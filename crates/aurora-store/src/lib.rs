@@ -4,6 +4,7 @@
 
 mod backup;
 mod integrity;
+pub mod issues;
 mod location;
 mod migrations;
 #[cfg_attr(windows, path = "platform/windows.rs")]
@@ -427,6 +428,10 @@ mod tests_support {
 
 #[cfg(test)]
 mod tests_0002;
+#[cfg(test)]
+mod tests_0003;
+#[cfg(test)]
+mod tests_issues;
 
 #[cfg(test)]
 mod tests {

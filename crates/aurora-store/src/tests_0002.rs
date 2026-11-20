@@ -16,12 +16,12 @@ fn names(conn: &Connection, sql: &str) -> Vec<(i64, i64, String)> {
 }
 
 #[tokio::test]
-async fn fresh_database_reaches_version_two() {
+async fn fresh_database_reaches_the_latest_version() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("test.db");
     let store = Store::open(&path).unwrap();
-    assert_eq!(latest_version(), 2);
-    assert_eq!(store.schema_version(), 2);
+    assert_eq!(latest_version(), 3);
+    assert_eq!(store.schema_version(), 3);
     assert!(store.open_report().backup.is_none());
     store.close().await;
 }
@@ -54,7 +54,8 @@ async fn populated_version_one_database_migrates_without_losing_anything() {
     .unwrap();
     v1.close().await;
 
-    let store = Store::open(&path).unwrap();
+    let store =
+        Store::open_with_migrations(&path, &OpenOptions::default(), &MIGRATIONS[..2]).unwrap();
     assert_eq!(store.schema_version(), 2);
     let backup = store.open_report().backup.clone().expect("backup taken");
     assert!(backup.starts_with(default_backup_dir(&path)));

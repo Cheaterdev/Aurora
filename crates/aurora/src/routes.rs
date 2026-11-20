@@ -1,16 +1,18 @@
 //! The REST API under `/api/v1`. Handlers only translate; the rules live in
-//! `aurora_store::projects`.
+//! `aurora_store::projects` and `aurora_store::issues`.
 //!
 //! There is no authentication yet (TRK-2). Every API route is built in
 //! [`api_router`], so one auth layer added there covers all of them.
 
+use aurora_store::issues::{self, IssueFilter, IssuePatch, MoveTarget, NewIssue, ParentFilter};
 use aurora_store::projects::{self, NewColumn, StateType};
 use aurora_store::{Rejection, Store, StoreError, now_millis};
 use axum::extract::rejection::JsonRejection;
-use axum::extract::{FromRequest, Path, Query, Request, State};
+use axum::extract::{FromRequest, FromRequestParts, Path, Query, Request, State};
+use axum::http::request::Parts;
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, patch, put};
+use axum::routing::{get, patch, post, put};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -46,6 +48,23 @@ pub fn api_router() -> Router<Store> {
         .route(
             "/projects/{key}/labels/{id}",
             patch(update_label).delete(delete_label),
+        )
+        .route(
+            "/projects/{key}/issues",
+            get(list_issues).post(create_issue),
+        )
+        .route(
+            "/projects/{key}/issues/{number}",
+            get(get_issue).patch(update_issue),
+        )
+        .route("/projects/{key}/issues/{number}/move", post(move_issue))
+        .route(
+            "/projects/{key}/issues/{number}/archive",
+            post(archive_issue),
+        )
+        .route(
+            "/projects/{key}/issues/{number}/unarchive",
+            post(unarchive_issue),
         )
 }
 
@@ -103,6 +122,35 @@ impl<S: Send + Sync, T: DeserializeOwned> FromRequest<S> for ApiJson<T> {
             }),
         }
     }
+}
+
+/// `Query` whose rejections use the API's error body.
+struct ApiQuery<T>(T);
+
+impl<S: Send + Sync, T: DeserializeOwned> FromRequestParts<S> for ApiQuery<T> {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, ApiError> {
+        match Query::<T>::from_request_parts(parts, state).await {
+            Ok(Query(value)) => Ok(ApiQuery(value)),
+            Err(rejection) => Err(ApiError {
+                status: StatusCode::UNPROCESSABLE_ENTITY,
+                message: format!("invalid query: {}", rejection.body_text()),
+            }),
+        }
+    }
+}
+
+fn invalid(reason: String) -> ApiError {
+    StoreError::from(Rejection::Invalid(reason)).into()
+}
+
+fn parse_state_type(text: &str) -> Result<StateType, ApiError> {
+    StateType::parse(text).ok_or_else(|| {
+        invalid(format!(
+            "unknown state_type {text}; use backlog, unstarted, started, completed or canceled"
+        ))
+    })
 }
 
 fn created<T: serde::Serialize>(value: T) -> Response {
@@ -197,14 +245,11 @@ async fn list_columns(
     Path(key): Path<String>,
     Query(filter): Query<ColumnFilter>,
 ) -> ApiResult<Response> {
-    let state_type = match filter.state_type {
-        None => None,
-        Some(text) => Some(StateType::parse(&text).ok_or_else(|| {
-            ApiError::from(StoreError::from(Rejection::Invalid(format!(
-                "unknown state_type {text}; use backlog, unstarted, started, completed or canceled"
-            ))))
-        })?),
-    };
+    let state_type = filter
+        .state_type
+        .as_deref()
+        .map(parse_state_type)
+        .transpose()?;
     let columns = store
         .read(move |c| match state_type {
             Some(state_type) => projects::columns_by_state_type(c, &key, state_type),
@@ -373,4 +418,125 @@ async fn delete_label(
         .write(move |tx| projects::delete_label(tx, now_millis(), &key, id))
         .await?;
     Ok(no_content())
+}
+
+// ---- issues ----
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IssueQuery {
+    column_id: Option<i64>,
+    state_type: Option<String>,
+    label_id: Option<i64>,
+    assignee_id: Option<i64>,
+    /// An issue number, or `none` for top-level issues.
+    parent: Option<String>,
+    include_archived: Option<bool>,
+    archived_only: Option<bool>,
+    limit: Option<i64>,
+    offset: Option<i64>,
+}
+
+impl IssueQuery {
+    fn into_filter(self) -> Result<IssueFilter, ApiError> {
+        let parent = match self.parent.as_deref() {
+            None => None,
+            Some("none") => Some(ParentFilter::None),
+            Some(text) => Some(ParentFilter::Number(text.parse().map_err(|_| {
+                invalid(format!(
+                    "parent must be an issue number or none, not {text}"
+                ))
+            })?)),
+        };
+        Ok(IssueFilter {
+            column_id: self.column_id,
+            state_type: self
+                .state_type
+                .as_deref()
+                .map(parse_state_type)
+                .transpose()?,
+            label_id: self.label_id,
+            assignee_id: self.assignee_id,
+            parent,
+            include_archived: self.include_archived.unwrap_or(false),
+            archived_only: self.archived_only.unwrap_or(false),
+            limit: self.limit,
+            offset: self.offset,
+        })
+    }
+}
+
+async fn list_issues(
+    State(store): State<Store>,
+    Path(key): Path<String>,
+    ApiQuery(query): ApiQuery<IssueQuery>,
+) -> ApiResult<Response> {
+    let filter = query.into_filter()?;
+    let list = store
+        .read(move |c| issues::list_issues(c, &key, &filter))
+        .await?;
+    Ok(Json(list).into_response())
+}
+
+async fn create_issue(
+    State(store): State<Store>,
+    Path(key): Path<String>,
+    ApiJson(body): ApiJson<NewIssue>,
+) -> ApiResult<Response> {
+    let issue = store
+        .write(move |tx| issues::create_issue(tx, now_millis(), &key, body))
+        .await?;
+    Ok(created(issue))
+}
+
+async fn get_issue(
+    State(store): State<Store>,
+    Path((key, number)): Path<(String, i64)>,
+) -> ApiResult<Response> {
+    let issue = store
+        .read(move |c| issues::get_issue(c, &key, number))
+        .await?;
+    Ok(Json(issue).into_response())
+}
+
+async fn update_issue(
+    State(store): State<Store>,
+    Path((key, number)): Path<(String, i64)>,
+    ApiJson(body): ApiJson<IssuePatch>,
+) -> ApiResult<Response> {
+    let issue = store
+        .write(move |tx| issues::update_issue(tx, now_millis(), &key, number, body))
+        .await?;
+    Ok(Json(issue).into_response())
+}
+
+async fn move_issue(
+    State(store): State<Store>,
+    Path((key, number)): Path<(String, i64)>,
+    ApiJson(body): ApiJson<MoveTarget>,
+) -> ApiResult<Response> {
+    let issue = store
+        .write(move |tx| issues::move_issue(tx, now_millis(), &key, number, body))
+        .await?;
+    Ok(Json(issue).into_response())
+}
+
+async fn archive_issue(
+    State(store): State<Store>,
+    Path((key, number)): Path<(String, i64)>,
+) -> ApiResult<Response> {
+    let issue = store
+        .write(move |tx| issues::archive_issue(tx, now_millis(), &key, number))
+        .await?;
+    Ok(Json(issue).into_response())
+}
+
+async fn unarchive_issue(
+    State(store): State<Store>,
+    Path((key, number)): Path<(String, i64)>,
+) -> ApiResult<Response> {
+    let issue = store
+        .write(move |tx| issues::unarchive_issue(tx, now_millis(), &key, number))
+        .await?;
+    Ok(Json(issue).into_response())
 }

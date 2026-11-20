@@ -23,15 +23,15 @@ pub enum Rejection {
     Invalid(String),
 }
 
-fn not_found(what: &str) -> StoreError {
+pub(crate) fn not_found(what: &str) -> StoreError {
     Rejection::NotFound(what.to_string()).into()
 }
 
-fn conflict(reason: impl Into<String>) -> StoreError {
+pub(crate) fn conflict(reason: impl Into<String>) -> StoreError {
     Rejection::Conflict(reason.into()).into()
 }
 
-fn invalid(reason: impl Into<String>) -> StoreError {
+pub(crate) fn invalid(reason: impl Into<String>) -> StoreError {
     Rejection::Invalid(reason.into()).into()
 }
 
@@ -226,7 +226,7 @@ fn clean_color(color: &str) -> Result<String, StoreError> {
     }
 }
 
-fn emit(
+pub(crate) fn emit(
     conn: &Connection,
     now: i64,
     project_id: i64,
