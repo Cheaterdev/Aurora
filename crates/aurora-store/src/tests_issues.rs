@@ -215,6 +215,7 @@ async fn create_with_every_field() {
             column_id: Some(s.columns[2]),
             assignee_id: Some(7),
             parent: Some(parent.issue.number),
+            initiative: None,
             priority: Some(Priority::High),
             labels: vec![b, a, b],
         })

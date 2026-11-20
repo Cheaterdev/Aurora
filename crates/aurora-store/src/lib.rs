@@ -14,6 +14,7 @@ pub mod auth;
 mod backup;
 pub mod comments;
 pub mod events;
+pub mod initiatives;
 mod integrity;
 pub mod issues;
 pub mod links;
@@ -645,6 +646,43 @@ mod tests_support {
         }
     }
 
+    pub(crate) mod initiatives {
+        pub(crate) use crate::initiatives::*;
+
+        use rusqlite::Transaction;
+
+        use super::test_actor;
+        use crate::StoreError;
+
+        pub(crate) fn create_initiative(
+            tx: &Transaction<'_>,
+            now: i64,
+            project_key: &str,
+            new: NewInitiative,
+        ) -> Result<InitiativeView, StoreError> {
+            crate::initiatives::create_initiative(tx, now, &test_actor(tx), project_key, new)
+        }
+
+        pub(crate) fn update_initiative(
+            tx: &Transaction<'_>,
+            now: i64,
+            project_key: &str,
+            id: i64,
+            patch: InitiativePatch,
+        ) -> Result<InitiativeView, StoreError> {
+            crate::initiatives::update_initiative(tx, now, &test_actor(tx), project_key, id, patch)
+        }
+
+        pub(crate) fn delete_initiative(
+            tx: &Transaction<'_>,
+            now: i64,
+            project_key: &str,
+            id: i64,
+        ) -> Result<(), StoreError> {
+            crate::initiatives::delete_initiative(tx, now, &test_actor(tx), project_key, id)
+        }
+    }
+
     pub(crate) mod links {
         pub(crate) use crate::links::*;
 
@@ -698,6 +736,8 @@ mod tests_0006;
 #[cfg(test)]
 mod tests_0007;
 #[cfg(test)]
+mod tests_0008;
+#[cfg(test)]
 mod tests_actor;
 #[cfg(test)]
 mod tests_auth;
@@ -705,6 +745,8 @@ mod tests_auth;
 mod tests_comments;
 #[cfg(test)]
 mod tests_events;
+#[cfg(test)]
+mod tests_initiatives;
 #[cfg(test)]
 mod tests_issues;
 #[cfg(test)]

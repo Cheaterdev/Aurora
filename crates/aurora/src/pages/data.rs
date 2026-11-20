@@ -2,14 +2,15 @@
 
 use std::collections::HashMap;
 
-use aurora_store::StoreError;
 use aurora_store::auth::{self, User};
 use aurora_store::comments::{self, Comment};
 use aurora_store::events::{self, Event};
+use aurora_store::initiatives::{self, Initiative, InitiativeDetail, InitiativeView};
 use aurora_store::issues::{self, Issue, IssueDetail, IssueFilter};
 use aurora_store::links::{self, Blocker};
 use aurora_store::projects::{self, Column, IssueType, Label, Project};
 use aurora_store::rusqlite::Connection;
+use aurora_store::{StoreError, now_millis};
 
 /// How many log entries the issue page shows.
 const ACTIVITY_LIMIT: i64 = 100;
@@ -27,6 +28,7 @@ pub struct BoardData {
     pub types: Vec<IssueType>,
     pub labels: Vec<Label>,
     pub users: Vec<User>,
+    pub initiatives: Vec<Initiative>,
     /// Open blockers of the blocked issues, by issue id.
     pub blockers: HashMap<i64, Vec<Blocker>>,
     /// Read before the rest, so a stream started after it misses nothing.
@@ -42,9 +44,35 @@ pub struct IssueData {
     pub types: Vec<IssueType>,
     pub labels: Vec<Label>,
     pub users: Vec<User>,
+    pub initiatives: Vec<Initiative>,
     pub activity: Vec<Event>,
     pub comments: Vec<Comment>,
     pub last_event: i64,
+}
+
+pub struct InitiativesData {
+    pub user: User,
+    pub project: Project,
+    pub initiatives: Vec<InitiativeView>,
+    pub last_event: i64,
+}
+
+pub struct InitiativeData {
+    pub user: User,
+    pub project: Project,
+    pub detail: InitiativeDetail,
+    pub columns: Vec<Column>,
+    pub last_event: i64,
+}
+
+/// The project's initiatives without their progress, to name them.
+fn project_initiatives(conn: &Connection, key: &str) -> Result<Vec<Initiative>, StoreError> {
+    Ok(
+        initiatives::list_initiatives(conn, now_millis(), key, None)?
+            .into_iter()
+            .map(|view| view.initiative)
+            .collect(),
+    )
 }
 
 pub fn load_home(conn: &Connection, user_id: i64) -> Result<HomeData, StoreError> {
@@ -82,7 +110,45 @@ pub fn load_board(conn: &Connection, user_id: i64, key: &str) -> Result<BoardDat
         types: projects::list_issue_types(conn, key)?,
         labels: projects::list_labels(conn, key)?,
         users: auth::list_users(conn)?,
+        initiatives: project_initiatives(conn, key)?,
         blockers: links::open_blockers(conn, key)?,
+        last_event,
+    })
+}
+
+pub fn load_initiatives(
+    conn: &Connection,
+    user_id: i64,
+    key: &str,
+) -> Result<InitiativesData, StoreError> {
+    let last_event = events::latest_event_id(conn)?;
+    Ok(InitiativesData {
+        user: auth::get_user(conn, user_id)?,
+        project: projects::get_project(conn, key)?,
+        initiatives: initiatives::list_initiatives(conn, now_millis(), key, None)?,
+        last_event,
+    })
+}
+
+pub fn load_initiative(
+    conn: &Connection,
+    user_id: i64,
+    key: &str,
+    id: i64,
+) -> Result<InitiativeData, StoreError> {
+    let last_event = events::latest_event_id(conn)?;
+    Ok(InitiativeData {
+        user: auth::get_user(conn, user_id)?,
+        project: projects::get_project(conn, key)?,
+        detail: initiatives::get_initiative(
+            conn,
+            now_millis(),
+            key,
+            id,
+            Some(issues::MAX_LIMIT),
+            None,
+        )?,
+        columns: projects::list_columns(conn, key)?,
         last_event,
     })
 }
@@ -109,6 +175,7 @@ pub fn load_issue(
         types: projects::list_issue_types(conn, key)?,
         labels: projects::list_labels(conn, key)?,
         users: auth::list_users(conn)?,
+        initiatives: project_initiatives(conn, key)?,
         activity,
         comments: comments::list_comments(conn, key, number)?,
         last_event,
@@ -139,6 +206,7 @@ pub struct ActivityData {
     pub types: Vec<IssueType>,
     pub labels: Vec<Label>,
     pub users: Vec<User>,
+    pub initiatives: Vec<Initiative>,
     pub activity: Vec<Event>,
 }
 
@@ -153,6 +221,7 @@ pub fn load_activity(
         types: projects::list_issue_types(conn, key)?,
         labels: projects::list_labels(conn, key)?,
         users: auth::list_users(conn)?,
+        initiatives: project_initiatives(conn, key)?,
         activity: events::entity_events(conn, "issue", detail.issue.id, ACTIVITY_LIMIT)?,
     })
 }

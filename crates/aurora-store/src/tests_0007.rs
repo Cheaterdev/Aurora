@@ -35,7 +35,7 @@ async fn populated_version_six_database_gains_comments_and_keeps_its_data() {
     v6.close().await;
 
     let store = Store::open(&path).unwrap();
-    assert_eq!(store.schema_version(), 7);
+    assert_eq!(store.schema_version(), crate::latest_version());
     let backup = store.open_report().backup.clone().expect("backup taken");
     assert!(backup.starts_with(default_backup_dir(&path)));
 

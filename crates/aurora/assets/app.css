@@ -677,6 +677,69 @@ main {
   font-size: 0.8rem;
 }
 
+/* ---- initiatives ---- */
+
+.initiative-list {
+  list-style: none;
+  padding: 0;
+  margin: 0 0 24px;
+  display: grid;
+  gap: 8px;
+}
+
+.initiative-item {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 8px 14px 12px;
+}
+
+.initiative-head {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+}
+
+.initiative-name {
+  display: inline-flex;
+  align-items: center;
+  min-height: var(--target);
+  font-weight: 600;
+}
+
+.progress-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px 12px;
+  margin: 4px 0 var(--gap);
+}
+
+.progress-bar {
+  flex: 1 1 200px;
+  min-width: 120px;
+  height: 14px;
+  accent-color: var(--accent);
+}
+
+.progress-text {
+  font-size: 0.9rem;
+}
+
+.chip-health[data-health="on_track"] {
+  color: var(--success);
+}
+
+.chip-health[data-health="at_risk"],
+.chip-health[data-health="off_track"] {
+  color: var(--danger);
+}
+
+.chip-health[data-health="off_track"] {
+  font-weight: 700;
+}
+
 /* ---- comments ---- */
 
 .comment-list,

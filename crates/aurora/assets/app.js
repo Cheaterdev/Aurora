@@ -270,6 +270,8 @@
       hideCommentForm(button.closest('form'));
     } else if (action === 'delete-comment') {
       deleteComment(button);
+    } else if (action === 'delete-initiative') {
+      deleteInitiative(button);
     }
   });
 
@@ -338,6 +340,13 @@
       return api('PATCH', '/projects/' + encodeURIComponent(project) + '/comments/' + form.dataset.commentId,
         { body: form.elements.body.value }).then(function () { return refreshComments(true); });
     },
+    'new-initiative': function (form) {
+      var payload = { name: form.elements.name.value.trim() };
+      if (form.elements.target_date.value) { payload.target_date = form.elements.target_date.value; }
+      return api('POST', '/projects/' + encodeURIComponent(project) + '/initiatives', payload).then(function (made) {
+        location.href = '/p/' + encodeURIComponent(project) + '/initiatives/' + made.id;
+      });
+    },
     'new-label': function (form) {
       return api('POST', '/projects/' + encodeURIComponent(project) + '/labels',
         { name: form.elements.name.value.trim(), color: form.elements.color.value }).then(function () { location.reload(); });
@@ -381,9 +390,18 @@
     }
   }
 
+  function initiativePath() {
+    return '/projects/' + encodeURIComponent(project) + '/initiatives/' + body.dataset.initiativeId;
+  }
+
   function request(holder) {
     var field = holder.dataset.field;
     var value = holder.value;
+    if (page === 'initiative') {
+      var patch = {};
+      patch[field] = field === 'target_date' && value === '' ? null : value;
+      return api('PATCH', initiativePath(), patch);
+    }
     if (field === 'column') {
       return api('POST', issuePath() + '/move', { column_id: Number(value) });
     }
@@ -394,7 +412,7 @@
       payload.type_id = Number(value);
     } else if (field === 'priority') {
       payload.priority = value === '' ? null : value;
-    } else if (field === 'assignee_id' || field === 'parent') {
+    } else if (field === 'assignee_id' || field === 'parent' || field === 'initiative') {
       payload[field] = nullableNumber(value);
     } else if (field === 'labels') {
       payload.labels = JSON.parse(currentValue(holder));
@@ -408,6 +426,8 @@
     message(out, 'Saving…');
     request(holder).then(function () {
       remember(holder);
+      var title = $('#initiative-title');
+      if (page === 'initiative' && holder.dataset.field === 'name' && title) { title.textContent = holder.value.trim(); }
       message(out, 'Saved', 'saved');
       setTimeout(function () { if (out && out.classList.contains('saved')) { message(out, ''); } }, 2500);
     }, function (err) {
@@ -417,7 +437,7 @@
   }
 
   document.addEventListener('change', function (event) {
-    if (page !== 'issue') { return; }
+    if (page !== 'issue' && page !== 'initiative') { return; }
     var holder = event.target.closest && event.target.closest('[data-field]');
     if (holder) { saveField(holder); }
   });
@@ -525,6 +545,38 @@
       });
   }
 
+  // ---- initiatives ----
+
+  var initiativeTimer = null;
+
+  function initiativesPath() { return '/p/' + encodeURIComponent(project) + '/initiatives'; }
+
+  function deleteInitiative(button) {
+    if (!window.confirm('Delete this initiative? Its issues stay, but leave the initiative.')) { return; }
+    button.disabled = true;
+    api('DELETE', initiativePath()).then(function () { location.href = initiativesPath(); }, function (err) {
+      button.disabled = false;
+      message($('#page-msg'), err.message, 'error');
+    });
+  }
+
+  // The list or the progress section is swapped; the fields being edited are left alone.
+  function refreshInitiative() {
+    var onList = page === 'initiatives';
+    var url = onList ? initiativesPath() + '/list' : initiativesPath() + '/' + body.dataset.initiativeId + '/progress';
+    return fetchFragment(url).then(function (html) {
+      var current = $(onList ? '#initiative-list' : '#initiative-progress');
+      if (!html || !current) { return; }
+      var fresh = parseFragment(html);
+      if (fresh) { current.replaceWith(fresh); }
+    });
+  }
+
+  function scheduleInitiativeRefresh() {
+    clearTimeout(initiativeTimer);
+    initiativeTimer = setTimeout(refreshInitiative, 150);
+  }
+
   // ---- live updates ----
 
   var lastEvent = Number(body.dataset.lastEvent || 0);
@@ -539,11 +591,21 @@
     } else if (page === 'issue' && data.entity_kind === 'issue' && String(data.entity_id) === body.dataset.issueId) {
       refreshActivity();
       if (typeof data.kind === 'string' && data.kind.indexOf('comment.') === 0) { scheduleCommentsRefresh(); }
+    } else if (page === 'initiatives') {
+      if (data.entity_kind === 'initiative' || data.entity_kind === 'issue') { scheduleInitiativeRefresh(); }
+    } else if (page === 'initiative') {
+      if (data.entity_kind === 'initiative' && String(data.entity_id) === body.dataset.initiativeId) {
+        if (data.kind === 'initiative.deleted') { location.href = initiativesPath(); return; }
+        scheduleInitiativeRefresh();
+      } else if (data.entity_kind === 'issue') {
+        scheduleInitiativeRefresh();
+      }
     }
   }
 
   function connect() {
-    if (!window.EventSource || !project || (page !== 'board' && page !== 'issue')) { return; }
+    var live = page === 'board' || page === 'issue' || page === 'initiatives' || page === 'initiative';
+    if (!window.EventSource || !project || !live) { return; }
     var url = '/events/stream?after=' + lastEvent + '&project=' + encodeURIComponent(project);
     source = new EventSource(url);
     source.onmessage = onEvent;

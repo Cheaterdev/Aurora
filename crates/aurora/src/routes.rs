@@ -8,6 +8,7 @@
 use aurora_store::auth::Principal;
 use aurora_store::comments::{self, NewComment};
 use aurora_store::events::{self, EventFilter, Start};
+use aurora_store::initiatives::{self, InitiativePatch, InitiativeStatus, NewInitiative};
 use aurora_store::issues::{self, IssueFilter, IssuePatch, MoveTarget, NewIssue, ParentFilter};
 use aurora_store::links::{self, LinkKind};
 use aurora_store::projects::{self, NewColumn, StateType};
@@ -95,6 +96,16 @@ pub fn api_router(store: Store) -> Router<Store> {
         .route(
             "/projects/{key}/comments/{id}",
             patch(edit_comment).delete(delete_comment),
+        )
+        .route(
+            "/projects/{key}/initiatives",
+            get(list_initiatives).post(create_initiative),
+        )
+        .route(
+            "/projects/{key}/initiatives/{id}",
+            get(get_initiative)
+                .patch(update_initiative)
+                .delete(delete_initiative),
         )
         .route("/events", get(list_events))
         .route("/consumers", get(list_consumers))
@@ -768,6 +779,91 @@ async fn delete_comment(
 ) -> ApiResult<Response> {
     store
         .write(move |tx| comments::delete_comment(tx, now_millis(), &actor, &key, id))
+        .await?;
+    Ok(no_content())
+}
+
+// ---- initiatives ----
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InitiativeQuery {
+    status: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InitiativeIssuesQuery {
+    limit: Option<i64>,
+    offset: Option<i64>,
+}
+
+async fn list_initiatives(
+    State(store): State<Store>,
+    Path(key): Path<String>,
+    ApiQuery(query): ApiQuery<InitiativeQuery>,
+) -> ApiResult<Response> {
+    let status = query
+        .status
+        .as_deref()
+        .map(|text| {
+            InitiativeStatus::parse(text).ok_or_else(|| {
+                invalid(format!(
+                    "unknown status {text}; use planned, active, paused, completed or canceled"
+                ))
+            })
+        })
+        .transpose()?;
+    let list = store
+        .read(move |c| initiatives::list_initiatives(c, now_millis(), &key, status))
+        .await?;
+    Ok(Json(list).into_response())
+}
+
+async fn create_initiative(
+    State(store): State<Store>,
+    Extension(actor): Extension<Principal>,
+    Path(key): Path<String>,
+    ApiJson(body): ApiJson<NewInitiative>,
+) -> ApiResult<Response> {
+    let initiative = store
+        .write(move |tx| initiatives::create_initiative(tx, now_millis(), &actor, &key, body))
+        .await?;
+    Ok(created(initiative))
+}
+
+async fn get_initiative(
+    State(store): State<Store>,
+    Path((key, id)): Path<(String, i64)>,
+    ApiQuery(query): ApiQuery<InitiativeIssuesQuery>,
+) -> ApiResult<Response> {
+    let detail = store
+        .read(move |c| {
+            initiatives::get_initiative(c, now_millis(), &key, id, query.limit, query.offset)
+        })
+        .await?;
+    Ok(Json(detail).into_response())
+}
+
+async fn update_initiative(
+    State(store): State<Store>,
+    Extension(actor): Extension<Principal>,
+    Path((key, id)): Path<(String, i64)>,
+    ApiJson(body): ApiJson<InitiativePatch>,
+) -> ApiResult<Response> {
+    let initiative = store
+        .write(move |tx| initiatives::update_initiative(tx, now_millis(), &actor, &key, id, body))
+        .await?;
+    Ok(Json(initiative).into_response())
+}
+
+async fn delete_initiative(
+    State(store): State<Store>,
+    Extension(actor): Extension<Principal>,
+    Path((key, id)): Path<(String, i64)>,
+) -> ApiResult<Response> {
+    store
+        .write(move |tx| initiatives::delete_initiative(tx, now_millis(), &actor, &key, id))
         .await?;
     Ok(no_content())
 }

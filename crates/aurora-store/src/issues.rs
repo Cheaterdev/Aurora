@@ -90,6 +90,8 @@ pub struct Issue {
     pub assignee_id: Option<i64>,
     /// The parent's number in the same project.
     pub parent: Option<i64>,
+    /// The initiative of the same project this issue counts towards.
+    pub initiative_id: Option<i64>,
     pub priority: Option<Priority>,
     pub position: f64,
     pub created: i64,
@@ -143,6 +145,8 @@ pub struct NewIssue {
     pub assignee_id: Option<i64>,
     /// Number of the parent issue.
     pub parent: Option<i64>,
+    /// Id of an initiative of the same project.
+    pub initiative: Option<i64>,
     pub priority: Option<Priority>,
     #[serde(default)]
     pub labels: Vec<i64>,
@@ -161,6 +165,9 @@ pub struct IssuePatch {
     pub assignee_id: Option<Option<i64>>,
     #[serde(default, deserialize_with = "present")]
     pub parent: Option<Option<i64>>,
+    /// Id of an initiative of the same project; `null` clears.
+    #[serde(default, deserialize_with = "present")]
+    pub initiative: Option<Option<i64>>,
     #[serde(default, deserialize_with = "present")]
     pub priority: Option<Option<Priority>>,
     /// The full new label set.
@@ -168,7 +175,7 @@ pub struct IssuePatch {
 }
 
 /// Tells an absent field (`None`) from an explicit `null` (`Some(None)`).
-fn present<'de, T, D>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+pub(crate) fn present<'de, T, D>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
 where
     T: Deserialize<'de>,
     D: Deserializer<'de>,
@@ -225,7 +232,7 @@ const ISSUE_COLUMNS: &str = concat!(
                JOIN \"column\" bc ON bc.id = b.column_id
               WHERE l.kind = 'blocks' AND l.to_issue_id = i.id AND ",
     open_blocker!(),
-    ")"
+    "), i.initiative_id"
 );
 
 const ISSUE_ORDER: &str = "ORDER BY c.position, i.position, i.id";
@@ -245,6 +252,7 @@ fn issue_row(row: &Row<'_>) -> rusqlite::Result<Issue> {
         description: row.get(7)?,
         assignee_id: row.get(8)?,
         parent: row.get(9)?,
+        initiative_id: row.get(17)?,
         priority: row.get(10)?,
         position: row.get(11)?,
         created: row.get(12)?,
@@ -368,6 +376,22 @@ fn check_column(conn: &Connection, project: &Project, id: i64) -> Result<(), Sto
     } else {
         Err(invalid(format!(
             "column_id {id} is not a column of project {}",
+            project.key
+        )))
+    }
+}
+
+fn check_initiative(conn: &Connection, project: &Project, id: i64) -> Result<(), StoreError> {
+    let found = exists(
+        conn,
+        "SELECT 1 FROM initiative WHERE id = ?1 AND project_id = ?2",
+        [id, project.id],
+    )?;
+    if found {
+        Ok(())
+    } else {
+        Err(invalid(format!(
+            "initiative {id} is not an initiative of project {}",
             project.key
         )))
     }
@@ -619,6 +643,9 @@ pub fn create_issue(
         .parent
         .map(|number| check_parent(tx, &project, number, None))
         .transpose()?;
+    if let Some(id) = new.initiative {
+        check_initiative(tx, &project, id)?;
+    }
     let labels = resolve_labels(tx, &project, &new.labels)?;
 
     let number: i64 = tx.query_row(
@@ -637,8 +664,9 @@ pub fn create_issue(
     )?;
     tx.execute(
         "INSERT INTO issue (project_id, number, type_id, column_id, title, description,
-                            assignee_id, parent_id, priority, position, created, updated)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11)",
+                            assignee_id, parent_id, priority, position, created, updated,
+                            initiative_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11, ?12)",
         params![
             project.id,
             number,
@@ -650,7 +678,8 @@ pub fn create_issue(
             parent_id,
             new.priority,
             last + POSITION_STEP,
-            now
+            now,
+            new.initiative
         ],
     )?;
     let id = tx.last_insert_rowid();
@@ -671,6 +700,7 @@ pub fn create_issue(
             "column_id": column_id,
             "parent": new.parent,
             "assignee_id": new.assignee_id,
+            "initiative": new.initiative,
             "priority": new.priority,
             "labels": labels,
         }),
@@ -775,6 +805,20 @@ pub fn update_issue(
         next.parent = parent;
         changed(&mut changes, "parent", json!(current.parent), json!(parent));
     }
+    if let Some(initiative) = patch.initiative {
+        if let Some(id) = initiative {
+            check_initiative(tx, &project, id)?;
+        }
+        if initiative != current.initiative_id {
+            next.initiative_id = initiative;
+            changed(
+                &mut changes,
+                "initiative",
+                json!(current.initiative_id),
+                json!(initiative),
+            );
+        }
+    }
     if let Some(priority) = patch.priority
         && priority != current.priority
     {
@@ -803,8 +847,8 @@ pub fn update_issue(
     }
     tx.execute(
         "UPDATE issue SET title = ?1, description = ?2, type_id = ?3, assignee_id = ?4,
-                          parent_id = ?5, priority = ?6, updated = ?7
-         WHERE id = ?8",
+                          parent_id = ?5, priority = ?6, updated = ?7, initiative_id = ?8
+         WHERE id = ?9",
         params![
             next.title,
             next.description,
@@ -813,6 +857,7 @@ pub fn update_issue(
             next.parent_id,
             next.priority,
             now,
+            next.initiative_id,
             current.id
         ],
     )?;

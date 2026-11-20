@@ -3,9 +3,10 @@
 //! assets and the live event stream.
 //!
 //! Pages are plain HTML from [`view`]; the little script in
-//! `assets/app.js` talks to the JSON API and re-fetches the board, activity and
-//! comments fragments (`/p/{key}/board`, `/p/{key}/{n}/activity`,
-//! `/p/{key}/{n}/comments`) when
+//! `assets/app.js` talks to the JSON API and re-fetches the board, activity,
+//! comments and initiative fragments (`/p/{key}/board`, `/p/{key}/{n}/activity`,
+//! `/p/{key}/{n}/comments`, `/p/{key}/initiatives/list`,
+//! `/p/{key}/initiatives/{id}/progress`) when
 //! `/events/stream` reports a change. Pages need the session cookie; a request
 //! without one is redirected to `/sign-in` (or to `/setup` while there is no
 //! owner), except fragment requests from the script, which get a 401.
@@ -45,6 +46,13 @@ pub fn router(store: Store, live: Live) -> Router<Store> {
         .route("/", get(home))
         .route("/p/{key}", get(board_page))
         .route("/p/{key}/board", get(board_fragment))
+        .route("/p/{key}/initiatives", get(initiatives_page))
+        .route("/p/{key}/initiatives/list", get(initiatives_fragment))
+        .route("/p/{key}/initiatives/{id}", get(initiative_page))
+        .route(
+            "/p/{key}/initiatives/{id}/progress",
+            get(initiative_progress_fragment),
+        )
         .route("/p/{key}/{number}", get(issue_page))
         .route("/p/{key}/{number}/activity", get(activity_fragment))
         .route("/p/{key}/{number}/comments", get(comments_fragment))
@@ -348,6 +356,63 @@ async fn board_fragment(
 ) -> PageResult {
     let board = load_board(&store, principal, key).await?;
     Ok(ok(view::board_fragment(&board)))
+}
+
+async fn load_initiatives(
+    store: &Store,
+    principal: Principal,
+    key: String,
+) -> Result<data::InitiativesData, PageError> {
+    Ok(store
+        .read(move |c| data::load_initiatives(c, principal.user_id, &key))
+        .await?)
+}
+
+async fn initiatives_page(
+    State(store): State<Store>,
+    Extension(principal): Extension<Principal>,
+    Path(key): Path<String>,
+) -> PageResult {
+    let data = load_initiatives(&store, principal, key).await?;
+    Ok(ok(view::initiatives_page(&data)))
+}
+
+async fn initiatives_fragment(
+    State(store): State<Store>,
+    Extension(principal): Extension<Principal>,
+    Path(key): Path<String>,
+) -> PageResult {
+    let data = load_initiatives(&store, principal, key).await?;
+    Ok(ok(view::initiatives_fragment(&data)))
+}
+
+async fn load_initiative(
+    store: &Store,
+    principal: Principal,
+    key: String,
+    id: i64,
+) -> Result<data::InitiativeData, PageError> {
+    Ok(store
+        .read(move |c| data::load_initiative(c, principal.user_id, &key, id))
+        .await?)
+}
+
+async fn initiative_page(
+    State(store): State<Store>,
+    Extension(principal): Extension<Principal>,
+    Path((key, id)): Path<(String, i64)>,
+) -> PageResult {
+    let data = load_initiative(&store, principal, key, id).await?;
+    Ok(ok(view::initiative_page(&data)))
+}
+
+async fn initiative_progress_fragment(
+    State(store): State<Store>,
+    Extension(principal): Extension<Principal>,
+    Path((key, id)): Path<(String, i64)>,
+) -> PageResult {
+    let data = load_initiative(&store, principal, key, id).await?;
+    Ok(ok(view::initiative_progress_fragment(&data)))
 }
 
 async fn issue_page(

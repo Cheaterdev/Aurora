@@ -20,8 +20,8 @@ async fn fresh_database_reaches_the_latest_version() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("test.db");
     let store = Store::open(&path).unwrap();
-    assert_eq!(latest_version(), 7);
-    assert_eq!(store.schema_version(), 7);
+    assert_eq!(latest_version(), 8);
+    assert_eq!(store.schema_version(), 8);
     assert!(store.open_report().backup.is_none());
     store.close().await;
 }

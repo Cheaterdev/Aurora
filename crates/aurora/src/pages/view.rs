@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use aurora_store::auth::{Role, User};
 use aurora_store::comments::{Comment, mention_ranges};
 use aurora_store::events::Event;
+use aurora_store::initiatives::{Health, Initiative, InitiativeStatus, InitiativeView, Progress};
 use aurora_store::issues::{Issue, Priority};
 use aurora_store::links::{Blocker, IssueLinks, LinkedIssue};
 use aurora_store::projects::{Column, IssueType, Label, Project};
@@ -15,7 +16,9 @@ use maud::{DOCTYPE, Markup, html};
 use serde_json::Value;
 
 use super::assets;
-use super::data::{ActivityData, BoardData, CommentsData, HomeData, IssueData};
+use super::data::{
+    ActivityData, BoardData, CommentsData, HomeData, InitiativeData, InitiativesData, IssueData,
+};
 use super::time::{utc_iso, utc_text};
 
 const PRIORITIES: [Priority; 4] = [
@@ -25,15 +28,25 @@ const PRIORITIES: [Priority; 4] = [
     Priority::Low,
 ];
 
+const STATUSES: [InitiativeStatus; 5] = [
+    InitiativeStatus::Planned,
+    InitiativeStatus::Active,
+    InitiativeStatus::Paused,
+    InitiativeStatus::Completed,
+    InitiativeStatus::Canceled,
+];
+
 pub struct Frame<'a> {
     pub title: &'a str,
-    /// `board`, `issue`, `home`, `sign-in` or `setup`; the script picks its behaviour from it.
+    /// `board`, `issue`, `initiatives`, `initiative`, `home`, `sign-in` or `setup`; the
+    /// script picks its behaviour from it.
     pub page: &'static str,
     pub user: Option<&'a User>,
     pub project: Option<&'a Project>,
     pub last_event: Option<i64>,
     pub issue_id: Option<i64>,
     pub issue_number: Option<i64>,
+    pub initiative_id: Option<i64>,
 }
 
 impl<'a> Frame<'a> {
@@ -46,6 +59,7 @@ impl<'a> Frame<'a> {
             last_event: None,
             issue_id: None,
             issue_number: None,
+            initiative_id: None,
         }
     }
 }
@@ -67,7 +81,8 @@ fn layout(frame: &Frame<'_>, content: Markup) -> Markup {
                 data-project=[frame.project.map(|p| p.key.as_str())]
                 data-last-event=[frame.last_event]
                 data-issue-id=[frame.issue_id]
-                data-issue-number=[frame.issue_number] {
+                data-issue-number=[frame.issue_number]
+                data-initiative-id=[frame.initiative_id] {
                 a.skip href="#main" { "Skip to content" }
                 header.topbar {
                     a.brand href="/" { "Aurora" }
@@ -78,6 +93,7 @@ fn layout(frame: &Frame<'_>, content: Markup) -> Markup {
                                 " "
                                 (project.name)
                             }
+                            a href={ "/p/" (project.key) "/initiatives" } { "Initiatives" }
                             a href="/?list=1" { "All projects" }
                         }
                     }
@@ -225,6 +241,7 @@ struct Lookup<'a> {
     types: HashMap<i64, &'a str>,
     labels: HashMap<i64, &'a Label>,
     users: HashMap<i64, &'a str>,
+    initiatives: HashMap<i64, &'a str>,
 }
 
 impl<'a> Lookup<'a> {
@@ -233,13 +250,24 @@ impl<'a> Lookup<'a> {
         types: &'a [IssueType],
         labels: &'a [Label],
         users: &'a [User],
+        initiatives: &'a [Initiative],
     ) -> Self {
         Lookup {
             columns: columns.iter().map(|c| (c.id, c.name.as_str())).collect(),
             types: types.iter().map(|t| (t.id, t.name.as_str())).collect(),
             labels: labels.iter().map(|l| (l.id, l)).collect(),
             users: users.iter().map(|u| (u.id, u.name.as_str())).collect(),
+            initiatives: initiatives
+                .iter()
+                .map(|i| (i.id, i.name.as_str()))
+                .collect(),
         }
+    }
+
+    fn initiative(&self, id: i64) -> String {
+        self.initiatives
+            .get(&id)
+            .map_or_else(|| format!("initiative {id}"), |n| (*n).to_string())
     }
 
     fn column(&self, id: i64) -> String {
@@ -342,6 +370,12 @@ fn card(issue: &Issue, key: &str, data: &BoardData, lookup: &Lookup<'_>) -> Mark
                 @if let Some(assignee) = issue.assignee_id {
                     span.chip.chip-assignee { (lookup.user(assignee)) }
                 }
+                @if let Some(initiative) = issue.initiative_id {
+                    span.chip.chip-initiative {
+                        span.sr-only { "Initiative: " }
+                        (lookup.initiative(initiative))
+                    }
+                }
             }
             label.move-to {
                 span.sr-only { "Move " (issue.identifier) " to column" }
@@ -359,7 +393,13 @@ fn card(issue: &Issue, key: &str, data: &BoardData, lookup: &Lookup<'_>) -> Mark
 
 /// The board itself; also what `GET /p/{key}/board` returns for live refreshes.
 pub fn board_fragment(data: &BoardData) -> Markup {
-    let lookup = Lookup::new(&data.columns, &data.types, &data.labels, &data.users);
+    let lookup = Lookup::new(
+        &data.columns,
+        &data.types,
+        &data.labels,
+        &data.users,
+        &data.initiatives,
+    );
     let key = data.project.key.as_str();
     html! {
         div #board.board data-project=(key) {
@@ -437,6 +477,250 @@ pub fn board_page(data: &BoardData) -> Markup {
     )
 }
 
+// ---- initiatives ----
+
+fn health_key(health: Health) -> &'static str {
+    match health {
+        Health::OnTrack => "on_track",
+        Health::AtRisk => "at_risk",
+        Health::OffTrack => "off_track",
+        Health::None => "none",
+    }
+}
+
+/// Words, so health never relies on colour alone.
+fn health_text(health: Health) -> &'static str {
+    match health {
+        Health::OnTrack => "On track",
+        Health::AtRisk => "At risk",
+        Health::OffTrack => "Off track",
+        Health::None => "No health signal",
+    }
+}
+
+fn progress_bar(name: &str, progress: &Progress, health: Health) -> Markup {
+    html! {
+        div.progress-row {
+            progress.progress-bar max=(progress.total.max(1)) value=(progress.done)
+                aria-label={ "Progress of " (name) } {
+                (progress.percent) "%"
+            }
+            span.progress-text {
+                (progress.done) " of " (progress.total) " done (" (progress.percent) "%)"
+            }
+            span.chip.chip-health data-health=(health_key(health)) {
+                "Health: " (health_text(health))
+            }
+        }
+    }
+}
+
+fn initiative_item(view: &InitiativeView, key: &str) -> Markup {
+    let initiative = &view.initiative;
+    html! {
+        li.initiative-item {
+            div.initiative-head {
+                a.initiative-name href={ "/p/" (key) "/initiatives/" (initiative.id) } {
+                    (initiative.name)
+                }
+                span.chip.chip-status data-status=(initiative.status.as_str()) {
+                    (initiative.status.as_str())
+                }
+                span.meta {
+                    @if let Some(date) = &initiative.target_date {
+                        "Target " (date)
+                    } @else {
+                        "No target date"
+                    }
+                }
+            }
+            (progress_bar(&initiative.name, &view.progress, view.health))
+        }
+    }
+}
+
+fn initiative_list(data: &InitiativesData) -> Markup {
+    let key = data.project.key.as_str();
+    html! {
+        section #initiative-list aria-label="Initiatives" {
+            @if data.initiatives.is_empty() {
+                p.empty { "No initiatives yet. Create the first one below." }
+            } @else {
+                ul.initiative-list {
+                    @for view in &data.initiatives { (initiative_item(view, key)) }
+                }
+            }
+        }
+    }
+}
+
+/// The list alone; also what `GET /p/{key}/initiatives/list` returns for live refreshes.
+pub fn initiatives_fragment(data: &InitiativesData) -> Markup {
+    initiative_list(data)
+}
+
+pub fn initiatives_page(data: &InitiativesData) -> Markup {
+    let key = data.project.key.as_str();
+    let mut frame = Frame::new("Initiatives", "initiatives");
+    frame.user = Some(&data.user);
+    frame.project = Some(&data.project);
+    frame.last_event = Some(data.last_event);
+    layout(
+        &frame,
+        html! {
+            section.page {
+                nav.crumbs aria-label="Breadcrumb" {
+                    a href={ "/p/" (key) } { (data.project.name) }
+                    " / "
+                    span { "Initiatives" }
+                }
+                h1 { "Initiatives" }
+                (initiative_list(data))
+                h2 { "New initiative" }
+                form.inline-form data-form="new-initiative" {
+                    div.field {
+                        label for="initiative-name" { "Name" }
+                        input #initiative-name name="name" required maxlength="200"
+                            placeholder="Launch" autocomplete="off";
+                    }
+                    div.field {
+                        label for="initiative-target" { "Target date (optional)" }
+                        input #initiative-target name="target_date" type="date";
+                    }
+                    button.primary type="submit" { "Create initiative" }
+                    p.field-msg role="alert" {}
+                }
+            }
+        },
+    )
+}
+
+/// Progress and the issue list of one initiative; also what
+/// `GET /p/{key}/initiatives/{id}/progress` returns for live refreshes.
+pub fn initiative_progress_fragment(data: &InitiativeData) -> Markup {
+    let key = data.project.key.as_str();
+    let view = &data.detail.view;
+    let progress = &view.progress;
+    let columns: HashMap<i64, &str> = data
+        .columns
+        .iter()
+        .map(|c| (c.id, c.name.as_str()))
+        .collect();
+    let shown = i64::try_from(data.detail.issues.len()).unwrap_or(i64::MAX);
+    html! {
+        section #initiative-progress aria-labelledby="progress-heading" {
+            h2 #progress-heading { "Progress" }
+            (progress_bar(&view.initiative.name, progress, view.health))
+            p.meta {
+                "Completed " (progress.completed)
+                ", canceled " (progress.canceled)
+                ", in progress " (progress.started)
+                ", not started " (progress.open)
+                ". Archived issues are not counted."
+            }
+            h2 #issues-heading { "Issues" }
+            @if data.detail.issues.is_empty() {
+                p.empty { "No issues yet. Pick this initiative on an issue's page to add it." }
+            } @else {
+                ul.links-list {
+                    @for issue in &data.detail.issues {
+                        li {
+                            a href={ "/p/" (key) "/" (issue.number) } {
+                                span.ident { (issue.identifier) }
+                                " "
+                                (issue.title)
+                            }
+                            " "
+                            span.chip data-state=(issue.state_type.as_str()) {
+                                (columns.get(&issue.column_id).copied().unwrap_or("column"))
+                            }
+                        }
+                    }
+                }
+            }
+            @if data.detail.total > shown {
+                p.hint { "Showing the first " (shown) " of " (data.detail.total) " issues." }
+            }
+        }
+    }
+}
+
+pub fn initiative_page(data: &InitiativeData) -> Markup {
+    let initiative = &data.detail.view.initiative;
+    let key = data.project.key.as_str();
+    let mut frame = Frame::new(&initiative.name, "initiative");
+    frame.user = Some(&data.user);
+    frame.project = Some(&data.project);
+    frame.last_event = Some(data.last_event);
+    frame.initiative_id = Some(initiative.id);
+    layout(
+        &frame,
+        html! {
+            article.issue {
+                nav.crumbs aria-label="Breadcrumb" {
+                    a href={ "/p/" (key) } { (data.project.name) }
+                    " / "
+                    a href={ "/p/" (key) "/initiatives" } { "Initiatives" }
+                    " / "
+                    span { (initiative.name) }
+                }
+                div.issue-head {
+                    h1 #initiative-title { (initiative.name) }
+                    button type="button" data-action="delete-initiative" { "Delete" }
+                }
+                p.field-msg #page-msg role="alert" {}
+                div.issue-grid {
+                    div.issue-main {
+                        div.field {
+                            label for="f-name" { "Name" }
+                            input #f-name data-field="name" value=(initiative.name) maxlength="200";
+                            p.field-msg role="alert" {}
+                        }
+                        div.field {
+                            label for="f-description" { "Description" }
+                            textarea #f-description data-field="description" rows="8" {
+                                "\n" (initiative.description)
+                            }
+                            div.row {
+                                button type="button" data-action="save-description" { "Save description" }
+                            }
+                            p.field-msg role="alert" {}
+                        }
+                        (initiative_progress_fragment(data))
+                    }
+                    aside.issue-side aria-label="Fields" {
+                        div.field {
+                            label for="f-status" { "Status" }
+                            select #f-status data-field="status" {
+                                @for status in STATUSES {
+                                    option value=(status.as_str())
+                                        selected[status == initiative.status] {
+                                        (status.as_str())
+                                    }
+                                }
+                            }
+                            p.field-msg role="alert" {}
+                        }
+                        div.field {
+                            label for="f-target" { "Target date" }
+                            input #f-target data-field="target_date" type="date"
+                                value=[initiative.target_date.as_deref()];
+                            p.field-msg role="alert" {}
+                        }
+                        p.meta {
+                            "Created "
+                            time.when datetime=(utc_iso(initiative.created)) data-ts=(initiative.created) {
+                                (utc_text(initiative.created))
+                            }
+                            "."
+                        }
+                    }
+                }
+            }
+        },
+    )
+}
+
 // ---- issue ----
 
 fn json_label(field: &str, value: &Value, lookup: &Lookup<'_>) -> String {
@@ -446,6 +730,7 @@ fn json_label(field: &str, value: &Value, lookup: &Lookup<'_>) -> String {
         ("type_id", v) => v.as_i64().map_or_else(none, |id| lookup.type_name(id)),
         ("assignee_id", v) => v.as_i64().map_or_else(none, |id| lookup.user(id)),
         ("parent", v) => v.as_i64().map_or_else(none, |n| format!("#{n}")),
+        ("initiative", v) => v.as_i64().map_or_else(none, |id| lookup.initiative(id)),
         ("labels", Value::Array(ids)) => {
             let names: Vec<String> = ids
                 .iter()
@@ -789,14 +1074,26 @@ pub fn comments_fragment(data: &CommentsData) -> Markup {
 }
 
 pub fn activity_fragment(data: &ActivityData) -> Markup {
-    let lookup = Lookup::new(&data.columns, &data.types, &data.labels, &data.users);
+    let lookup = Lookup::new(
+        &data.columns,
+        &data.types,
+        &data.labels,
+        &data.users,
+        &data.initiatives,
+    );
     activity_list(&data.activity, &lookup)
 }
 
 pub fn issue_page(data: &IssueData) -> Markup {
     let issue = &data.detail.issue;
     let key = data.project.key.as_str();
-    let lookup = Lookup::new(&data.columns, &data.types, &data.labels, &data.users);
+    let lookup = Lookup::new(
+        &data.columns,
+        &data.types,
+        &data.labels,
+        &data.users,
+        &data.initiatives,
+    );
     let title = format!("{} {}", issue.identifier, issue.title);
     let mut frame = Frame::new(&title, "issue");
     frame.user = Some(&data.user);
@@ -915,6 +1212,20 @@ pub fn issue_page(data: &IssueData) -> Markup {
                                 @for user in data.users.iter().filter(|u| !u.disabled || Some(u.id) == issue.assignee_id) {
                                     option value=(user.id) selected[Some(user.id) == issue.assignee_id] {
                                         (user.name)
+                                    }
+                                }
+                            }
+                            p.field-msg role="alert" {}
+                        }
+                        div.field {
+                            label for="f-initiative" { "Initiative" }
+                            select #f-initiative data-field="initiative" {
+                                option value="" selected[issue.initiative_id.is_none()] { "None" }
+                                @for initiative in &data.initiatives {
+                                    option value=(initiative.id)
+                                        selected[Some(initiative.id) == issue.initiative_id] {
+                                        (initiative.name)
+                                        " (" (initiative.status.as_str()) ")"
                                     }
                                 }
                             }

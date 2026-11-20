@@ -1305,6 +1305,415 @@ async fn stream_reports_comment_events_for_the_issue() {
     server.shutdown().await;
 }
 
+// ---- initiatives ----
+
+/// Creates an initiative in WEB and returns its id.
+async fn initiative(server: &Server, cookie: &str, body: Value) -> i64 {
+    let (status, made) = server
+        .api(cookie, "POST", "/projects/WEB/initiatives", body)
+        .await;
+    assert_eq!(status, 201, "{made}");
+    made["id"].as_i64().unwrap()
+}
+
+async fn assign(server: &Server, cookie: &str, number: i64, initiative: i64) {
+    let (status, issue) = server
+        .api(
+            cookie,
+            "PATCH",
+            &format!("/projects/WEB/issues/{number}"),
+            json!({ "initiative": initiative }),
+        )
+        .await;
+    assert_eq!(status, 200, "{issue}");
+}
+
+async fn done_column(server: &Server, cookie: &str) -> i64 {
+    let (_, columns) = server
+        .api(cookie, "GET", "/projects/WEB/columns", Value::Null)
+        .await;
+    columns
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["state_type"] == "completed")
+        .unwrap()["id"]
+        .as_i64()
+        .unwrap()
+}
+
+#[tokio::test]
+async fn initiatives_page_lists_progress_health_and_a_create_form() {
+    let server = Server::start().await;
+    let cookie = server.owner_cookie().await;
+    let numbers = seed(&server, &cookie).await;
+
+    // Nothing yet: an empty state, the form and the nav link are there.
+    let resp = get(server.addr, "/p/WEB/initiatives", Some(&cookie)).await;
+    assert_eq!(resp.status, 200);
+    assert!(resp.body.contains("No initiatives yet"));
+    assert!(resp.body.contains(r#"data-page="initiatives""#));
+    assert!(resp.body.contains(r#"data-form="new-initiative""#));
+    assert!(resp.body.contains(r#"name="target_date" type="date""#));
+    assert!(resp.body.contains(r#"href="/p/WEB/initiatives""#));
+    let board = get(server.addr, "/p/WEB", Some(&cookie)).await;
+    assert!(
+        board
+            .body
+            .contains(r#"<a href="/p/WEB/initiatives">Initiatives</a>"#),
+        "the project header links to the initiatives"
+    );
+
+    let launch = initiative(
+        &server,
+        &cookie,
+        json!({"name": "Launch", "status": "active", "target_date": "2999-01-01"}),
+    )
+    .await;
+    let evil = initiative(&server, &cookie, json!({"name": "<b>Evil</b> \"one\""})).await;
+    assign(&server, &cookie, numbers[0], launch).await;
+    assign(&server, &cookie, numbers[1], launch).await;
+    let done = done_column(&server, &cookie).await;
+    let (status, _) = server
+        .api(
+            &cookie,
+            "POST",
+            &format!("/projects/WEB/issues/{}/move", numbers[0]),
+            json!({ "column_id": done }),
+        )
+        .await;
+    assert_eq!(status, 200);
+
+    let resp = get(server.addr, "/p/WEB/initiatives", Some(&cookie)).await;
+    assert_eq!(resp.status, 200);
+    let body = &resp.body;
+    assert_eq!(resp.header("cache-control"), Some("no-store"));
+    assert!(body.contains(&format!(r#"href="/p/WEB/initiatives/{launch}""#)));
+    assert!(body.contains("1 of 2 done (50%)"), "{body}");
+    assert!(body.contains(r#"<progress class="progress-bar" max="2" value="1""#));
+    assert!(body.contains("0 of 0 done (0%)"));
+    assert!(body.contains("Target 2999-01-01"));
+    assert!(body.contains("No target date"));
+    // Health is in words, not only a colour.
+    assert!(body.contains("Health: On track"), "{body}");
+    assert!(body.contains("Health: No health signal"));
+    assert!(body.contains(r#"data-status="active""#));
+    assert!(
+        index_of(body, "Launch") < index_of(body, "Evil"),
+        "creation order"
+    );
+
+    // Escaping, and no inline script or style.
+    assert!(body.contains("&lt;b&gt;Evil&lt;/b&gt; &quot;one&quot;"));
+    assert!(!body.contains("<b>Evil"));
+    assert!(!body.contains(" style="));
+    assert!(!body.contains("<style"));
+    assert_eq!(body.matches("<script").count(), 1);
+    let _ = evil;
+
+    // The list fragment on its own, behind the session.
+    let frag = get(server.addr, "/p/WEB/initiatives/list", Some(&cookie)).await;
+    assert_eq!(frag.status, 200);
+    assert!(frag.body.starts_with("<section"), "{}", frag.body);
+    assert!(frag.body.contains(r#"id="initiative-list""#));
+    assert!(frag.body.contains("1 of 2 done (50%)"));
+    assert!(!frag.body.contains("<html"));
+    assert_eq!(
+        get(server.addr, "/p/WEB/initiatives/list", None)
+            .await
+            .status,
+        303
+    );
+    let resp = send(
+        server.addr,
+        "GET",
+        "/p/WEB/initiatives/list",
+        &[("X-Requested-With", "aurora")],
+        "",
+    )
+    .await;
+    assert_eq!(resp.status, 401);
+    assert_eq!(
+        get(server.addr, "/p/WEB/initiatives", None).await.status,
+        303
+    );
+    assert_eq!(
+        get(server.addr, "/p/NOPE/initiatives", Some(&cookie))
+            .await
+            .status,
+        404
+    );
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn initiative_page_has_editable_fields_progress_and_its_issues() {
+    let server = Server::start().await;
+    let cookie = server.owner_cookie().await;
+    let numbers = seed(&server, &cookie).await;
+    let id = initiative(
+        &server,
+        &cookie,
+        json!({
+            "name": "Ship <it>",
+            "description": "</textarea><script>alert(2)</script>\nline two",
+            "status": "paused",
+            "target_date": "2031-02-03"
+        }),
+    )
+    .await;
+    assign(&server, &cookie, numbers[0], id).await;
+    assign(&server, &cookie, numbers[2], id).await;
+    assign(&server, &cookie, numbers[1], id).await;
+    let (status, _) = server
+        .api(
+            &cookie,
+            "POST",
+            "/projects/WEB/issues/2/archive",
+            Value::Null,
+        )
+        .await;
+    assert_eq!(status, 200);
+    let done = done_column(&server, &cookie).await;
+    server
+        .api(
+            &cookie,
+            "POST",
+            "/projects/WEB/issues/3/move",
+            json!({ "column_id": done }),
+        )
+        .await;
+
+    let resp = get(
+        server.addr,
+        &format!("/p/WEB/initiatives/{id}"),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(resp.status, 200);
+    let body = &resp.body;
+    assert!(body.contains(r#"data-page="initiative""#));
+    assert!(body.contains(&format!(r#"data-initiative-id="{id}""#)));
+    assert!(body.contains(r#"data-field="name""#));
+    assert!(body.contains(r#"data-field="description""#));
+    assert!(body.contains(r#"data-field="status""#));
+    assert!(body.contains(r#"data-field="target_date""#));
+    assert!(body.contains(r#"type="date" value="2031-02-03""#));
+    assert!(
+        body.contains(r#"<option value="paused" selected>paused</option>"#),
+        "{body}"
+    );
+    assert!(body.contains(r#"<option value="active">active</option>"#));
+    assert!(body.contains(r#"data-action="delete-initiative""#));
+    assert!(body.contains(r#"data-action="save-description""#));
+
+    // Progress counts the two live issues (one done); the archived one is out.
+    assert!(body.contains("1 of 2 done (50%)"), "{body}");
+    assert!(body.contains("Completed 1, canceled 0, in progress 0, not started 1."));
+    assert!(body.contains(r#"href="/p/WEB/1""#));
+    assert!(body.contains(r#"href="/p/WEB/3""#));
+    assert!(
+        !body.contains(r#"href="/p/WEB/2""#),
+        "archived issues are not listed"
+    );
+    assert!(body.contains(r#"data-state="completed""#));
+    assert!(body.contains(r#"href="/p/WEB/initiatives""#));
+
+    // Escaping.
+    assert!(body.contains("Ship &lt;it&gt;"));
+    assert!(!body.contains("Ship <it>"));
+    assert!(body.contains("&lt;/textarea&gt;&lt;script&gt;alert(2)&lt;/script&gt;"));
+    assert_eq!(body.matches("<script").count(), 1);
+    assert!(!body.contains(" style="));
+
+    // The progress fragment on its own.
+    let frag = get(
+        server.addr,
+        &format!("/p/WEB/initiatives/{id}/progress"),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(frag.status, 200);
+    assert!(frag.body.starts_with("<section"), "{}", frag.body);
+    assert!(frag.body.contains(r#"id="initiative-progress""#));
+    assert!(frag.body.contains("1 of 2 done (50%)"));
+    assert!(!frag.body.contains("<html"));
+    assert!(!frag.body.contains(r#"data-field="name""#));
+    assert_eq!(
+        get(
+            server.addr,
+            &format!("/p/WEB/initiatives/{id}/progress"),
+            None
+        )
+        .await
+        .status,
+        303
+    );
+
+    // An empty initiative says so and offers no broken bar.
+    let empty = initiative(&server, &cookie, json!({"name": "Empty"})).await;
+    let resp = get(
+        server.addr,
+        &format!("/p/WEB/initiatives/{empty}"),
+        Some(&cookie),
+    )
+    .await;
+    assert!(resp.body.contains("0 of 0 done (0%)"));
+    assert!(resp.body.contains("No issues yet"));
+    assert!(resp.body.contains(r#"max="1" value="0""#));
+
+    // Unknown ids, and ids of other projects, are 404 pages.
+    for path in [
+        format!("/p/WEB/initiatives/{}", id + 100),
+        format!("/p/NOPE/initiatives/{id}"),
+        format!("/p/WEB/initiatives/{}/progress", id + 100),
+    ] {
+        assert_eq!(
+            get(server.addr, &path, Some(&cookie)).await.status,
+            404,
+            "{path}"
+        );
+    }
+    let (status, _) = server
+        .api(
+            &cookie,
+            "POST",
+            "/projects",
+            json!({"key": "OTH", "name": "Other"}),
+        )
+        .await;
+    assert_eq!(status, 201);
+    assert_eq!(
+        get(
+            server.addr,
+            &format!("/p/OTH/initiatives/{id}"),
+            Some(&cookie)
+        )
+        .await
+        .status,
+        404
+    );
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn issue_page_picks_the_initiative_and_the_board_and_activity_show_it() {
+    let server = Server::start().await;
+    let cookie = server.owner_cookie().await;
+    let numbers = seed(&server, &cookie).await;
+    let id = initiative(&server, &cookie, json!({"name": "Launch <1>"})).await;
+    initiative(&server, &cookie, json!({"name": "Other one"})).await;
+
+    // Unassigned: the select offers none and both initiatives, none selected.
+    let resp = get(server.addr, "/p/WEB/1", Some(&cookie)).await;
+    let body = &resp.body;
+    assert!(body.contains(r#"id="f-initiative""#));
+    assert!(body.contains(r#"data-field="initiative""#));
+    assert!(
+        body.contains(r#"<option value="" selected>None</option>"#),
+        "{body}"
+    );
+    assert!(body.contains(&format!(
+        r#"<option value="{id}">Launch &lt;1&gt; (planned)</option>"#
+    )));
+    assert!(body.contains("Other one (planned)"));
+
+    assign(&server, &cookie, numbers[0], id).await;
+    let resp = get(server.addr, "/p/WEB/1", Some(&cookie)).await;
+    assert!(
+        resp.body.contains(&format!(
+            r#"<option value="{id}" selected>Launch &lt;1&gt; (planned)</option>"#
+        )),
+        "{}",
+        resp.body
+    );
+    assert!(resp.body.contains(r#"<option value="">None</option>"#));
+    // The activity names the initiative.
+    assert!(resp.body.contains("initiative: none"), "{}", resp.body);
+    assert!(resp.body.contains("Launch &lt;1&gt;"));
+    let frag = get(server.addr, "/p/WEB/1/activity", Some(&cookie)).await;
+    assert!(frag.body.contains("initiative: none"));
+
+    // The board card carries a chip.
+    let board = get(server.addr, "/p/WEB/board", Some(&cookie)).await;
+    assert!(board.body.contains("chip-initiative"), "{}", board.body);
+    assert!(board.body.contains("Launch &lt;1&gt;"));
+    assert_eq!(board.body.matches("chip-initiative").count(), 1);
+
+    // The script saves the field with PATCH and knows the initiative pages.
+    let js = get(server.addr, "/assets/app.js", None).await.body;
+    for needle in [
+        "field === 'initiative'",
+        "'new-initiative'",
+        "delete-initiative",
+        "/initiatives",
+        "/list'",
+        "/progress'",
+        "initiativeId",
+        "initiative.deleted",
+        "page === 'initiatives'",
+    ] {
+        assert!(js.contains(needle), "app.js lacks {needle}");
+    }
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn stream_reports_initiative_and_issue_events() {
+    let server = Server::start().await;
+    let cookie = server.owner_cookie().await;
+    let numbers = seed(&server, &cookie).await;
+    let mut sse = Sse::open(server.addr, "/events/stream?project=WEB", &cookie, None).await;
+
+    let id = initiative(&server, &cookie, json!({"name": "Live"})).await;
+    sse.read_until("initiative.created").await;
+    assign(&server, &cookie, numbers[0], id).await;
+    sse.read_until("issue.updated").await;
+    let (status, _) = server
+        .api(
+            &cookie,
+            "PATCH",
+            &format!("/projects/WEB/initiatives/{id}"),
+            json!({"status": "active"}),
+        )
+        .await;
+    assert_eq!(status, 200);
+    sse.read_until("initiative.updated").await;
+    let (status, _) = server
+        .api(
+            &cookie,
+            "DELETE",
+            &format!("/projects/WEB/initiatives/{id}"),
+            Value::Null,
+        )
+        .await;
+    assert_eq!(status, 204);
+    sse.read_until("initiative.deleted").await;
+
+    let events = sse.events();
+    let created = events
+        .iter()
+        .find(|e| e["kind"] == "initiative.created")
+        .unwrap();
+    // The page reacts to events whose entity is its initiative, or an issue.
+    assert_eq!(created["entity_kind"], "initiative");
+    assert_eq!(created["entity_id"], id);
+    let kinds: Vec<&str> = events.iter().map(|e| e["kind"].as_str().unwrap()).collect();
+    assert_eq!(
+        kinds,
+        [
+            "initiative.created",
+            "issue.updated",
+            "initiative.updated",
+            "issue.updated",
+            "initiative.deleted"
+        ]
+    );
+    assert_eq!(events[1]["entity_kind"], "issue");
+    assert!(!sse.seen.contains("Live"), "the stream carries no names");
+    server.shutdown().await;
+}
+
 #[tokio::test]
 async fn shutdown_ends_open_streams_without_waiting_for_the_drain() {
     let server = Server::start().await;

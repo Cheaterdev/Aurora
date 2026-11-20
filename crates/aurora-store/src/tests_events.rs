@@ -10,6 +10,7 @@ use crate::auth::{Principal, Role, Scope};
 use crate::comments::{self, NewComment};
 use crate::events::{self, Event, EventFilter, Start};
 use crate::projects::{NewColumn, Rejection, StateType};
+use crate::tests_support::initiatives::{self, InitiativePatch, InitiativeStatus, NewInitiative};
 use crate::tests_support::issues::{self, IssuePatch, MoveTarget, NewIssue, Priority};
 use crate::tests_support::links::{self, LinkKind};
 use crate::tests_support::projects;
@@ -554,6 +555,8 @@ struct Snapshot {
     labels: BTreeMap<i64, (i64, String, String)>,
     /// issue id -> issue
     issues: BTreeMap<i64, IssueSnap>,
+    /// initiative id -> initiative
+    initiatives: BTreeMap<i64, InitiativeSnap>,
     /// link id -> (kind, project id, from number, to number); a `relates` link
     /// has the lower number first
     links: BTreeMap<i64, (String, i64, i64, i64)>,
@@ -604,6 +607,16 @@ fn link_snap(kind: &str, pid: i64, from: i64, to: i64) -> (String, i64, i64, i64
     }
 }
 
+/// The description is only in the log as a change, never at creation, so it
+/// is not modelled.
+#[derive(Debug, PartialEq)]
+struct InitiativeSnap {
+    project_id: i64,
+    name: String,
+    status: String,
+    target_date: Option<String>,
+}
+
 #[derive(Debug, PartialEq)]
 struct IssueSnap {
     project_id: i64,
@@ -613,6 +626,7 @@ struct IssueSnap {
     column_id: i64,
     assignee_id: Option<i64>,
     parent: Option<i64>,
+    initiative: Option<i64>,
     priority: Option<String>,
     labels: Vec<i64>,
     archived: bool,
@@ -687,11 +701,45 @@ fn replay(log: &[Event]) -> Snapshot {
                         column_id: p["column_id"].as_i64().unwrap(),
                         assignee_id: p["assignee_id"].as_i64(),
                         parent: p["parent"].as_i64(),
+                        initiative: p["initiative"].as_i64(),
                         priority: p["priority"].as_str().map(String::from),
                         labels: ids(&p["labels"]),
                         archived: false,
                     },
                 );
+            }
+            "initiative.created" => {
+                s.initiatives.insert(
+                    e.entity_id,
+                    InitiativeSnap {
+                        project_id: pid,
+                        name: text(&p["name"]),
+                        status: text(&p["status"]),
+                        target_date: p["target_date"].as_str().map(String::from),
+                    },
+                );
+            }
+            "initiative.updated" => {
+                let initiative = s.initiatives.get_mut(&e.entity_id).unwrap();
+                for (field, change) in p["changes"].as_object().unwrap() {
+                    let to = &change["to"];
+                    match field.as_str() {
+                        "name" => initiative.name = text(to),
+                        "status" => initiative.status = text(to),
+                        "target_date" => initiative.target_date = to.as_str().map(String::from),
+                        "description" => {}
+                        other => panic!("unknown initiative field {other}"),
+                    }
+                }
+            }
+            "initiative.deleted" => {
+                // The deleted initiative's issues are unassigned by their own
+                // issue.updated events, which come first.
+                assert!(
+                    s.issues.values().all(|i| i.initiative != Some(e.entity_id)),
+                    "issues still point at the deleted initiative"
+                );
+                s.initiatives.remove(&e.entity_id);
             }
             "issue.updated" => {
                 let issue = s.issues.get_mut(&e.entity_id).unwrap();
@@ -702,6 +750,7 @@ fn replay(log: &[Event]) -> Snapshot {
                         "type_id" => issue.type_id = to.as_i64().unwrap(),
                         "assignee_id" => issue.assignee_id = to.as_i64(),
                         "parent" => issue.parent = to.as_i64(),
+                        "initiative" => issue.initiative = to.as_i64(),
                         "priority" => issue.priority = to.as_str().map(String::from),
                         "labels" => issue.labels = ids(to),
                         // The description is only in the log as a change, never at creation.
@@ -790,6 +839,18 @@ async fn read_state(store: &Store) -> Snapshot {
                 for l in projects::list_labels(c, &project.key)? {
                     s.labels.insert(l.id, (l.project_id, l.name, l.color));
                 }
+                for view in initiatives::list_initiatives(c, 0, &project.key, None)? {
+                    let i = view.initiative;
+                    s.initiatives.insert(
+                        i.id,
+                        InitiativeSnap {
+                            project_id: i.project_id,
+                            name: i.name,
+                            status: i.status.as_str().to_string(),
+                            target_date: i.target_date,
+                        },
+                    );
+                }
                 let list = issues::list_issues(
                     c,
                     &project.key,
@@ -844,6 +905,7 @@ async fn read_state(store: &Store) -> Snapshot {
                             column_id: i.column_id,
                             assignee_id: i.assignee_id,
                             parent: i.parent,
+                            initiative: i.initiative_id,
                             priority: i.priority.map(|p| p.as_str().to_string()),
                             labels: i.labels,
                             archived: i.archived,
@@ -1107,6 +1169,120 @@ async fn replaying_the_log_rebuilds_the_state() {
     run(s, move |tx| projects::delete_label(tx, 53, "TRK", c_id)).await;
     run(s, |tx| projects::rename_project(tx, 54, "TRK", "Tracker 2")).await;
 
+    // Initiatives: created, edited, issues joining, moving between them and
+    // leaving, one deleted while holding issues (one created into it).
+    let launch = run(s, |tx| {
+        initiatives::create_initiative(
+            tx,
+            55,
+            "TRK",
+            NewInitiative {
+                name: "Launch".into(),
+                target_date: Some("2030-01-01".into()),
+                ..NewInitiative::default()
+            },
+        )
+    })
+    .await;
+    let doomed = run(s, |tx| {
+        initiatives::create_initiative(
+            tx,
+            55,
+            "TRK",
+            NewInitiative {
+                name: "Doomed".into(),
+                status: Some(InitiativeStatus::Active),
+                ..NewInitiative::default()
+            },
+        )
+    })
+    .await;
+    run(s, |tx| {
+        initiatives::create_initiative(
+            tx,
+            55,
+            "OTH",
+            NewInitiative {
+                name: "Theirs".into(),
+                ..NewInitiative::default()
+            },
+        )
+    })
+    .await;
+    let (launch_id, doomed_id) = (launch.initiative.id, doomed.initiative.id);
+    run(s, move |tx| {
+        initiatives::update_initiative(
+            tx,
+            56,
+            "TRK",
+            launch_id,
+            InitiativePatch {
+                name: Some("Launch 1.0".into()),
+                description: Some(Some("the plan".into())),
+                status: Some(InitiativeStatus::Active),
+                target_date: Some(Some("2031-03-04".into())),
+            },
+        )
+    })
+    .await;
+    run(s, move |tx| {
+        initiatives::update_initiative(
+            tx,
+            57,
+            "TRK",
+            launch_id,
+            InitiativePatch {
+                target_date: Some(None),
+                ..InitiativePatch::default()
+            },
+        )
+    })
+    .await;
+    for (number, initiative) in [(1, launch_id), (2, doomed_id), (3, doomed_id)] {
+        run(s, move |tx| {
+            issues::update_issue(
+                tx,
+                58,
+                "TRK",
+                number,
+                patch(|p| p.initiative = Some(Some(initiative))),
+            )
+        })
+        .await;
+    }
+    run(s, move |tx| {
+        issues::update_issue(
+            tx,
+            59,
+            "TRK",
+            3,
+            patch(|p| p.initiative = Some(Some(launch_id))),
+        )
+    })
+    .await;
+    run(s, move |tx| {
+        issues::create_issue(
+            tx,
+            59,
+            "TRK",
+            NewIssue {
+                title: "four".into(),
+                type_id: Some(task_id),
+                initiative: Some(doomed_id),
+                ..NewIssue::default()
+            },
+        )
+    })
+    .await;
+    run(s, move |tx| {
+        initiatives::delete_initiative(tx, 59, "TRK", doomed_id)
+    })
+    .await;
+    run(s, move |tx| {
+        issues::update_issue(tx, 59, "TRK", 1, patch(|p| p.initiative = Some(None)))
+    })
+    .await;
+
     // Links: added, one removed, one re-added the other way, a symmetric one.
     run(s, |tx| {
         links::add_link(tx, 60, "TRK", 1, 2, LinkKind::Blocks)
@@ -1227,8 +1403,19 @@ async fn replaying_the_log_rebuilds_the_state() {
     assert!(log.iter().any(|e| e.kind == "mention.created"));
 
     // The scenario really exercised the state, not an empty model.
-    assert_eq!(actual.issues.len(), 4);
+    assert_eq!(actual.issues.len(), 5);
     assert_eq!(actual.projects.len(), 2);
+    assert_eq!(actual.initiatives.len(), 2, "Launch and Theirs are left");
+    assert_eq!(actual.initiatives[&launch_id].name, "Launch 1.0");
+    assert_eq!(actual.initiatives[&launch_id].target_date, None);
+    let joined: Vec<_> = actual
+        .issues
+        .values()
+        .filter(|i| i.initiative.is_some())
+        .collect();
+    assert_eq!(joined.len(), 1, "only issue 3 stayed in an initiative");
+    assert_eq!(joined[0].number, 3);
+    assert!(log.iter().any(|e| e.kind == "initiative.deleted"));
     assert!(actual.issues.values().any(|i| i.archived));
     assert!(actual.issues.values().any(|i| i.parent.is_some()));
     assert!(actual.issues.values().any(|i| i.labels == [b_id]));
