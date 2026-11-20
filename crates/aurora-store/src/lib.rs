@@ -128,7 +128,8 @@ struct Inner {
     report: OpenReport,
     marker: PathBuf,
     sender: Mutex<Option<mpsc::Sender<WriteJob>>>,
-    writer: Mutex<Option<JoinHandle<()>>>,
+    /// The writer returns whether its final checkpoint succeeded.
+    writer: Mutex<Option<JoinHandle<bool>>>,
 }
 
 /// Cheap to clone; all clones share one writer.
@@ -253,6 +254,10 @@ impl Store {
                 while let Some(job) = receiver.blocking_recv() {
                     job(&mut conn);
                 }
+                let checkpointed = checkpoint_truncate(&conn);
+                // Close the connection here so the join below implies it is closed.
+                drop(conn);
+                checkpointed
             })
             .map_err(StoreError::WriterSpawn)?;
 
@@ -326,17 +331,50 @@ impl Store {
         .map_err(|_| StoreError::Panicked)?
     }
 
-    /// Stops accepting writes, lets the writer finish what is already queued
-    /// and waits for it to exit.
+    /// Stops accepting writes, lets the writer finish what is already queued,
+    /// checkpoints and truncates the WAL, closes the write connection and
+    /// removes the run marker. The marker stays unless every step succeeded,
+    /// so the next start runs the full integrity check.
     pub async fn close(&self) {
         drop(lock(&self.inner.sender).take());
         let writer = lock(&self.inner.writer).take();
         if let Some(writer) = writer {
-            let _ = tokio::task::spawn_blocking(move || writer.join()).await;
-            // Only after the writer has exited and its connection closed.
+            let clean = match tokio::task::spawn_blocking(move || writer.join()).await {
+                Ok(Ok(checkpointed)) => checkpointed,
+                _ => {
+                    tracing::error!("the writer thread died; leaving the run marker in place");
+                    false
+                }
+            };
+            if !clean {
+                tracing::warn!(
+                    marker = %self.inner.marker.display(),
+                    "store did not close cleanly; leaving the run marker so the next start runs the full check"
+                );
+                return;
+            }
             if let Err(err) = std::fs::remove_file(&self.inner.marker) {
                 tracing::warn!(%err, "could not remove the run marker; next start will run the full check");
             }
+        }
+    }
+}
+
+/// `true` when the WAL was fully checkpointed and truncated.
+fn checkpoint_truncate(conn: &Connection) -> bool {
+    // Row is (busy, wal pages, pages checkpointed); busy = 1 means it could not complete.
+    let result = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
+        r.get::<_, i64>(0)
+    });
+    match result {
+        Ok(0) => true,
+        Ok(_) => {
+            tracing::warn!("WAL checkpoint was blocked by another connection");
+            false
+        }
+        Err(err) => {
+            tracing::warn!(%err, "WAL checkpoint failed");
+            false
         }
     }
 }
@@ -980,5 +1018,97 @@ mod tests {
             assert_eq!(version_of(&copy), 1);
             assert_eq!(project_names(&copy), ["Old data"]);
         }
+    }
+
+    fn wal_len(path: &Path) -> u64 {
+        std::fs::metadata(sibling(path, "-wal")).map_or(0, |m| m.len())
+    }
+
+    #[tokio::test]
+    async fn close_drains_queued_writes_checkpoints_and_removes_marker() {
+        let (_dir, path) = temp_db();
+        let store = Store::open(&path).unwrap();
+        let mut tasks = Vec::new();
+        for i in 0..20 {
+            let store = store.clone();
+            tasks.push(tokio::spawn(async move {
+                store
+                    .write(move |tx| {
+                        if i == 0 {
+                            // Lets the others queue up behind this one.
+                            std::thread::sleep(Duration::from_millis(100));
+                        }
+                        tx.execute(
+                            "INSERT INTO project (key, name, created) VALUES (?1, 'P', 1)",
+                            [format!("K{i}")],
+                        )?;
+                        Ok(())
+                    })
+                    .await
+            }));
+        }
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        store.close().await;
+        for task in tasks {
+            task.await.unwrap().unwrap();
+        }
+
+        assert_eq!(wal_len(&path), 0, "the WAL is truncated by close");
+        assert!(!marker_path(&path).exists());
+
+        let store = Store::open(&path).unwrap();
+        let report = store.open_report();
+        assert!(!report.unclean_shutdown);
+        assert_eq!(report.integrity_check, IntegrityCheck::Quick);
+        let count: i64 = store
+            .read(|c| Ok(c.query_row("SELECT COUNT(*) FROM project", [], |r| r.get(0))?))
+            .await
+            .unwrap();
+        assert_eq!(count, 20);
+        store.close().await;
+    }
+
+    #[tokio::test]
+    async fn panicking_write_leaves_no_lock_or_state_behind() {
+        let (_dir, path) = temp_db();
+        let store = Store::open(&path).unwrap();
+        let panicked = store
+            .write(|tx| {
+                tx.execute(
+                    "INSERT INTO project (key, name, created) VALUES ('P', 'P', 1)",
+                    [],
+                )?;
+                if tx.is_autocommit() {
+                    unreachable!();
+                }
+                panic!("boom");
+                #[allow(unreachable_code)]
+                Ok(())
+            })
+            .await;
+        assert!(matches!(panicked, Err(StoreError::Panicked)));
+
+        let count: i64 = store
+            .read(|c| Ok(c.query_row("SELECT COUNT(*) FROM project", [], |r| r.get(0))?))
+            .await
+            .unwrap();
+        assert_eq!(count, 0, "the panicking write was rolled back");
+        store
+            .write(|tx| {
+                tx.execute(
+                    "INSERT INTO project (key, name, created) VALUES ('P', 'P', 1)",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let count: i64 = store
+            .read(|c| Ok(c.query_row("SELECT COUNT(*) FROM project", [], |r| r.get(0))?))
+            .await
+            .unwrap();
+        assert_eq!(count, 1);
+        store.close().await;
+        assert!(!marker_path(&path).exists());
     }
 }

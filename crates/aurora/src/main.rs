@@ -47,6 +47,8 @@ async fn run() -> Result<()> {
         "database ready"
     );
 
+    // Registered before the server starts answering so an early signal is not lost.
+    let signal = aurora::shutdown_signal();
     let listener = match TcpListener::bind((config.host, config.port)).await {
         Ok(listener) => listener,
         Err(err) => {
@@ -56,12 +58,17 @@ async fn run() -> Result<()> {
     };
     tracing::info!(addr = %listener.local_addr()?, "listening");
 
-    aurora::serve(listener, store, async {
-        if let Err(err) = tokio::signal::ctrl_c().await {
-            tracing::error!(%err, "cannot listen for Ctrl+C");
-            std::future::pending::<()>().await;
-        }
-        tracing::info!("shutting down");
-    })
+    // TRK-45 registers the "mark active runs interrupted" hook here.
+    let hooks = aurora::ShutdownHooks::new();
+
+    aurora::serve(
+        listener,
+        store,
+        async move {
+            let name = signal.await;
+            tracing::info!(signal = name, "shutdown signal received");
+        },
+        hooks,
+    )
     .await
 }

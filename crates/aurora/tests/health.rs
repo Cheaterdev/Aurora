@@ -10,9 +10,14 @@ async fn health_reports_status_and_versions() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (stop, stopped) = oneshot::channel::<()>();
-    let server = tokio::spawn(aurora::serve(listener, store, async {
-        let _ = stopped.await;
-    }));
+    let server = tokio::spawn(aurora::serve(
+        listener,
+        store,
+        async {
+            let _ = stopped.await;
+        },
+        aurora::ShutdownHooks::new(),
+    ));
 
     let mut stream = TcpStream::connect(addr).await.unwrap();
     stream
