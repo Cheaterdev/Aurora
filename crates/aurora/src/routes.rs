@@ -1,8 +1,9 @@
 //! The REST API under `/api/v1`. Handlers only translate; the rules live in
 //! `aurora_store::projects` and `aurora_store::issues`.
 //!
-//! There is no authentication yet (TRK-2). Every API route is built in
-//! [`api_router`], so one auth layer added there covers all of them.
+//! Every API route is built in [`api_router`]. All of them sit behind the
+//! authentication layer in [`crate::auth`] except `POST /setup` and
+//! `POST /auth/sign-in`; `/health` lives outside the API.
 
 use aurora_store::events::{self, EventFilter, Start};
 use aurora_store::issues::{self, IssueFilter, IssuePatch, MoveTarget, NewIssue, ParentFilter};
@@ -13,16 +14,28 @@ use axum::extract::{FromRequest, FromRequestParts, Path, Query, Request, State};
 use axum::http::request::Parts;
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, patch, post, put};
-use axum::{Json, Router};
+use axum::routing::{delete, get, patch, post, put};
+use axum::{Json, Router, middleware};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::json;
 
+use crate::auth;
+
 const DEFAULT_LABEL_COLOR: &str = "#808080";
 
-pub fn api_router() -> Router<Store> {
-    Router::new()
+/// `store` is only needed to build the authentication layer.
+pub fn api_router(store: Store) -> Router<Store> {
+    let public = Router::new()
+        .route("/setup", post(auth::setup))
+        .route("/auth/sign-in", post(auth::sign_in));
+    let protected = Router::new()
+        .route("/auth/sign-out", post(auth::sign_out))
+        .route("/auth/me", get(auth::me))
+        .route("/keys", get(auth::list_keys).post(auth::create_key))
+        .route("/keys/{id}", delete(auth::revoke_key))
+        .route("/keys/{id}/rotate", post(auth::rotate_key))
+        .route("/users", get(auth::list_users).post(auth::create_user))
         .route("/projects", get(list_projects).post(create_project))
         .route("/projects/{key}", get(get_project).patch(rename_project))
         .route(
@@ -75,6 +88,8 @@ pub fn api_router() -> Router<Store> {
         )
         .route("/consumers/{name}/events", get(poll_consumer))
         .route("/consumers/{name}/ack", post(ack_consumer))
+        .layer(middleware::from_fn_with_state(store, auth::require_auth));
+    public.merge(protected)
 }
 
 pub struct ApiError {
@@ -92,6 +107,10 @@ impl From<StoreError> for ApiError {
             StoreError::Rejected(Rejection::Invalid(reason)) => {
                 (StatusCode::UNPROCESSABLE_ENTITY, reason)
             }
+            StoreError::Rejected(Rejection::Unauthorized(reason)) => {
+                (StatusCode::UNAUTHORIZED, reason)
+            }
+            StoreError::Rejected(Rejection::Forbidden(reason)) => (StatusCode::FORBIDDEN, reason),
             other => {
                 tracing::error!(error = %other, "store operation failed");
                 (
@@ -106,14 +125,21 @@ impl From<StoreError> for ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (self.status, Json(json!({ "error": self.message }))).into_response()
+        let mut response = (self.status, Json(json!({ "error": self.message }))).into_response();
+        if self.status == StatusCode::UNAUTHORIZED {
+            response.headers_mut().insert(
+                header::WWW_AUTHENTICATE,
+                header::HeaderValue::from_static("Bearer"),
+            );
+        }
+        response
     }
 }
 
-type ApiResult<T> = Result<T, ApiError>;
+pub(crate) type ApiResult<T> = Result<T, ApiError>;
 
 /// `Json` whose rejections use the API's error body.
-struct ApiJson<T>(T);
+pub(crate) struct ApiJson<T>(pub(crate) T);
 
 impl<S: Send + Sync, T: DeserializeOwned> FromRequest<S> for ApiJson<T> {
     type Rejection = ApiError;
@@ -134,7 +160,7 @@ impl<S: Send + Sync, T: DeserializeOwned> FromRequest<S> for ApiJson<T> {
 }
 
 /// `Query` whose rejections use the API's error body.
-struct ApiQuery<T>(T);
+pub(crate) struct ApiQuery<T>(pub(crate) T);
 
 impl<S: Send + Sync, T: DeserializeOwned> FromRequestParts<S> for ApiQuery<T> {
     type Rejection = ApiError;
@@ -162,11 +188,11 @@ fn parse_state_type(text: &str) -> Result<StateType, ApiError> {
     })
 }
 
-fn created<T: serde::Serialize>(value: T) -> Response {
+pub(crate) fn created<T: serde::Serialize>(value: T) -> Response {
     (StatusCode::CREATED, Json(value)).into_response()
 }
 
-fn no_content() -> Response {
+pub(crate) fn no_content() -> Response {
     (
         StatusCode::NO_CONTENT,
         [(header::CONTENT_TYPE, "application/json")],

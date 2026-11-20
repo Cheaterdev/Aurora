@@ -6,3 +6,10 @@ members = ["crates/aurora-store", "crates/aurora"]
 version = "0.1.0"
 edition = "2024"
 publish = false
+
+# Argon2 is deliberately slow; unoptimised it makes every sign-in test take seconds.
+[profile.dev.package.argon2]
+opt-level = 3
+
+[profile.dev.package.blake2]
+opt-level = 3

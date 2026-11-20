@@ -1,5 +1,6 @@
 //! The Aurora server: configuration and the HTTP surface.
 
+pub mod auth;
 pub mod config;
 pub mod routes;
 pub mod shutdown;
@@ -47,10 +48,10 @@ async fn health(State(store): State<Store>) -> Json<Health> {
     })
 }
 
-fn app_routes() -> Router<Store> {
+fn app_routes(store: Store) -> Router<Store> {
     Router::new()
         .route("/health", get(health))
-        .nest("/api/v1", routes::api_router())
+        .nest("/api/v1", routes::api_router(store))
 }
 
 fn panic_response(payload: Box<dyn Any + Send + 'static>) -> Response {
@@ -70,7 +71,7 @@ fn with_layers(router: Router) -> Router {
 }
 
 pub fn router(store: Store) -> Router {
-    with_layers(app_routes().with_state(store))
+    with_layers(app_routes(store.clone()).with_state(store))
 }
 
 /// Serves until `shutdown` resolves, then stops accepting connections, lets
@@ -189,7 +190,7 @@ mod tests {
 
     /// Exists only in test builds; the release binary has no panic route.
     fn test_app(store: Store) -> Router {
-        let routes = app_routes()
+        let routes = app_routes(store.clone())
             .route(
                 "/__test/panic",
                 get(|| async { panic!("handler exploded") }),

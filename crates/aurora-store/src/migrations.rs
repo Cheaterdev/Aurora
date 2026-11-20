@@ -32,6 +32,11 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         name: "consumer_cursor",
         sql: include_str!("../migrations/0004_consumer_cursor.sql"),
     },
+    Migration {
+        version: 5,
+        name: "auth",
+        sql: include_str!("../migrations/0005_auth.sql"),
+    },
 ];
 
 /// The schema version this binary produces and understands.

@@ -4,16 +4,21 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
 
+mod common;
+
 struct Api {
     addr: std::net::SocketAddr,
+    key: String,
 }
 
 impl Api {
     async fn call(&self, method: &str, path: &str, body: Option<Value>) -> (u16, Value) {
         let body = body.map(|b| b.to_string()).unwrap_or_default();
         let mut stream = TcpStream::connect(self.addr).await.unwrap();
+        let key = &self.key;
         let request = format!(
             "{method} /api/v1{path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\
+             Authorization: Bearer {key}\r\n\
              Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
             body.len()
         );
@@ -54,6 +59,7 @@ async fn projects_columns_issue_types_and_labels_over_http() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let api = Api {
         addr: listener.local_addr().unwrap(),
+        key: common::owner_key(&store).await,
     };
     let (stop, stopped) = oneshot::channel::<()>();
     let server = tokio::spawn(aurora::serve(

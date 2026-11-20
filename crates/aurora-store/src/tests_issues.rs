@@ -117,7 +117,7 @@ impl Setup {
         self.store
             .write(move |tx| {
                 tx.execute(
-                    "INSERT INTO user (id, name, kind) VALUES (?1, 'U', 'human')",
+                    "INSERT INTO user (id, name, kind) VALUES (?1, 'U' || ?1, 'human')",
                     [id],
                 )?;
                 Ok(())

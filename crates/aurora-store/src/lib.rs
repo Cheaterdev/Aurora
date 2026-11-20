@@ -2,6 +2,7 @@
 //! single writer task. Every write goes through [`Store::write`]; reads use
 //! their own read-only connections via [`Store::read`].
 
+pub mod auth;
 mod backup;
 pub mod events;
 mod integrity;
@@ -50,6 +51,10 @@ pub enum StoreError {
     Panicked,
     #[error("the store is closed")]
     Closed,
+    #[error("the operating system could not provide random bytes")]
+    Random,
+    #[error("password hashing failed: {0}")]
+    Hashing(String),
     /// The request was understood and refused; nothing was changed.
     #[error(transparent)]
     Rejected(#[from] Rejection),
@@ -433,6 +438,10 @@ mod tests_0002;
 mod tests_0003;
 #[cfg(test)]
 mod tests_0004;
+#[cfg(test)]
+mod tests_0005;
+#[cfg(test)]
+mod tests_auth;
 #[cfg(test)]
 mod tests_events;
 #[cfg(test)]

@@ -29,7 +29,8 @@ async fn populated_version_three_database_gains_cursors_and_keeps_its_events() {
     .unwrap();
     v3.close().await;
 
-    let store = Store::open(&path).unwrap();
+    let store =
+        Store::open_with_migrations(&path, &OpenOptions::default(), &MIGRATIONS[..4]).unwrap();
     assert_eq!(store.schema_version(), 4);
     let backup = store.open_report().backup.clone().expect("backup taken");
     assert!(backup.starts_with(default_backup_dir(&path)));

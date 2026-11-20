@@ -21,6 +21,12 @@ pub enum Rejection {
     Conflict(String),
     #[error("{0}")]
     Invalid(String),
+    /// No valid credentials.
+    #[error("{0}")]
+    Unauthorized(String),
+    /// Valid credentials that may not do this.
+    #[error("{0}")]
+    Forbidden(String),
 }
 
 pub(crate) fn not_found(what: &str) -> StoreError {
@@ -36,7 +42,7 @@ pub(crate) fn invalid(reason: impl Into<String>) -> StoreError {
 }
 
 /// A unique or foreign-key violation is a refusal, not a database failure.
-fn refusal(err: rusqlite::Error, reason: impl FnOnce() -> String) -> StoreError {
+pub(crate) fn refusal(err: rusqlite::Error, reason: impl FnOnce() -> String) -> StoreError {
     match &err {
         rusqlite::Error::SqliteFailure(code, _) if code.code == ErrorCode::ConstraintViolation => {
             conflict(reason())
@@ -235,12 +241,37 @@ pub(crate) fn emit(
     kind: &str,
     payload: &Value,
 ) -> Result<(), StoreError> {
-    // The actor stays NULL until authentication exists.
+    // The actor stays NULL for project and issue events until the HTTP layer
+    // passes the principal down to these functions (a follow-up to TRK-2).
+    emit_as(
+        conn,
+        now,
+        None,
+        Some(project_id),
+        entity_kind,
+        entity_id,
+        kind,
+        payload,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn emit_as(
+    conn: &Connection,
+    now: i64,
+    actor_id: Option<i64>,
+    project_id: Option<i64>,
+    entity_kind: &str,
+    entity_id: i64,
+    kind: &str,
+    payload: &Value,
+) -> Result<(), StoreError> {
     conn.execute(
         "INSERT INTO event (time, actor_id, project_id, entity_kind, entity_id, kind, payload_json)
-         VALUES (?1, NULL, ?2, ?3, ?4, ?5, ?6)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         params![
             now,
+            actor_id,
             project_id,
             entity_kind,
             entity_id,
