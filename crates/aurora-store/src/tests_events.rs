@@ -6,6 +6,8 @@ use std::collections::BTreeMap;
 use rusqlite::Transaction;
 use serde_json::Value;
 
+use crate::auth::{Principal, Role, Scope};
+use crate::comments::{self, NewComment};
 use crate::events::{self, Event, EventFilter, Start};
 use crate::projects::{NewColumn, Rejection, StateType};
 use crate::tests_support::issues::{self, IssuePatch, MoveTarget, NewIssue, Priority};
@@ -519,6 +521,7 @@ fn no_store_function_edits_an_event() {
     for (file, source) in [
         ("projects.rs", include_str!("projects.rs")),
         ("issues.rs", include_str!("issues.rs")),
+        ("comments.rs", include_str!("comments.rs")),
         ("events.rs", include_str!("events.rs")),
     ] {
         let source = source.to_lowercase();
@@ -554,6 +557,43 @@ struct Snapshot {
     /// link id -> (kind, project id, from number, to number); a `relates` link
     /// has the lower number first
     links: BTreeMap<i64, (String, i64, i64, i64)>,
+    /// comment id -> comment, for the comments a reader sees
+    comments: BTreeMap<i64, CommentSnap>,
+}
+
+#[derive(Debug, PartialEq)]
+struct CommentSnap {
+    issue_id: i64,
+    parent: Option<i64>,
+    author: i64,
+    mentions: Vec<String>,
+    edited: bool,
+    deleted: bool,
+}
+
+fn strings(value: &Value) -> Vec<String> {
+    value.as_array().unwrap().iter().map(text).collect()
+}
+
+/// What readers see: a deleted reply is gone, a deleted top-level comment only
+/// stays while a live reply hangs off it, and a deleted comment has no mentions.
+fn visible(comments: &mut BTreeMap<i64, CommentSnap>) {
+    let with_replies: std::collections::BTreeSet<i64> = comments
+        .values()
+        .filter(|c| !c.deleted)
+        .filter_map(|c| c.parent)
+        .collect();
+    let gone: Vec<i64> = comments
+        .iter()
+        .filter(|(id, c)| c.deleted && (c.parent.is_some() || !with_replies.contains(id)))
+        .map(|(id, _)| *id)
+        .collect();
+    for id in gone {
+        comments.remove(&id);
+    }
+    for c in comments.values_mut().filter(|c| c.deleted) {
+        c.mentions.clear();
+    }
 }
 
 fn link_snap(kind: &str, pid: i64, from: i64, to: i64) -> (String, i64, i64, i64) {
@@ -688,9 +728,43 @@ fn replay(log: &[Event]) -> Snapshot {
             "link.removed" => {
                 s.links.remove(&p["link_id"].as_i64().unwrap());
             }
+            "comment.created" => {
+                s.comments.insert(
+                    p["comment_id"].as_i64().unwrap(),
+                    CommentSnap {
+                        issue_id: e.entity_id,
+                        parent: p["parent"].as_i64(),
+                        author: p["author"]["id"].as_i64().unwrap(),
+                        mentions: strings(&p["mentions"]),
+                        edited: false,
+                        deleted: false,
+                    },
+                );
+            }
+            "comment.edited" => {
+                let c = s
+                    .comments
+                    .get_mut(&p["comment_id"].as_i64().unwrap())
+                    .unwrap();
+                c.mentions = strings(&p["mentions"]);
+                c.edited = true;
+            }
+            "comment.deleted" => {
+                s.comments
+                    .get_mut(&p["comment_id"].as_i64().unwrap())
+                    .unwrap()
+                    .deleted = true;
+            }
+            "mention.created" => {
+                // No state of its own: it names a user the comment mentions.
+                let c = &s.comments[&p["comment_id"].as_i64().unwrap()];
+                assert!(c.mentions.contains(&text(&p["user_name"])));
+                assert_eq!(c.issue_id, e.entity_id);
+            }
             other => panic!("replay does not know the event kind {other}"),
         }
     }
+    visible(&mut s.comments);
     for names in s.columns.values_mut() {
         names.sort();
     }
@@ -726,6 +800,25 @@ async fn read_state(store: &Store) -> Snapshot {
                     },
                 )?;
                 for i in &list.issues {
+                    for top in comments::list_comments(c, &project.key, i.number)? {
+                        for comment in std::iter::once(&top).chain(top.replies.iter()) {
+                            s.comments.insert(
+                                comment.id,
+                                CommentSnap {
+                                    issue_id: i.id,
+                                    parent: comment.parent,
+                                    author: comment.author.id,
+                                    mentions: comment
+                                        .mentions
+                                        .iter()
+                                        .map(|m| m.name.clone())
+                                        .collect(),
+                                    edited: comment.edited.is_some(),
+                                    deleted: comment.deleted.is_some(),
+                                },
+                            );
+                        }
+                    }
                     let found = links::list_links(c, &project.key, i.number)?;
                     for other in &found.blocks {
                         s.links.insert(
@@ -1033,12 +1126,105 @@ async fn replaying_the_log_rebuilds_the_state() {
     })
     .await;
 
+    // Comments: threads, edits that add and drop mentions, deletes of every kind.
+    run(s, |tx| {
+        tx.execute(
+            "INSERT INTO user (id, name, kind) VALUES (2, 'bot', 'agent')",
+            [],
+        )?;
+        Ok(())
+    })
+    .await;
+    let ann = Principal {
+        user_id: 1,
+        role: Role::Member,
+        scope: Scope::Write,
+    };
+    let bot = Principal {
+        user_id: 2,
+        role: Role::Agent,
+        scope: Scope::Write,
+    };
+    let comment = |now: i64,
+                   who: Principal,
+                   key: &'static str,
+                   issue: i64,
+                   body: &'static str,
+                   parent: Option<i64>| {
+        (
+            now,
+            who,
+            key,
+            issue,
+            NewComment {
+                body: body.into(),
+                parent,
+            },
+        )
+    };
+    let mut ids = Vec::new();
+    for (now, who, key, issue, new) in [
+        comment(70, ann, "TRK", 1, "hi @bot", None),
+        comment(71, bot, "TRK", 1, "thanks @Ann", Some(1)),
+        comment(72, ann, "TRK", 2, "plain", None),
+        comment(73, ann, "TRK", 1, "gone soon", Some(1)),
+        comment(74, ann, "OTH", 1, "@bot @ann @bot", None),
+    ] {
+        // `Some(1)` stands for the first comment created above.
+        let new = NewComment {
+            parent: new.parent.map(|_| ids[0]),
+            ..new
+        };
+        let added = run(s, move |tx| {
+            comments::add_comment(tx, now, &who, key, issue, new)
+        })
+        .await;
+        ids.push(added.id);
+    }
+    let [hi, thanks, plain, soon, other] = ids[..] else {
+        panic!("five comments")
+    };
+    run(s, move |tx| {
+        comments::edit_comment(tx, 75, &ann, "TRK", hi, "hi @bot and @Ann")
+    })
+    .await;
+    run(s, move |tx| {
+        comments::edit_comment(tx, 76, &bot, "TRK", thanks, "no mentions")
+    })
+    .await;
+    run(s, move |tx| {
+        comments::edit_comment(tx, 77, &ann, "OTH", other, "@bot only")
+    })
+    .await;
+    run(s, move |tx| {
+        comments::delete_comment(tx, 78, &ann, "TRK", soon)
+    })
+    .await;
+    run(s, move |tx| {
+        comments::delete_comment(tx, 79, &ann, "TRK", plain)
+    })
+    .await;
+    run(s, move |tx| {
+        comments::delete_comment(tx, 80, &ann, "TRK", hi)
+    })
+    .await;
+
     let log = all_events(s).await;
     assert!(log.len() > 30, "{} events", log.len());
     let replayed = replay(&log);
     let actual = read_state(s).await;
     assert_eq!(replayed, actual);
     assert_eq!(actual.links.len(), 3);
+
+    // Visible: the placeholder of `hi` (its reply stays), the reply and the OTH
+    // comment; the deleted reply and the deleted lone comment are gone.
+    assert_eq!(actual.comments.len(), 3);
+    assert!(actual.comments[&hi].deleted && actual.comments[&hi].mentions.is_empty());
+    assert_eq!(actual.comments[&thanks].parent, Some(hi));
+    assert!(actual.comments[&thanks].edited && actual.comments[&thanks].mentions.is_empty());
+    assert_eq!(actual.comments[&other].mentions, ["bot"]);
+    assert!(!actual.comments.contains_key(&soon) && !actual.comments.contains_key(&plain));
+    assert!(log.iter().any(|e| e.kind == "mention.created"));
 
     // The scenario really exercised the state, not an empty model.
     assert_eq!(actual.issues.len(), 4);

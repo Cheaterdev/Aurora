@@ -4,6 +4,7 @@ use std::collections::HashMap;
 
 use aurora_store::StoreError;
 use aurora_store::auth::{self, User};
+use aurora_store::comments::{self, Comment};
 use aurora_store::events::{self, Event};
 use aurora_store::issues::{self, Issue, IssueDetail, IssueFilter};
 use aurora_store::links::{self, Blocker};
@@ -42,6 +43,7 @@ pub struct IssueData {
     pub labels: Vec<Label>,
     pub users: Vec<User>,
     pub activity: Vec<Event>,
+    pub comments: Vec<Comment>,
     pub last_event: i64,
 }
 
@@ -108,7 +110,26 @@ pub fn load_issue(
         labels: projects::list_labels(conn, key)?,
         users: auth::list_users(conn)?,
         activity,
+        comments: comments::list_comments(conn, key, number)?,
         last_event,
+    })
+}
+
+/// The comments list alone, for the live refresh of an issue page.
+pub struct CommentsData {
+    pub viewer: User,
+    pub comments: Vec<Comment>,
+}
+
+pub fn load_comments(
+    conn: &Connection,
+    user_id: i64,
+    key: &str,
+    number: i64,
+) -> Result<CommentsData, StoreError> {
+    Ok(CommentsData {
+        viewer: auth::get_user(conn, user_id)?,
+        comments: comments::list_comments(conn, key, number)?,
     })
 }
 

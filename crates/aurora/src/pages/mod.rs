@@ -3,8 +3,9 @@
 //! assets and the live event stream.
 //!
 //! Pages are plain HTML from [`view`]; the little script in
-//! `assets/app.js` talks to the JSON API and re-fetches the board and
-//! activity fragments (`/p/{key}/board`, `/p/{key}/{n}/activity`) when
+//! `assets/app.js` talks to the JSON API and re-fetches the board, activity and
+//! comments fragments (`/p/{key}/board`, `/p/{key}/{n}/activity`,
+//! `/p/{key}/{n}/comments`) when
 //! `/events/stream` reports a change. Pages need the session cookie; a request
 //! without one is redirected to `/sign-in` (or to `/setup` while there is no
 //! owner), except fragment requests from the script, which get a 401.
@@ -46,6 +47,7 @@ pub fn router(store: Store, live: Live) -> Router<Store> {
         .route("/p/{key}/board", get(board_fragment))
         .route("/p/{key}/{number}", get(issue_page))
         .route("/p/{key}/{number}/activity", get(activity_fragment))
+        .route("/p/{key}/{number}/comments", get(comments_fragment))
         .layer(middleware::from_fn_with_state(
             store.clone(),
             require_page_auth,
@@ -367,4 +369,15 @@ async fn activity_fragment(
         .read(move |c| data::load_activity(c, &key, number))
         .await?;
     Ok(ok(view::activity_fragment(&activity)))
+}
+
+async fn comments_fragment(
+    State(store): State<Store>,
+    Extension(principal): Extension<Principal>,
+    Path((key, number)): Path<(String, i64)>,
+) -> PageResult {
+    let data = store
+        .read(move |c| data::load_comments(c, principal.user_id, &key, number))
+        .await?;
+    Ok(ok(view::comments_fragment(&data)))
 }

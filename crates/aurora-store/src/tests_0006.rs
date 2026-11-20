@@ -33,7 +33,7 @@ async fn populated_version_five_database_gains_links_and_keeps_its_data() {
     v5.close().await;
 
     let store = Store::open(&path).unwrap();
-    assert_eq!(store.schema_version(), 6);
+    assert_eq!(store.schema_version(), crate::latest_version());
     let backup = store.open_report().backup.clone().expect("backup taken");
     assert!(backup.starts_with(default_backup_dir(&path)));
 

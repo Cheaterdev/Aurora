@@ -264,13 +264,21 @@
       saveField($('#f-description'));
     } else if (action === 'remove-link') {
       removeLink(button);
+    } else if (action === 'show-reply' || action === 'show-edit') {
+      showCommentForm(button, action === 'show-reply' ? '.reply-form' : '.comment-edit');
+    } else if (action === 'hide-comment-form') {
+      hideCommentForm(button.closest('form'));
+    } else if (action === 'delete-comment') {
+      deleteComment(button);
     }
   });
 
   document.addEventListener('keydown', function (event) {
     if (event.key !== 'Escape') { return; }
     var form = event.target.closest && event.target.closest('.add-form');
-    if (form) { hideAddForm(form); }
+    if (form) { hideAddForm(form); return; }
+    var commentForm = event.target.closest && event.target.closest('.reply-form, .comment-edit');
+    if (commentForm) { hideCommentForm(commentForm); }
   });
 
   function withBusy(form, work) {
@@ -319,6 +327,16 @@
       };
       if (choice === 'blocked_by') { payload.direction = 'blocked_by'; }
       return api('POST', issuePath() + '/links', payload).then(function () { location.reload(); });
+    },
+    'add-comment': function (form) {
+      return postComment(form, {});
+    },
+    'add-reply': function (form) {
+      return postComment(form, { parent: Number(form.dataset.parentId) });
+    },
+    'edit-comment': function (form) {
+      return api('PATCH', '/projects/' + encodeURIComponent(project) + '/comments/' + form.dataset.commentId,
+        { body: form.elements.body.value }).then(function () { return refreshComments(true); });
     },
     'new-label': function (form) {
       return api('POST', '/projects/' + encodeURIComponent(project) + '/labels',
@@ -433,6 +451,80 @@
     });
   }
 
+  // ---- comments ----
+
+  var commentsTimer = null;
+  var commentsWanted = false;
+
+  // A refresh would throw away what is being typed: wait until the writing is done.
+  function composing() {
+    return $$('#comments textarea').some(function (area) {
+      var form = area.closest('form');
+      return form && !form.hidden && (area === document.activeElement || area.value !== area.defaultValue);
+    });
+  }
+
+  function refreshComments(force) {
+    if (!$('#comments')) { return Promise.resolve(); }
+    if (!force && composing()) { commentsWanted = true; return Promise.resolve(); }
+    commentsWanted = false;
+    return fetchFragment('/p/' + encodeURIComponent(project) + '/' + body.dataset.issueNumber + '/comments').then(function (html) {
+      var current = $('#comments');
+      if (!html || !current) { return; }
+      var fresh = parseFragment(html);
+      if (!fresh) { return; }
+      current.replaceWith(fresh);
+      localizeTimes(fresh);
+    });
+  }
+
+  function scheduleCommentsRefresh() {
+    clearTimeout(commentsTimer);
+    commentsTimer = setTimeout(function () { refreshComments(false); }, 150);
+  }
+
+  document.addEventListener('focusout', function () {
+    if (commentsWanted) { setTimeout(function () { if (commentsWanted) { refreshComments(false); } }, 50); }
+  });
+
+  function postComment(form, extra) {
+    var payload = { body: form.elements.body.value };
+    if (extra.parent) { payload.parent = extra.parent; }
+    return api('POST', issuePath() + '/comments', payload).then(function () {
+      form.reset();
+      return refreshComments(true);
+    });
+  }
+
+  function showCommentForm(button, selector) {
+    var item = button.closest('.comment');
+    var form = item && $(selector, item);
+    if (!form) { return; }
+    form.hidden = false;
+    var area = $('textarea', form);
+    if (area) { area.focus(); }
+  }
+
+  function hideCommentForm(form) {
+    if (!form) { return; }
+    var area = $('textarea', form);
+    if (area) { area.value = area.defaultValue; }
+    form.hidden = true;
+    message($('.field-msg', form), '');
+    if (commentsWanted) { refreshComments(false); }
+  }
+
+  function deleteComment(button) {
+    if (!window.confirm('Delete this comment?')) { return; }
+    var item = button.closest('.comment');
+    button.disabled = true;
+    api('DELETE', '/projects/' + encodeURIComponent(project) + '/comments/' + item.dataset.commentId)
+      .then(function () { return refreshComments(true); }, function (err) {
+        button.disabled = false;
+        message($('#page-msg'), err.message, 'error');
+      });
+  }
+
   // ---- live updates ----
 
   var lastEvent = Number(body.dataset.lastEvent || 0);
@@ -446,6 +538,7 @@
       scheduleBoardRefresh();
     } else if (page === 'issue' && data.entity_kind === 'issue' && String(data.entity_id) === body.dataset.issueId) {
       refreshActivity();
+      if (typeof data.kind === 'string' && data.kind.indexOf('comment.') === 0) { scheduleCommentsRefresh(); }
     }
   }
 

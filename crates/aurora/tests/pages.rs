@@ -1056,6 +1056,255 @@ async fn issue_page_lists_links_with_a_form_and_escapes_titles() {
     server.shutdown().await;
 }
 
+/// Posts a comment as the owner (cookie) and returns its id.
+async fn comment(server: &Server, cookie: &str, body: &str, parent: Option<i64>) -> i64 {
+    let (status, made) = server
+        .api(
+            cookie,
+            "POST",
+            "/projects/WEB/issues/1/comments",
+            json!({"body": body, "parent": parent}),
+        )
+        .await;
+    assert_eq!(status, 201, "{made}");
+    made["id"].as_i64().unwrap()
+}
+
+#[tokio::test]
+async fn issue_page_shows_threaded_comments_with_mentions_and_forms() {
+    let server = Server::start().await;
+    let cookie = server.owner_cookie().await;
+    seed(&server, &cookie).await;
+    let (status, agent) = server
+        .api(&cookie, "POST", "/users", json!({"name": "robot"}))
+        .await;
+    assert_eq!(status, 201);
+    // An agent whose name is markup: it must be shown as text.
+    let (status, odd) = server
+        .api(&cookie, "POST", "/users", json!({"name": "<i>odd</i>"}))
+        .await;
+    assert_eq!(status, 201);
+    let (_, key) = server
+        .api(
+            &cookie,
+            "POST",
+            "/keys",
+            json!({"name": "k", "user_id": odd["id"]}),
+        )
+        .await;
+    let bearer = format!("Bearer {}", key["key"].as_str().unwrap());
+
+    let empty = get(server.addr, "/p/WEB/1", Some(&cookie)).await.body;
+    assert!(empty.contains(r#"id="comments""#) && empty.contains("No comments yet."));
+    assert!(empty.contains(r#"data-form="add-comment""#));
+    assert!(!empty.contains(r#"data-form="add-reply""#));
+
+    let top = comment(
+        &server,
+        &cookie,
+        "Hi @robot, <script>alert(1)</script>\nsecond line @nobody",
+        None,
+    )
+    .await;
+    let reply = comment(&server, &cookie, "me too @ROBOT", Some(top)).await;
+    let resp = send(
+        server.addr,
+        "POST",
+        "/api/v1/projects/WEB/issues/1/comments",
+        &[
+            ("Authorization", bearer.as_str()),
+            ("Content-Type", "application/json"),
+        ],
+        &json!({"body": "from the odd one", "parent": top}).to_string(),
+    )
+    .await;
+    assert_eq!(resp.status, 201, "{}", resp.body);
+    let gone = comment(&server, &cookie, "to be removed", None).await;
+    let (status, _) = server
+        .api(
+            &cookie,
+            "DELETE",
+            &format!("/projects/WEB/comments/{gone}"),
+            Value::Null,
+        )
+        .await;
+    assert_eq!(status, 204);
+    let (status, _) = server
+        .api(
+            &cookie,
+            "PATCH",
+            &format!("/projects/WEB/comments/{reply}"),
+            json!({"body": "me too @ROBOT!"}),
+        )
+        .await;
+    assert_eq!(status, 200);
+    assert_eq!(agent["name"], "robot");
+
+    let page = get(server.addr, "/p/WEB/1", Some(&cookie)).await;
+    assert_eq!(page.status, 200);
+    let body = &page.body;
+    // Escaped body and author names; mentions wrapped; nothing raw.
+    assert!(
+        body.contains("&lt;script&gt;alert(1)&lt;/script&gt;"),
+        "{body}"
+    );
+    assert!(!body.contains("<script>alert(1)"));
+    assert!(body.contains("&lt;i&gt;odd&lt;/i&gt;") && !body.contains("<i>odd</i>"));
+    assert!(body.contains(r#"<span class="mention">@robot</span>"#));
+    assert!(body.contains(r#"<span class="mention">@ROBOT</span>"#));
+    assert!(!body.contains(r#"<span class="mention">@nobody"#));
+    assert!(body.contains("second line @nobody"));
+    assert!(body.contains("Hi <span"), "{body}");
+    assert!(body.contains(r#"class="comment-text""#));
+    assert!(body.contains(r#"class="chip">agent"#));
+
+    // Threaded: the top comment, then its replies inside the reply list, in order;
+    // the placeholder shows for no one else and the lone deleted comment is gone.
+    let at = |needle: &str| index_of(body, needle);
+    assert!(at(r#"id="comments""#) < at("Hi <span"));
+    assert!(at("Hi <span") < at(r#"class="reply-list""#));
+    assert!(at(r#"class="reply-list""#) < at("me too "));
+    assert!(at("me too ") < at("from the odd one"));
+    assert!(!body.contains("to be removed"));
+    assert!(!body.contains("This comment was deleted."));
+    assert!(
+        body.contains(r#"class="comment-edited""#),
+        "the edited reply is marked"
+    );
+    assert_eq!(
+        body.matches(r#"data-action="show-reply""#).count(),
+        1,
+        "top level only"
+    );
+
+    // Forms: add, reply (per top-level comment), edit; delete and edit buttons for the owner.
+    assert!(body.contains(r#"data-form="add-comment""#));
+    assert!(body.contains(&format!(r#"data-form="add-reply" data-parent-id="{top}""#)));
+    assert!(body.contains(&format!(
+        r#"data-form="edit-comment" data-comment-id="{reply}""#
+    )));
+    assert!(body.contains(r#"data-action="delete-comment""#));
+    assert!(body.matches("data-action=\"show-edit\"").count() >= 3);
+    assert!(body.contains(r#"<time class="when""#) && body.contains("data-ts="));
+    assert!(body.contains("maxlength=\"20000\""));
+
+    // The edit form carries the stored text (escaped), so editing starts from it.
+    assert!(body.contains("me too @ROBOT!</textarea>"));
+
+    // A deleted top-level comment with replies stays as a placeholder.
+    let (status, _) = server
+        .api(
+            &cookie,
+            "DELETE",
+            &format!("/projects/WEB/comments/{top}"),
+            Value::Null,
+        )
+        .await;
+    assert_eq!(status, 204);
+    let page = get(server.addr, "/p/WEB/1", Some(&cookie)).await.body;
+    assert!(page.contains("This comment was deleted."));
+    assert!(!page.contains("alert(1)"));
+    assert!(page.contains("from the odd one"));
+
+    // Activity says what happened and hides the mentions.
+    assert!(page.contains("commented"));
+    assert!(page.contains("replied to a comment"));
+    assert!(page.contains("edited a comment"));
+    assert!(page.contains("deleted a comment"));
+    assert!(
+        !page.contains("mention.created"),
+        "mentions are not activity"
+    );
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn comments_fragment_needs_a_session_and_renders_the_list_alone() {
+    let server = Server::start().await;
+    let cookie = server.owner_cookie().await;
+    seed(&server, &cookie).await;
+    comment(&server, &cookie, "fragment text", None).await;
+
+    let resp = get(server.addr, "/p/WEB/1/comments", Some(&cookie)).await;
+    assert_eq!(resp.status, 200);
+    assert!(resp.body.starts_with("<section"), "{}", resp.body);
+    assert!(resp.body.contains(r#"id="comments""#));
+    assert!(resp.body.contains("fragment text"));
+    assert!(!resp.body.contains("<html"));
+    assert_eq!(resp.header("cache-control"), Some("no-store"));
+
+    // The script refreshes with the CSRF header: no cookie is a plain 401, no redirect.
+    let resp = send(
+        server.addr,
+        "GET",
+        "/p/WEB/1/comments",
+        &[("X-Requested-With", "aurora")],
+        "",
+    )
+    .await;
+    assert_eq!(resp.status, 401);
+    let resp = get(server.addr, "/p/WEB/1/comments", None).await;
+    assert_eq!(resp.status, 303);
+    assert_eq!(
+        get(server.addr, "/p/WEB/99/comments", Some(&cookie))
+            .await
+            .status,
+        404
+    );
+    assert_eq!(
+        get(server.addr, "/p/NOPE/1/comments", Some(&cookie))
+            .await
+            .status,
+        404
+    );
+
+    // The script knows the forms and refreshes the fragment on comment events.
+    let js = get(server.addr, "/assets/app.js", None).await.body;
+    for needle in [
+        "'add-comment'",
+        "'add-reply'",
+        "'edit-comment'",
+        "/comments'",
+        "comment.",
+    ] {
+        assert!(js.contains(needle), "app.js lacks {needle}");
+    }
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn stream_reports_comment_events_for_the_issue() {
+    let server = Server::start().await;
+    let cookie = server.owner_cookie().await;
+    seed(&server, &cookie).await;
+    let mut sse = Sse::open(server.addr, "/events/stream?project=WEB", &cookie, None).await;
+    let id = comment(&server, &cookie, "live", None).await;
+    sse.read_until("comment.created").await;
+    let (status, _) = server
+        .api(
+            &cookie,
+            "PATCH",
+            &format!("/projects/WEB/comments/{id}"),
+            json!({"body": "live, edited"}),
+        )
+        .await;
+    assert_eq!(status, 200);
+    sse.read_until("comment.edited").await;
+    let events = sse.events();
+    assert_eq!(events[0]["kind"], "comment.created");
+    assert_eq!(
+        events[0]["entity_kind"], "issue",
+        "the page reacts to its own issue's events"
+    );
+    assert_eq!(events[0]["entity_id"], 1);
+    assert!(
+        !sse.seen.contains("live, edited"),
+        "the stream carries no comment text"
+    );
+    server.shutdown().await;
+}
+
 #[tokio::test]
 async fn shutdown_ends_open_streams_without_waiting_for_the_drain() {
     let server = Server::start().await;

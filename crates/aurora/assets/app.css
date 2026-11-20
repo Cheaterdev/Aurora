@@ -677,6 +677,89 @@ main {
   font-size: 0.8rem;
 }
 
+/* ---- comments ---- */
+
+.comment-list,
+.reply-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.comment-list > li {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 10px 12px;
+  margin-bottom: var(--gap);
+}
+
+.reply-list {
+  margin: 8px 0 0 12px;
+  padding-left: 12px;
+  border-left: 3px solid var(--border);
+}
+
+.reply-list > li {
+  padding: 8px 0;
+}
+
+.comment-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 2px 8px;
+}
+
+.comment-text {
+  margin: 4px 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.comment-deleted {
+  margin: 4px 0;
+  color: var(--muted);
+  font-style: italic;
+}
+
+.comment-edited {
+  color: var(--muted);
+  font-size: 0.8rem;
+}
+
+.mention {
+  background: var(--chip-bg);
+  color: var(--accent);
+  border-radius: var(--radius-small);
+  padding: 0 3px;
+  font-weight: 600;
+}
+
+.comment-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.comment-form,
+.comment-edit,
+.reply-form {
+  margin-top: 8px;
+}
+
+.comment-edit[hidden],
+.reply-form[hidden] {
+  display: none;
+}
+
+.comment-form textarea,
+.comment-edit textarea,
+.reply-form textarea {
+  font-family: var(--font);
+  min-height: 88px;
+}
+
 /* ---- toasts ---- */
 
 .toasts {

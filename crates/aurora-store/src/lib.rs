@@ -12,6 +12,7 @@ macro_rules! open_blocker {
 
 pub mod auth;
 mod backup;
+pub mod comments;
 pub mod events;
 mod integrity;
 pub mod issues;
@@ -695,9 +696,13 @@ mod tests_0005;
 #[cfg(test)]
 mod tests_0006;
 #[cfg(test)]
+mod tests_0007;
+#[cfg(test)]
 mod tests_actor;
 #[cfg(test)]
 mod tests_auth;
+#[cfg(test)]
+mod tests_comments;
 #[cfg(test)]
 mod tests_events;
 #[cfg(test)]

@@ -5,7 +5,8 @@
 
 use std::collections::HashMap;
 
-use aurora_store::auth::User;
+use aurora_store::auth::{Role, User};
+use aurora_store::comments::{Comment, mention_ranges};
 use aurora_store::events::Event;
 use aurora_store::issues::{Issue, Priority};
 use aurora_store::links::{Blocker, IssueLinks, LinkedIssue};
@@ -14,7 +15,7 @@ use maud::{DOCTYPE, Markup, html};
 use serde_json::Value;
 
 use super::assets;
-use super::data::{ActivityData, BoardData, HomeData, IssueData};
+use super::data::{ActivityData, BoardData, CommentsData, HomeData, IssueData};
 use super::time::{utc_iso, utc_text};
 
 const PRIORITIES: [Priority; 4] = [
@@ -510,6 +511,16 @@ fn describe(event: &Event, lookup: &Lookup<'_>) -> (String, Vec<String>) {
                 Vec::new(),
             )
         }
+        "comment.created" => {
+            let text = if payload["parent"].is_null() {
+                "commented"
+            } else {
+                "replied to a comment"
+            };
+            (text.to_string(), Vec::new())
+        }
+        "comment.edited" => ("edited a comment".to_string(), Vec::new()),
+        "comment.deleted" => ("deleted a comment".to_string(), Vec::new()),
         "issue.archived" => ("archived the issue".to_string(), Vec::new()),
         "issue.unarchived" => ("restored the issue".to_string(), Vec::new()),
         "issue.updated" => {
@@ -540,14 +551,20 @@ fn describe(event: &Event, lookup: &Lookup<'_>) -> (String, Vec<String>) {
 }
 
 fn activity_list(events: &[Event], lookup: &Lookup<'_>) -> Markup {
+    // A mention is for the runner and the mentioned user; the comment line says enough.
+    let shown: Vec<&Event> = events
+        .iter()
+        .rev()
+        .filter(|e| e.kind != "mention.created")
+        .collect();
     html! {
         section #activity.activity aria-labelledby="activity-heading" {
             h2 #activity-heading { "Activity" }
-            @if events.is_empty() {
+            @if shown.is_empty() {
                 p.empty { "Nothing yet." }
             } @else {
                 ol.activity-list {
-                    @for event in events.iter().rev() {
+                    @for event in shown {
                         @let (headline, lines) = describe(event, lookup);
                         li data-kind=(event.kind) {
                             p {
@@ -635,6 +652,142 @@ fn links_section(links: &IssueLinks, blocked: bool, key: &str, lookup: &Lookup<'
     }
 }
 
+/// The body split at the mentions it resolved to: `(is_mention, text)`.
+fn body_pieces(comment: &Comment) -> Vec<(bool, &str)> {
+    let names: Vec<&str> = comment.mentions.iter().map(|m| m.name.as_str()).collect();
+    let mut pieces = Vec::new();
+    let mut at = 0;
+    for range in mention_ranges(&comment.body, &names) {
+        if range.start > at {
+            pieces.push((false, &comment.body[at..range.start]));
+        }
+        pieces.push((true, &comment.body[range.start..range.end]));
+        at = range.end;
+    }
+    if at < comment.body.len() {
+        pieces.push((false, &comment.body[at..]));
+    }
+    pieces
+}
+
+fn comment_form(
+    kind: &'static str,
+    label: &str,
+    initial: &str,
+    parent: Option<i64>,
+    comment: Option<i64>,
+    submit: &str,
+) -> Markup {
+    let id = match (comment, parent) {
+        (Some(id), _) => format!("edit-{id}"),
+        (None, Some(id)) => format!("reply-{id}"),
+        (None, None) => "new-comment".to_string(),
+    };
+    let class = match kind {
+        "edit-comment" => "comment-edit",
+        "add-reply" => "reply-form",
+        _ => "comment-form",
+    };
+    html! {
+        form class=(class) data-form=(kind) data-parent-id=[parent] data-comment-id=[comment]
+            hidden[kind != "add-comment"] {
+            div.field {
+                label for=(id) { (label) }
+                textarea id=(id) name="body" rows="4" required maxlength="20000" {
+                    "\n" (initial)
+                }
+            }
+            div.row {
+                button.primary type="submit" { (submit) }
+                @if kind != "add-comment" {
+                    button type="button" data-action="hide-comment-form" { "Cancel" }
+                }
+            }
+            p.field-msg role="alert" {}
+        }
+    }
+}
+
+fn comment_item(comment: &Comment, viewer: &User) -> Markup {
+    let may_change = comment.author.id == viewer.id || viewer.role == Role::Owner;
+    let top_level = comment.parent.is_none();
+    let deleted = comment.deleted.is_some();
+    html! {
+        li.comment.reply[!top_level] id={ "comment-" (comment.id) } data-comment-id=(comment.id) {
+            div.comment-head {
+                strong { (comment.author.name) }
+                @if comment.author.kind == "agent" { span.chip { "agent" } }
+                time.when datetime=(utc_iso(comment.created)) data-ts=(comment.created) {
+                    (utc_text(comment.created))
+                }
+                @if let (Some(edited), false) = (comment.edited, deleted) {
+                    span.comment-edited title=(utc_text(edited)) { "edited" }
+                }
+            }
+            @if deleted {
+                p.comment-deleted { "This comment was deleted." }
+            } @else {
+                p.comment-text {
+                    @for (is_mention, piece) in body_pieces(comment) {
+                        @if is_mention { span.mention { (piece) } } @else { (piece) }
+                    }
+                }
+                div.comment-actions {
+                    @if top_level {
+                        button type="button" data-action="show-reply" {
+                            "Reply"
+                            span.sr-only { " to " (comment.author.name) }
+                        }
+                    }
+                    @if may_change {
+                        button type="button" data-action="show-edit" {
+                            "Edit"
+                            span.sr-only { " comment by " (comment.author.name) }
+                        }
+                        button type="button" data-action="delete-comment" {
+                            "Delete"
+                            span.sr-only { " comment by " (comment.author.name) }
+                        }
+                    }
+                }
+                @if may_change {
+                    (comment_form("edit-comment", "Edit your comment", &comment.body, None, Some(comment.id), "Save"))
+                }
+            }
+            @if top_level {
+                @if !comment.replies.is_empty() {
+                    ol.reply-list {
+                        @for reply in &comment.replies { (comment_item(reply, viewer)) }
+                    }
+                }
+                @if !deleted {
+                    (comment_form("add-reply", "Reply", "", Some(comment.id), None, "Reply"))
+                }
+            }
+        }
+    }
+}
+
+fn comments_list(comments: &[Comment], viewer: &User) -> Markup {
+    html! {
+        section #comments.comments aria-labelledby="comments-heading" {
+            h2 #comments-heading { "Comments" }
+            @if comments.is_empty() {
+                p.empty { "No comments yet." }
+            } @else {
+                ol.comment-list {
+                    @for comment in comments { (comment_item(comment, viewer)) }
+                }
+            }
+            (comment_form("add-comment", "Add a comment", "", None, None, "Comment"))
+        }
+    }
+}
+
+pub fn comments_fragment(data: &CommentsData) -> Markup {
+    comments_list(&data.comments, &data.viewer)
+}
+
 pub fn activity_fragment(data: &ActivityData) -> Markup {
     let lookup = Lookup::new(&data.columns, &data.types, &data.labels, &data.users);
     activity_list(&data.activity, &lookup)
@@ -716,6 +869,7 @@ pub fn issue_page(data: &IssueData) -> Markup {
                             }
                         }
                         (links_section(&data.detail.links, issue.blocked, key, &lookup))
+                        (comments_list(&data.comments, &data.user))
                         (activity_list(&data.activity, &lookup))
                     }
                     aside.issue-side aria-label="Fields" {

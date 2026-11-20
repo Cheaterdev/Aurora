@@ -6,6 +6,7 @@
 //! `POST /auth/sign-in`; `/health` lives outside the API.
 
 use aurora_store::auth::Principal;
+use aurora_store::comments::{self, NewComment};
 use aurora_store::events::{self, EventFilter, Start};
 use aurora_store::issues::{self, IssueFilter, IssuePatch, MoveTarget, NewIssue, ParentFilter};
 use aurora_store::links::{self, LinkKind};
@@ -87,6 +88,14 @@ pub fn api_router(store: Store) -> Router<Store> {
             get(list_links).post(add_link),
         )
         .route("/projects/{key}/links/{id}", delete(remove_link))
+        .route(
+            "/projects/{key}/issues/{number}/comments",
+            get(list_comments).post(add_comment),
+        )
+        .route(
+            "/projects/{key}/comments/{id}",
+            patch(edit_comment).delete(delete_comment),
+        )
         .route("/events", get(list_events))
         .route("/consumers", get(list_consumers))
         .route(
@@ -706,6 +715,59 @@ async fn remove_link(
 ) -> ApiResult<Response> {
     store
         .write(move |tx| links::remove_link(tx, now_millis(), &actor, &key, id))
+        .await?;
+    Ok(no_content())
+}
+
+// ---- comments ----
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CommentBody {
+    body: String,
+}
+
+async fn list_comments(
+    State(store): State<Store>,
+    Path((key, number)): Path<(String, i64)>,
+) -> ApiResult<Response> {
+    let found = store
+        .read(move |c| comments::list_comments(c, &key, number))
+        .await?;
+    Ok(Json(found).into_response())
+}
+
+async fn add_comment(
+    State(store): State<Store>,
+    Extension(actor): Extension<Principal>,
+    Path((key, number)): Path<(String, i64)>,
+    ApiJson(body): ApiJson<NewComment>,
+) -> ApiResult<Response> {
+    let comment = store
+        .write(move |tx| comments::add_comment(tx, now_millis(), &actor, &key, number, body))
+        .await?;
+    Ok(created(comment))
+}
+
+async fn edit_comment(
+    State(store): State<Store>,
+    Extension(actor): Extension<Principal>,
+    Path((key, id)): Path<(String, i64)>,
+    ApiJson(body): ApiJson<CommentBody>,
+) -> ApiResult<Response> {
+    let comment = store
+        .write(move |tx| comments::edit_comment(tx, now_millis(), &actor, &key, id, &body.body))
+        .await?;
+    Ok(Json(comment).into_response())
+}
+
+async fn delete_comment(
+    State(store): State<Store>,
+    Extension(actor): Extension<Principal>,
+    Path((key, id)): Path<(String, i64)>,
+) -> ApiResult<Response> {
+    store
+        .write(move |tx| comments::delete_comment(tx, now_millis(), &actor, &key, id))
         .await?;
     Ok(no_content())
 }
