@@ -11,7 +11,9 @@ use aurora_store::issues::{self, Issue, IssueDetail, IssueFilter};
 use aurora_store::links::{self, Blocker};
 use aurora_store::projects::{self, Column, IssueType, Label, Project};
 use aurora_store::rusqlite::Connection;
-use aurora_store::{StoreError, now_millis};
+use aurora_store::search::{self, Kind, SearchQuery, SearchResults};
+use aurora_store::{Rejection, StoreError, now_millis};
+use axum::http::StatusCode;
 
 /// How many log entries the issue page shows.
 const ACTIVITY_LIMIT: i64 = 100;
@@ -106,6 +108,95 @@ fn project_initiatives(conn: &Connection, key: &str) -> Result<Vec<Initiative>, 
             .map(|view| view.initiative)
             .collect(),
     )
+}
+
+/// Results per page of `/search`.
+pub const SEARCH_PAGE_SIZE: i64 = 20;
+
+/// What the search page was asked for, as the address says it.
+pub struct SearchRequest {
+    pub q: String,
+    pub project: Option<String>,
+    pub kind: Option<String>,
+    pub include_archived: bool,
+    /// 1-based.
+    pub page: i64,
+}
+
+pub enum SearchOutcome {
+    /// No words were given yet.
+    Idle,
+    Found(SearchResults),
+    Refused {
+        message: String,
+        status: StatusCode,
+    },
+}
+
+pub struct SearchData {
+    pub user: User,
+    pub projects: Vec<Project>,
+    pub q: String,
+    pub project: Option<String>,
+    pub kind: Option<Kind>,
+    pub include_archived: bool,
+    pub page: i64,
+    pub outcome: SearchOutcome,
+}
+
+pub fn load_search(
+    conn: &Connection,
+    user_id: i64,
+    request: SearchRequest,
+) -> Result<SearchData, StoreError> {
+    let SearchRequest {
+        q,
+        project,
+        kind,
+        include_archived,
+        page,
+    } = request;
+    let kind_text = kind.filter(|k| !k.is_empty());
+    let kind = kind_text.as_deref().and_then(Kind::parse);
+    let refused = |message: String, status| SearchOutcome::Refused { message, status };
+    let outcome = if kind_text.is_some() && kind.is_none() {
+        refused(
+            "Look in issues, comments or documents.".to_string(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+        )
+    } else if q.trim().is_empty() {
+        SearchOutcome::Idle
+    } else {
+        let query = SearchQuery {
+            q: q.clone(),
+            project: project.clone(),
+            kinds: kind.map(|k| vec![k]),
+            include_archived,
+            limit: Some(SEARCH_PAGE_SIZE),
+            offset: Some((page - 1) * SEARCH_PAGE_SIZE),
+        };
+        match search::search(conn, &query) {
+            Ok(found) => SearchOutcome::Found(found),
+            Err(StoreError::Rejected(Rejection::NotFound(_))) => refused(
+                "There is no such project.".to_string(),
+                StatusCode::NOT_FOUND,
+            ),
+            Err(StoreError::Rejected(Rejection::Invalid(reason))) => {
+                refused(reason, StatusCode::UNPROCESSABLE_ENTITY)
+            }
+            Err(other) => return Err(other),
+        }
+    };
+    Ok(SearchData {
+        user: auth::get_user(conn, user_id)?,
+        projects: projects::list_projects(conn)?,
+        q,
+        project,
+        kind,
+        include_archived,
+        page,
+        outcome,
+    })
 }
 
 pub fn load_home(conn: &Connection, user_id: i64) -> Result<HomeData, StoreError> {

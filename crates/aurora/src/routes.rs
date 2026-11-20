@@ -13,6 +13,7 @@ use aurora_store::initiatives::{self, InitiativePatch, InitiativeStatus, NewInit
 use aurora_store::issues::{self, IssueFilter, IssuePatch, MoveTarget, NewIssue, ParentFilter};
 use aurora_store::links::{self, LinkKind};
 use aurora_store::projects::{self, NewColumn, StateType};
+use aurora_store::search::{self, Kind, SearchQuery};
 use aurora_store::{Rejection, Store, StoreError, now_millis};
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{FromRequest, FromRequestParts, Path, Query, Request, State};
@@ -146,6 +147,7 @@ pub fn api_router(store: Store) -> Router<Store> {
             "/projects/{key}/documents/{id}/links/{link_id}",
             delete(remove_document_link),
         )
+        .route("/search", get(search_all))
         .route("/events", get(list_events))
         .route("/consumers", get(list_consumers))
         .route(
@@ -1165,6 +1167,48 @@ async fn list_events(
         .read(move |c| events::read_events(c, query.after.unwrap_or(0), query.limit, &filter))
         .await?;
     Ok(Json(json!({ "events": list })).into_response())
+}
+
+// ---- search ----
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SearchParams {
+    q: Option<String>,
+    project: Option<String>,
+    /// Comma separated: `issue`, `comment`, `document`.
+    kind: Option<String>,
+    include_archived: Option<bool>,
+    limit: Option<i64>,
+    offset: Option<i64>,
+}
+
+async fn search_all(
+    State(store): State<Store>,
+    ApiQuery(params): ApiQuery<SearchParams>,
+) -> ApiResult<Response> {
+    let kinds = params.kind.as_deref().map(Kind::parse_list).transpose()?;
+    let query = SearchQuery {
+        q: params.q.unwrap_or_default(),
+        project: params.project,
+        kinds,
+        include_archived: params.include_archived.unwrap_or(false),
+        limit: params.limit,
+        offset: params.offset,
+    };
+    let echo = query.q.clone();
+    let limit = query.limit.unwrap_or(search::DEFAULT_LIMIT);
+    let offset = query.offset.unwrap_or(0);
+    let results = store.read(move |c| search::search(c, &query)).await?;
+    Ok(Json(json!({
+        "query": echo,
+        "total": results.total,
+        "total_capped": results.total_capped,
+        "limit": limit,
+        "offset": offset,
+        "hits": results.hits,
+    }))
+    .into_response())
 }
 
 async fn list_consumers(State(store): State<Store>) -> ApiResult<Response> {

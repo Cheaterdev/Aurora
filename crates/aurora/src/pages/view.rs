@@ -16,13 +16,15 @@ use aurora_store::initiatives::{Health, Initiative, InitiativeStatus, Initiative
 use aurora_store::issues::{Issue, Priority};
 use aurora_store::links::{Blocker, IssueLinks, LinkedIssue};
 use aurora_store::projects::{Column, IssueType, Label, Project};
+use aurora_store::search::{Hit, Kind, Segment};
 use maud::{DOCTYPE, Markup, html};
 use serde_json::Value;
 
 use super::assets;
 use super::data::{
     ActivityData, BoardData, CommentsData, DocumentData, DocumentsData, HistoryData, HomeData,
-    InitiativeData, InitiativesData, IssueData, RevisionData,
+    InitiativeData, InitiativesData, IssueData, RevisionData, SEARCH_PAGE_SIZE, SearchData,
+    SearchOutcome,
 };
 use super::time::{utc_iso, utc_text};
 use crate::markdown;
@@ -54,6 +56,8 @@ pub struct Frame<'a> {
     pub issue_number: Option<i64>,
     pub initiative_id: Option<i64>,
     pub document_id: Option<i64>,
+    /// The text the top bar's search box starts with.
+    pub search: Option<&'a str>,
 }
 
 impl<'a> Frame<'a> {
@@ -68,6 +72,7 @@ impl<'a> Frame<'a> {
             issue_number: None,
             initiative_id: None,
             document_id: None,
+            search: None,
         }
     }
 }
@@ -105,6 +110,15 @@ fn layout(frame: &Frame<'_>, content: Markup) -> Markup {
                             a href={ "/p/" (project.key) "/initiatives" } { "Initiatives" }
                             a href={ "/p/" (project.key) "/documents" } { "Documents" }
                             a href="/?list=1" { "All projects" }
+                        }
+                    }
+                    @if frame.user.is_some() {
+                        form.search method="get" action="/search" role="search" {
+                            label.sr-only for="search-q" { "Search issues, comments and documents" }
+                            input #search-q type="search" name="q" maxlength="200"
+                                value=[frame.search] placeholder="Search (press /)"
+                                autocomplete="off" aria-keyshortcuts="/";
+                            button type="submit" { "Search" }
                         }
                     }
                     @if let Some(user) = frame.user {
@@ -193,6 +207,172 @@ pub fn message(title: &str, text: &str, user: Option<&User>) -> Markup {
                 h1 { (title) }
                 p { (text) }
                 p { a href="/" { "Back to the projects" } }
+            }
+        },
+    )
+}
+
+// ---- search ----
+
+/// Matched runs in `<mark>`; every piece of text is escaped by maud.
+fn marked(segments: &[Segment]) -> Markup {
+    html! {
+        @for segment in segments {
+            @if segment.matched { mark { (segment.text) } } @else { (segment.text) }
+        }
+    }
+}
+
+fn search_url(data: &SearchData, page: i64) -> String {
+    let mut url = format!("/search?q={}", super::encode_component(&data.q));
+    if let Some(project) = &data.project {
+        url.push_str(&format!("&project={}", super::encode_component(project)));
+    }
+    if let Some(kind) = data.kind {
+        url.push_str(&format!("&kind={}", kind.as_str()));
+    }
+    if data.include_archived {
+        url.push_str("&include_archived=1");
+    }
+    if page > 1 {
+        url.push_str(&format!("&page={page}"));
+    }
+    url
+}
+
+fn kind_label(kind: Kind) -> &'static str {
+    match kind {
+        Kind::Issue => "Issue",
+        Kind::Comment => "Comment",
+        Kind::Document => "Document",
+    }
+}
+
+fn search_hit(hit: &Hit) -> Markup {
+    let key = hit.project.as_str();
+    let href = match (hit.kind, &hit.issue, &hit.document) {
+        (Kind::Issue, Some(issue), _) => format!("/p/{key}/{}", issue.number),
+        (Kind::Comment, Some(issue), _) => format!(
+            "/p/{key}/{}#comment-{}",
+            issue.number,
+            hit.comment_id.unwrap_or_default()
+        ),
+        (_, _, Some(document)) => format!("/p/{key}/documents/{}", document.id),
+        _ => format!("/p/{key}"),
+    };
+    html! {
+        li.search-hit {
+            div.hit-head {
+                span.chip.kind-badge { (kind_label(hit.kind)) }
+                a.hit-title href=(href) {
+                    @if let Some(issue) = &hit.issue {
+                        span.key { (issue.identifier) }
+                        @if hit.kind == Kind::Issue && !hit.title.is_empty() {
+                            (marked(&hit.title))
+                        } @else {
+                            (issue.title)
+                        }
+                    } @else if let Some(document) = &hit.document {
+                        @if hit.title.is_empty() { (document.title) } @else { (marked(&hit.title)) }
+                    }
+                }
+                @if hit.archived { span.chip.chip-archived { "Archived" } }
+                @if hit.exact { span.chip { "Identifier match" } }
+            }
+            @if !hit.snippet.is_empty() {
+                p.hit-snippet { (marked(&hit.snippet)) }
+            }
+        }
+    }
+}
+
+pub fn search_page(data: &SearchData) -> Markup {
+    let mut frame = Frame::new("Search", "search");
+    frame.user = Some(&data.user);
+    frame.search = Some(&data.q);
+    let kinds = [
+        (None, "Everything"),
+        (Some(Kind::Issue), "Issues"),
+        (Some(Kind::Comment), "Comments"),
+        (Some(Kind::Document), "Documents"),
+    ];
+    layout(
+        &frame,
+        html! {
+            section.page.search-page {
+                h1 { "Search" }
+                form.search-filters method="get" action="/search" {
+                    div.field {
+                        label for="search-page-q" { "Words" }
+                        input #search-page-q type="search" name="q" value=(data.q)
+                            maxlength="200" autocomplete="off";
+                    }
+                    div.field {
+                        label for="search-project" { "Project" }
+                        select #search-project name="project" {
+                            option value="" selected[data.project.is_none()] { "All projects" }
+                            @for project in &data.projects {
+                                option value=(project.key)
+                                    selected[data.project.as_deref() == Some(project.key.as_str())] {
+                                    (project.key) " " (project.name)
+                                }
+                            }
+                        }
+                    }
+                    div.field {
+                        label for="search-kind" { "Look in" }
+                        select #search-kind name="kind" {
+                            @for (kind, label) in kinds {
+                                option value=(kind.map_or("", Kind::as_str)) selected[data.kind == kind] {
+                                    (label)
+                                }
+                            }
+                        }
+                    }
+                    div.field.check {
+                        input #search-archived type="checkbox" name="include_archived" value="1"
+                            checked[data.include_archived];
+                        label for="search-archived" { "Include archived" }
+                    }
+                    button.primary type="submit" { "Search" }
+                }
+                @match &data.outcome {
+                    SearchOutcome::Idle => {
+                        p.empty {
+                            "Type words to find issues, comments and documents. "
+                            "An identifier such as TRK-12 jumps to that issue."
+                        }
+                    }
+                    SearchOutcome::Refused { message, .. } => {
+                        p.form-error role="alert" { (message) }
+                    }
+                    SearchOutcome::Found(results) if results.hits.is_empty() => {
+                        p.empty role="status" {
+                            "Nothing found for \u{201c}" (data.q) "\u{201d}. "
+                            "Try fewer or different words, or loosen the filters."
+                        }
+                    }
+                    SearchOutcome::Found(results) => {
+                        @let first = (data.page - 1) * SEARCH_PAGE_SIZE + 1;
+                        @let last = first + i64::try_from(results.hits.len()).unwrap_or(0) - 1;
+                        p.search-summary role="status" {
+                            "Results " (first) "\u{2013}" (last) " of "
+                            (results.total) @if results.total_capped { "+" }
+                        }
+                        ol.search-results {
+                            @for hit in &results.hits { (search_hit(hit)) }
+                        }
+                        nav.pager aria-label="Result pages" {
+                            @if data.page > 1 {
+                                a.button href=(search_url(data, data.page - 1)) { "Previous" }
+                            }
+                            span.pager-page { "Page " (data.page) }
+                            @if last < results.total {
+                                a.button href=(search_url(data, data.page + 1)) { "Next" }
+                            }
+                        }
+                    }
+                }
             }
         },
     )

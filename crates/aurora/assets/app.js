@@ -301,6 +301,18 @@
     if (commentForm) { hideCommentForm(commentForm); }
   });
 
+  // `/` jumps to the search box unless the person is typing somewhere.
+  document.addEventListener('keydown', function (event) {
+    if (event.key !== '/' || event.ctrlKey || event.metaKey || event.altKey) { return; }
+    var target = event.target;
+    if (target && (/^(INPUT|TEXTAREA|SELECT)$/.test(target.tagName) || target.isContentEditable)) { return; }
+    var box = document.getElementById('search-q');
+    if (!box) { return; }
+    event.preventDefault();
+    box.focus();
+    box.select();
+  });
+
   function withBusy(form, work) {
     var buttons = $$('button', form);
     buttons.forEach(function (b) { b.disabled = true; });

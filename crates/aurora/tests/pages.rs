@@ -2048,6 +2048,234 @@ async fn stream_reports_document_events_for_the_document() {
     server.shutdown().await;
 }
 
+// ---- search ----
+
+fn enc(text: &str) -> String {
+    text.bytes()
+        .map(|b| {
+            if b.is_ascii_alphanumeric() || b == b'-' {
+                char::from(b).to_string()
+            } else {
+                format!("%{b:02X}")
+            }
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn search_page_marks_matches_escapes_text_and_links_to_the_content() {
+    let server = Server::start().await;
+    let cookie = server.owner_cookie().await;
+    seed(&server, &cookie).await;
+
+    // Pages need a session; the search box is in every signed-in page's top bar.
+    let resp = get(server.addr, "/search?q=first", None).await;
+    assert_eq!(resp.status, 303);
+    assert!(resp.header("location").unwrap().starts_with("/sign-in"));
+    let board = get(server.addr, "/p/WEB", Some(&cookie)).await;
+    assert!(board.body.contains(r#"action="/search""#));
+    assert!(board.body.contains(r#"id="search-q""#));
+    assert!(board.body.contains(r#"role="search""#));
+    let sign_in = get(server.addr, "/sign-in", None).await;
+    assert!(!sign_in.body.contains(r#"action="/search""#));
+
+    let (status, _) = server
+        .api(
+            &cookie,
+            "PATCH",
+            "/projects/WEB/issues/1",
+            json!({"title": "Fix <b>flicker</b> now", "description": "the <script>alert(1)</script> flicker"}),
+        )
+        .await;
+    assert_eq!(status, 200);
+    let comment_id = comment(
+        &server,
+        &cookie,
+        "a flicker <img src=x onerror=alert(1)> seen",
+        None,
+    )
+    .await;
+    let doc = document(
+        &server,
+        &cookie,
+        json!({"title": "Flicker notes", "body": "how the flicker happens"}),
+    )
+    .await;
+
+    // The empty page explains itself.
+    let idle = get(server.addr, "/search", Some(&cookie)).await;
+    assert_eq!(idle.status, 200);
+    assert!(idle.body.contains("Type words to find"));
+    assert!(idle.body.contains(r#"name="project""#));
+    assert!(idle.body.contains(r#"name="kind""#));
+
+    let found = get(server.addr, "/search?q=flicker", Some(&cookie)).await;
+    assert_eq!(found.status, 200, "{}", found.body);
+    // Matches are wrapped by the renderer; the text around them is escaped.
+    assert!(found.body.contains("<mark>flicker</mark>"));
+    assert!(found.body.contains("Fix &lt;b&gt;"));
+    assert!(!found.body.contains("<b>flicker</b>"));
+    assert!(!found.body.contains("<script>alert"));
+    assert!(!found.body.contains("<img src=x"));
+    assert!(found.body.contains("&lt;script&gt;alert(1)&lt;/script&gt;"));
+    // Kind badges are text; the three kinds link to their pages.
+    assert!(
+        found
+            .body
+            .contains(r#"<span class="chip kind-badge">Issue</span>"#)
+    );
+    assert!(
+        found
+            .body
+            .contains(r#"<span class="chip kind-badge">Comment</span>"#)
+    );
+    assert!(
+        found
+            .body
+            .contains(r#"<span class="chip kind-badge">Document</span>"#)
+    );
+    assert!(found.body.contains(r#"href="/p/WEB/1""#));
+    assert!(
+        found
+            .body
+            .contains(&format!(r#"href="/p/WEB/1#comment-{comment_id}""#))
+    );
+    assert!(
+        found
+            .body
+            .contains(&format!(r#"href="/p/WEB/documents/{doc}""#))
+    );
+    assert!(found.body.contains("Results 1\u{2013}3 of 3"));
+    // The box in the top bar keeps the text; the query is escaped there too.
+    assert!(found.body.contains(r#"value="flicker""#));
+
+    // The issue page has the element the comment link points at.
+    let issue = get(server.addr, "/p/WEB/1", Some(&cookie)).await;
+    assert!(
+        issue
+            .body
+            .contains(&format!(r#"id="comment-{comment_id}""#))
+    );
+
+    // Filters.
+    let docs = get(
+        server.addr,
+        "/search?q=flicker&kind=document",
+        Some(&cookie),
+    )
+    .await;
+    assert!(docs.body.contains(&format!("/p/WEB/documents/{doc}")));
+    assert!(!docs.body.contains("kind-badge\">Issue"));
+    assert!(docs.body.contains(r#"<option value="document" selected>"#));
+    let project = get(server.addr, "/search?q=flicker&project=WEB", Some(&cookie)).await;
+    assert!(project.body.contains(r#"<option value="WEB" selected>"#));
+
+    // Archived issues appear only when asked for, with a text label.
+    let (status, _) = server
+        .api(
+            &cookie,
+            "POST",
+            "/projects/WEB/issues/1/archive",
+            Value::Null,
+        )
+        .await;
+    assert_eq!(status, 200);
+    let hidden = get(server.addr, "/search?q=fix&kind=issue", Some(&cookie)).await;
+    assert!(hidden.body.contains("Nothing found"));
+    let shown = get(
+        server.addr,
+        "/search?q=fix&kind=issue&include_archived=1",
+        Some(&cookie),
+    )
+    .await;
+    assert!(shown.body.contains("chip-archived"));
+    assert!(shown.body.contains("Archived"));
+    assert!(shown.body.contains("checked"));
+
+    // The script focuses the box on `/`.
+    let js = get(server.addr, "/assets/app.js", None).await.body;
+    assert!(js.contains("getElementById('search-q')"));
+    assert!(js.contains("event.key !== '/'"));
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn search_page_has_empty_and_error_states_and_pages() {
+    let server = Server::start().await;
+    let cookie = server.owner_cookie().await;
+    seed(&server, &cookie).await;
+
+    let empty = get(server.addr, "/search?q=zzzz", Some(&cookie)).await;
+    assert_eq!(empty.status, 200);
+    assert!(empty.body.contains("Nothing found for"));
+    // Reflected text is escaped wherever it appears.
+    let nasty = get(
+        server.addr,
+        &format!("/search?q={}", enc("\"><script>x</script>")),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(nasty.status, 200);
+    assert!(!nasty.body.contains("<script>x"));
+    assert!(nasty.body.contains("&lt;script&gt;x&lt;/script&gt;"));
+
+    let words = get(server.addr, "/search?q=%2A%2A", Some(&cookie)).await;
+    assert_eq!(words.status, 422);
+    assert!(words.body.contains(r#"role="alert""#));
+    assert!(words.body.contains("empty query"));
+    let project = get(server.addr, "/search?q=first&project=NOPE", Some(&cookie)).await;
+    assert_eq!(project.status, 404);
+    assert!(project.body.contains("no such project"));
+    let kind = get(server.addr, "/search?q=first&kind=bogus", Some(&cookie)).await;
+    assert_eq!(kind.status, 422);
+    let long = get(
+        server.addr,
+        &format!("/search?q={}", "a".repeat(250)),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(long.status, 422);
+    // A page number that is not one is the first page.
+    let odd = get(server.addr, "/search?q=first&page=abc", Some(&cookie)).await;
+    assert_eq!(odd.status, 200);
+    assert!(odd.body.contains("Results 1"));
+
+    for i in 0..25 {
+        let (status, _) = server
+            .api(
+                &cookie,
+                "POST",
+                "/projects/WEB/issues",
+                json!({"title": format!("pageword {i}")}),
+            )
+            .await;
+        assert_eq!(status, 201);
+    }
+    let first = get(server.addr, "/search?q=pageword", Some(&cookie)).await;
+    assert_eq!(first.body.matches(r#"class="search-hit""#).count(), 20);
+    assert!(first.body.contains("Results 1\u{2013}20 of 25"));
+    assert!(
+        first
+            .body
+            .contains(r#"href="/search?q=pageword&amp;page=2""#)
+    );
+    assert!(!first.body.contains(">Previous<"));
+    let second = get(server.addr, "/search?q=pageword&page=2", Some(&cookie)).await;
+    assert_eq!(second.body.matches(r#"class="search-hit""#).count(), 5);
+    assert!(second.body.contains("Results 21\u{2013}25 of 25"));
+    assert!(second.body.contains(">Previous<"));
+    assert!(!second.body.contains(">Next<"));
+    assert!(
+        second
+            .body
+            .contains(r#"href="/search?q=pageword">Previous"#)
+    );
+    let past = get(server.addr, "/search?q=pageword&page=9", Some(&cookie)).await;
+    assert_eq!(past.status, 200);
+    assert!(past.body.contains("Nothing found"));
+    server.shutdown().await;
+}
+
 #[tokio::test]
 async fn shutdown_ends_open_streams_without_waiting_for_the_drain() {
     let server = Server::start().await;

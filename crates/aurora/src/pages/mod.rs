@@ -1,6 +1,6 @@
 //! The server-rendered pages (everything outside `/api/v1`): sign-in and
-//! first-run setup, the project list, the board, the issue page, the embedded
-//! assets and the live event stream.
+//! first-run setup, the project list, the board, the issue page, search
+//! results (`/search`), the embedded assets and the live event stream.
 //!
 //! Pages are plain HTML from [`view`]; the little script in
 //! `assets/app.js` talks to the JSON API and re-fetches the board, activity,
@@ -45,6 +45,7 @@ pub fn router(store: Store, live: Live) -> Router<Store> {
         .route("/assets/{name}", get(assets::serve_asset));
     let pages = Router::new()
         .route("/", get(home))
+        .route("/search", get(search_page))
         .route("/p/{key}", get(board_page))
         .route("/p/{key}/board", get(board_fragment))
         .route("/p/{key}/initiatives", get(initiatives_page))
@@ -338,6 +339,42 @@ async fn home(
         return Ok(Redirect::to(&format!("/p/{}", only.key)).into_response());
     }
     Ok(ok(view::home(&page)))
+}
+
+#[derive(Deserialize)]
+struct SearchParams {
+    q: Option<String>,
+    project: Option<String>,
+    kind: Option<String>,
+    include_archived: Option<String>,
+    page: Option<String>,
+}
+
+async fn search_page(
+    State(store): State<Store>,
+    Extension(principal): Extension<Principal>,
+    Query(params): Query<SearchParams>,
+) -> PageResult {
+    let request = data::SearchRequest {
+        q: params.q.unwrap_or_default(),
+        project: params.project.filter(|p| !p.is_empty()),
+        kind: params.kind,
+        include_archived: params
+            .include_archived
+            .is_some_and(|v| !v.is_empty() && v != "0" && v != "false"),
+        page: params
+            .page
+            .and_then(|p| p.parse::<i64>().ok())
+            .map_or(1, |p| p.clamp(1, 10_000)),
+    };
+    let data = store
+        .read(move |c| data::load_search(c, principal.user_id, request))
+        .await?;
+    let status = match &data.outcome {
+        data::SearchOutcome::Refused { status, .. } => *status,
+        _ => StatusCode::OK,
+    };
+    Ok(html_response(status, view::search_page(&data)))
 }
 
 async fn load_board(

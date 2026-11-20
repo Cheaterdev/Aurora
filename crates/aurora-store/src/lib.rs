@@ -25,6 +25,7 @@ mod migrations;
 #[cfg_attr(not(windows), path = "platform/other.rs")]
 mod platform;
 pub mod projects;
+pub mod search;
 
 use std::io::Write;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -835,6 +836,8 @@ mod tests_0008;
 #[cfg(test)]
 mod tests_0009;
 #[cfg(test)]
+mod tests_0010;
+#[cfg(test)]
 mod tests_actor;
 #[cfg(test)]
 mod tests_auth;
@@ -850,6 +853,8 @@ mod tests_initiatives;
 mod tests_issues;
 #[cfg(test)]
 mod tests_links;
+#[cfg(test)]
+mod tests_search;
 
 #[cfg(test)]
 mod tests {
