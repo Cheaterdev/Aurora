@@ -2,15 +2,16 @@ use rusqlite::{Connection, params};
 
 use crate::StoreError;
 
-struct Migration {
-    version: i64,
-    name: &'static str,
-    sql: &'static str,
+#[derive(Clone, Copy)]
+pub(crate) struct Migration {
+    pub(crate) version: i64,
+    pub(crate) name: &'static str,
+    pub(crate) sql: &'static str,
 }
 
 /// Append new migrations at the end with the next version number. Applied
 /// migrations are never edited: the schema only moves forward.
-const MIGRATIONS: &[Migration] = &[Migration {
+pub(crate) const MIGRATIONS: &[Migration] = &[Migration {
     version: 1,
     name: "initial",
     sql: include_str!("../migrations/0001_initial.sql"),
@@ -18,12 +19,51 @@ const MIGRATIONS: &[Migration] = &[Migration {
 
 /// The schema version this binary produces and understands.
 pub fn latest_version() -> i64 {
-    MIGRATIONS.last().map_or(0, |m| m.version)
+    latest_of(MIGRATIONS)
 }
 
-/// Brings the database up to `latest_version()` and returns that version.
-/// Each migration runs in its own transaction together with its bookkeeping row.
-pub(crate) fn migrate(conn: &mut Connection) -> Result<i64, StoreError> {
+pub(crate) fn latest_of(migrations: &[Migration]) -> i64 {
+    migrations.last().map_or(0, |m| m.version)
+}
+
+/// The version recorded in the database (0 when it has none yet). Refuses a
+/// database newer than `migrations`. Writes nothing.
+pub(crate) fn recorded_version(
+    conn: &Connection,
+    migrations: &[Migration],
+) -> Result<i64, StoreError> {
+    let has_table: bool = conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_version')",
+        [],
+        |row| row.get(0),
+    )?;
+    let current: i64 = if has_table {
+        conn.query_row(
+            "SELECT COALESCE(MAX(version), 0) FROM schema_version",
+            [],
+            |row| row.get(0),
+        )?
+    } else {
+        0
+    };
+    let latest = latest_of(migrations);
+    if current > latest {
+        return Err(StoreError::DatabaseTooNew {
+            found: current,
+            supported: latest,
+        });
+    }
+    Ok(current)
+}
+
+/// Brings the database from `current` (see [`recorded_version`]) up to the
+/// last of `migrations` and returns that version. Each migration runs in its
+/// own transaction together with its bookkeeping row.
+pub(crate) fn migrate(
+    conn: &mut Connection,
+    migrations: &[Migration],
+    current: i64,
+) -> Result<i64, StoreError> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS schema_version (
             version    INTEGER PRIMARY KEY,
@@ -31,23 +71,13 @@ pub(crate) fn migrate(conn: &mut Connection) -> Result<i64, StoreError> {
             applied_at INTEGER NOT NULL
         )",
     )?;
+    let latest = latest_of(migrations);
 
-    let current: i64 = conn.query_row(
-        "SELECT COALESCE(MAX(version), 0) FROM schema_version",
-        [],
-        |row| row.get(0),
-    )?;
-    let latest = latest_version();
-    if current > latest {
-        return Err(StoreError::DatabaseTooNew {
-            found: current,
-            supported: latest,
-        });
-    }
-
-    for migration in MIGRATIONS.iter().filter(|m| m.version > current) {
+    for migration in migrations.iter().filter(|m| m.version > current) {
         let tx = conn.transaction()?;
         tx.execute_batch(migration.sql)?;
+        #[cfg(test)]
+        crate::tests_support::abort_if_requested(migration.version);
         tx.execute(
             "INSERT INTO schema_version (version, name, applied_at)
              VALUES (?1, ?2, CAST(unixepoch('subsec') * 1000 AS INTEGER))",

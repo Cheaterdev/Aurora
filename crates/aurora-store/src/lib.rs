@@ -2,6 +2,7 @@
 //! single writer task. Every write goes through [`Store::write`]; reads use
 //! their own read-only connections via [`Store::read`].
 
+mod backup;
 mod integrity;
 mod location;
 mod migrations;
@@ -16,6 +17,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+use migrations::Migration;
 use rusqlite::{Connection, OpenFlags, Transaction};
 use tokio::sync::{mpsc, oneshot};
 
@@ -59,6 +61,11 @@ pub enum StoreError {
          (or pass --allow-unsafe-location for development only)"
     )]
     UnsafeLocation { path: PathBuf, reason: String },
+    #[error(
+        "could not back up the database before migrating ({path}): {reason}; \
+         refusing to start, nothing was migrated"
+    )]
+    BackupFailed { path: PathBuf, reason: String },
     #[error("cannot write the run marker {path}: {source}")]
     Marker {
         path: PathBuf,
@@ -85,6 +92,9 @@ pub struct OpenReport {
     /// The location refusal was skipped although the location looked unsafe.
     pub unsafe_location_overridden: Option<String>,
     pub backup_dir: PathBuf,
+    /// The backup taken before pending migrations, if there were any to apply
+    /// to an existing database.
+    pub backup: Option<PathBuf>,
 }
 
 /// `<db file name>.backups` next to the database file.
@@ -138,7 +148,24 @@ impl Store {
     /// serving requests. Nothing is migrated or written to a database that
     /// fails its integrity check.
     pub fn open_with(path: impl AsRef<Path>, options: &OpenOptions) -> Result<Store, StoreError> {
-        let path = path.as_ref().to_path_buf();
+        Store::open_inner(path.as_ref(), options, migrations::MIGRATIONS)
+    }
+
+    #[cfg(test)]
+    fn open_with_migrations(
+        path: impl AsRef<Path>,
+        options: &OpenOptions,
+        migration_list: &[Migration],
+    ) -> Result<Store, StoreError> {
+        Store::open_inner(path.as_ref(), options, migration_list)
+    }
+
+    fn open_inner(
+        path: &Path,
+        options: &OpenOptions,
+        migration_list: &[Migration],
+    ) -> Result<Store, StoreError> {
+        let path = path.to_path_buf();
         let backup_dir = options
             .backup_dir
             .clone()
@@ -190,8 +217,9 @@ impl Store {
             unclean_shutdown,
             unsafe_location_overridden,
             backup_dir,
+            backup: None,
         };
-        let started = Store::start(path, conn, marker.clone(), report);
+        let started = Store::start(path, conn, marker.clone(), report, migration_list);
         if started.is_err() && !unclean_shutdown {
             let _ = std::fs::remove_file(&marker);
         }
@@ -202,10 +230,21 @@ impl Store {
         path: PathBuf,
         mut conn: Connection,
         marker: PathBuf,
-        report: OpenReport,
+        mut report: OpenReport,
+        migration_list: &[Migration],
     ) -> Result<Store, StoreError> {
         apply_pragmas(&conn, true)?;
-        let schema_version = migrations::migrate(&mut conn)?;
+        let current = migrations::recorded_version(&conn, migration_list)?;
+        let latest = migrations::latest_of(migration_list);
+        if current >= 1 && latest > current {
+            let taken = backup::take(&conn, &path, &report.backup_dir, current)?;
+            tracing::info!(
+                backup = %taken.display(), from_version = current, to_version = latest,
+                "backed up the database before migrating"
+            );
+            report.backup = Some(taken);
+        }
+        let schema_version = migrations::migrate(&mut conn, migration_list, current)?;
 
         let (sender, mut receiver) = mpsc::channel::<WriteJob>(WRITE_QUEUE_DEPTH);
         let writer = std::thread::Builder::new()
@@ -321,6 +360,19 @@ fn apply_pragmas(conn: &Connection, writable: bool) -> Result<(), StoreError> {
     conn.pragma_update(None, "synchronous", "FULL")?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests_support {
+    /// Kills the process, simulating power loss, when a test child asks for it.
+    /// Called inside the migration transaction after its SQL ran and before
+    /// the version row is recorded or anything is committed.
+    pub(crate) fn abort_if_requested(version: i64) {
+        let wanted = std::env::var("AURORA_TEST_ABORT_AT_VERSION").ok();
+        if wanted.is_some_and(|v| v == version.to_string()) {
+            std::process::abort();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -708,5 +760,225 @@ mod tests {
         store.close().await;
         let result = store.write(|_| Ok(())).await;
         assert!(matches!(result, Err(StoreError::Closed)));
+    }
+
+    // ---- TRK-40: backup before migrating ----
+
+    const V2: Migration = Migration {
+        version: 2,
+        name: "extra",
+        sql: "CREATE TABLE extra_a (x INTEGER);
+              INSERT INTO extra_a VALUES (1);
+              CREATE TABLE extra_b (y INTEGER);",
+    };
+
+    fn with_v2() -> [Migration; 2] {
+        [migrations::MIGRATIONS[0], V2]
+    }
+
+    async fn old_db_with_data(path: &Path) {
+        let store = Store::open(path).unwrap();
+        store
+            .write(|tx| {
+                tx.execute(
+                    "INSERT INTO project (key, name, created) VALUES ('OLD', 'Old data', 1)",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        store.close().await;
+    }
+
+    fn db_files(dir: &Path) -> Vec<PathBuf> {
+        let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.extension().is_some_and(|e| e == "db"))
+            .collect();
+        files.sort();
+        files
+    }
+
+    fn version_of(conn: &Connection) -> i64 {
+        conn.query_row("SELECT MAX(version) FROM schema_version", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    fn project_names(conn: &Connection) -> Vec<String> {
+        conn.prepare("SELECT name FROM project ORDER BY id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn pending_migration_is_preceded_by_a_verified_backup() {
+        let (_dir, path) = temp_db();
+        old_db_with_data(&path).await;
+
+        let store =
+            Store::open_with_migrations(&path, &OpenOptions::default(), &with_v2()).unwrap();
+        assert_eq!(store.schema_version(), 2);
+        let taken = store.open_report().backup.clone().expect("backup taken");
+        store.close().await;
+
+        let backups = db_files(&default_backup_dir(&path));
+        assert_eq!(backups, vec![taken.clone()]);
+        let name = taken.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(
+            name.starts_with("test-v1-") && name.ends_with("Z.db"),
+            "{name}"
+        );
+        assert_eq!(
+            std::fs::read_dir(default_backup_dir(&path))
+                .unwrap()
+                .count(),
+            1
+        );
+
+        let copy = Connection::open(&taken).unwrap();
+        assert_eq!(version_of(&copy), 1);
+        assert_eq!(project_names(&copy), ["Old data"]);
+        let extra: i64 = copy
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name LIKE 'extra_%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(extra, 0);
+
+        let live = Connection::open(&path).unwrap();
+        assert_eq!(version_of(&live), 2);
+        assert_eq!(project_names(&live), ["Old data"]);
+    }
+
+    #[tokio::test]
+    async fn fresh_or_current_database_makes_no_backup() {
+        let (_dir, path) = temp_db();
+        let store = Store::open(&path).unwrap();
+        assert!(store.open_report().backup.is_none());
+        store.close().await;
+        assert!(!default_backup_dir(&path).exists());
+
+        let store = Store::open(&path).unwrap();
+        assert!(store.open_report().backup.is_none());
+        store.close().await;
+        assert!(!default_backup_dir(&path).exists());
+    }
+
+    #[tokio::test]
+    async fn failing_backup_refuses_start_and_migrates_nothing() {
+        let (_dir, path) = temp_db();
+        old_db_with_data(&path).await;
+        let blocked = default_backup_dir(&path);
+        std::fs::write(&blocked, "not a folder").unwrap();
+
+        let err = Store::open_with_migrations(&path, &OpenOptions::default(), &with_v2())
+            .err()
+            .expect("open must fail");
+        assert!(matches!(err, StoreError::BackupFailed { .. }), "{err}");
+        let text = err.to_string();
+        assert!(text.contains(&blocked.display().to_string()), "{text}");
+        assert!(text.contains("nothing was migrated"), "{text}");
+        assert!(!marker_path(&path).exists());
+
+        let conn = Connection::open(&path).unwrap();
+        assert_eq!(version_of(&conn), 1);
+        let extra: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name LIKE 'extra_%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(extra, 0);
+    }
+
+    #[tokio::test]
+    async fn leftover_tmp_is_ignored_by_the_hint_and_removed_by_the_next_backup() {
+        let (_dir, path) = temp_db();
+        old_db_with_data(&path).await;
+        let backups = default_backup_dir(&path);
+        std::fs::create_dir(&backups).unwrap();
+        let tmp = backups.join("test-v1-20200101T000000Z.db.tmp");
+        std::fs::write(&tmp, "half written").unwrap();
+
+        let hint = integrity::recovery_hint(&backups);
+        assert!(hint.contains("No backup was found"), "{hint}");
+        assert!(!hint.contains("20200101"), "{hint}");
+
+        let store =
+            Store::open_with_migrations(&path, &OpenOptions::default(), &with_v2()).unwrap();
+        store.close().await;
+        assert!(!tmp.exists());
+        assert_eq!(db_files(&backups).len(), 1);
+        assert_eq!(std::fs::read_dir(&backups).unwrap().count(), 1);
+    }
+
+    const KILL_DB: &str = "AURORA_KILL_HELPER_DB";
+    const KILL_HELPER: &str = "tests::kill_helper_aborts_mid_migration";
+
+    /// Runs only as the child of `process_death_mid_migration_leaves_a_clean_database`.
+    #[test]
+    fn kill_helper_aborts_mid_migration() {
+        let Ok(path) = std::env::var(KILL_DB) else {
+            return;
+        };
+        let _ = Store::open_with_migrations(path, &OpenOptions::default(), &with_v2());
+        // Reaching this line means the failpoint did not fire.
+    }
+
+    #[tokio::test]
+    async fn process_death_mid_migration_leaves_a_clean_database() {
+        let (_dir, path) = temp_db();
+        old_db_with_data(&path).await;
+
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([KILL_HELPER, "--exact", "--test-threads=1", "--nocapture"])
+            .env(KILL_DB, &path)
+            .env("AURORA_TEST_ABORT_AT_VERSION", "2")
+            .status()
+            .unwrap();
+        assert!(!status.success(), "child must die abnormally, got {status}");
+        assert!(marker_path(&path).exists(), "the crash leaves the marker");
+
+        let store =
+            Store::open_with_migrations(&path, &OpenOptions::default(), &with_v2()).unwrap();
+        let report = store.open_report();
+        assert!(report.unclean_shutdown);
+        assert_eq!(report.integrity_check, IntegrityCheck::Full);
+        assert_eq!(store.schema_version(), 2);
+        store.close().await;
+
+        let rows = applied_rows(&path);
+        assert_eq!(
+            rows.iter().map(|r| r.0).collect::<Vec<_>>(),
+            [1, 2],
+            "version 2 recorded exactly once"
+        );
+        let conn = Connection::open(&path).unwrap();
+        let a_rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM extra_a", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(a_rows, 1, "the migration ran once, in one piece");
+        conn.query_row("SELECT COUNT(*) FROM extra_b", [], |r| r.get::<_, i64>(0))
+            .unwrap();
+        assert_eq!(project_names(&conn), ["Old data"]);
+
+        let backups = db_files(&default_backup_dir(&path));
+        assert!(
+            !backups.is_empty(),
+            "a backup from before the attempt exists"
+        );
+        for backup in backups {
+            let copy = Connection::open(&backup).unwrap();
+            assert_eq!(version_of(&copy), 1);
+            assert_eq!(project_names(&copy), ["Old data"]);
+        }
     }
 }

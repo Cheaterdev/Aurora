@@ -5,7 +5,7 @@ edition.workspace = true
 publish.workspace = true
 
 [dependencies]
-rusqlite = { version = "0.43.0", features = ["bundled"] }
+rusqlite = { version = "0.43.0", features = ["bundled", "backup"] }
 thiserror = "2.0.21"
 tokio = { version = "1.54.1", features = ["sync", "rt"] }
 tracing = "0.1.44"

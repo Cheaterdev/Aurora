@@ -7,6 +7,12 @@ use windows_sys::Win32::Storage::FileSystem::GetDriveTypeW;
 // windows-sys only exposes this under another feature; the value is fixed by the Win32 API.
 const DRIVE_REMOTE: u32 = 4;
 
+/// Windows cannot flush a directory handle through std; NTFS journals the
+/// rename itself.
+pub fn sync_dir(_dir: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
 /// Why `path` (already absolute) is on a network location, if it is.
 pub fn network_location(path: &Path) -> Option<String> {
     let Some(Component::Prefix(prefix)) = path.components().next() else {
