@@ -11,11 +11,18 @@ pub(crate) struct Migration {
 
 /// Append new migrations at the end with the next version number. Applied
 /// migrations are never edited: the schema only moves forward.
-pub(crate) const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    name: "initial",
-    sql: include_str!("../migrations/0001_initial.sql"),
-}];
+pub(crate) const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        name: "initial",
+        sql: include_str!("../migrations/0001_initial.sql"),
+    },
+    Migration {
+        version: 2,
+        name: "project_catalog",
+        sql: include_str!("../migrations/0002_project_catalog.sql"),
+    },
+];
 
 /// The schema version this binary produces and understands.
 pub fn latest_version() -> i64 {

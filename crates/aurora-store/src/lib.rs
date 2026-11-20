@@ -9,6 +9,7 @@ mod migrations;
 #[cfg_attr(windows, path = "platform/windows.rs")]
 #[cfg_attr(not(windows), path = "platform/other.rs")]
 mod platform;
+pub mod projects;
 
 use std::io::Write;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -24,6 +25,7 @@ use tokio::sync::{mpsc, oneshot};
 pub use integrity::IntegrityCheck;
 pub use location::{synced_folder_reason, unsafe_reason};
 pub use migrations::latest_version;
+pub use projects::Rejection;
 pub use rusqlite;
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -46,6 +48,9 @@ pub enum StoreError {
     Panicked,
     #[error("the store is closed")]
     Closed,
+    /// The request was understood and refused; nothing was changed.
+    #[error(transparent)]
+    Rejected(#[from] Rejection),
     #[error(
         "the database {path} failed the {check} integrity check; refusing to start.\n{details}\n{hint}"
     )]
@@ -111,6 +116,13 @@ fn sibling(db_path: &Path, suffix: &str) -> PathBuf {
     let mut name = db_path.file_name().unwrap_or_default().to_os_string();
     name.push(suffix);
     db_path.with_file_name(name)
+}
+
+/// Unix milliseconds, the unit of every stored time.
+pub fn now_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
 }
 
 fn write_marker(path: &Path) -> std::io::Result<()> {
@@ -412,6 +424,9 @@ mod tests_support {
         }
     }
 }
+
+#[cfg(test)]
+mod tests_0002;
 
 #[cfg(test)]
 mod tests {
@@ -815,7 +830,12 @@ mod tests {
     }
 
     async fn old_db_with_data(path: &Path) {
-        let store = Store::open(path).unwrap();
+        let store = Store::open_with_migrations(
+            path,
+            &OpenOptions::default(),
+            &migrations::MIGRATIONS[..1],
+        )
+        .unwrap();
         store
             .write(|tx| {
                 tx.execute(
