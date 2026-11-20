@@ -30,7 +30,8 @@ async fn populated_version_two_database_gains_priority_and_keeps_its_issues() {
     .unwrap();
     v2.close().await;
 
-    let store = Store::open(&path).unwrap();
+    let store =
+        Store::open_with_migrations(&path, &OpenOptions::default(), &MIGRATIONS[..3]).unwrap();
     assert_eq!(store.schema_version(), 3);
     let backup = store.open_report().backup.clone().expect("backup taken");
     assert!(backup.starts_with(default_backup_dir(&path)));

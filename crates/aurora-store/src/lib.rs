@@ -3,6 +3,7 @@
 //! their own read-only connections via [`Store::read`].
 
 mod backup;
+pub mod events;
 mod integrity;
 pub mod issues;
 mod location;
@@ -430,6 +431,10 @@ mod tests_support {
 mod tests_0002;
 #[cfg(test)]
 mod tests_0003;
+#[cfg(test)]
+mod tests_0004;
+#[cfg(test)]
+mod tests_events;
 #[cfg(test)]
 mod tests_issues;
 

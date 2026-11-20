@@ -4,6 +4,7 @@
 //! There is no authentication yet (TRK-2). Every API route is built in
 //! [`api_router`], so one auth layer added there covers all of them.
 
+use aurora_store::events::{self, EventFilter, Start};
 use aurora_store::issues::{self, IssueFilter, IssuePatch, MoveTarget, NewIssue, ParentFilter};
 use aurora_store::projects::{self, NewColumn, StateType};
 use aurora_store::{Rejection, Store, StoreError, now_millis};
@@ -66,6 +67,14 @@ pub fn api_router() -> Router<Store> {
             "/projects/{key}/issues/{number}/unarchive",
             post(unarchive_issue),
         )
+        .route("/events", get(list_events))
+        .route("/consumers", get(list_consumers))
+        .route(
+            "/consumers/{name}",
+            put(register_consumer).delete(delete_consumer),
+        )
+        .route("/consumers/{name}/events", get(poll_consumer))
+        .route("/consumers/{name}/ack", post(ack_consumer))
 }
 
 pub struct ApiError {
@@ -539,4 +548,131 @@ async fn unarchive_issue(
         .write(move |tx| issues::unarchive_issue(tx, now_millis(), &key, number))
         .await?;
     Ok(Json(issue).into_response())
+}
+
+// ---- events and consumers ----
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EventQuery {
+    after: Option<i64>,
+    limit: Option<i64>,
+    project: Option<String>,
+    entity_kind: Option<String>,
+    kind_prefix: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PollQuery {
+    limit: Option<i64>,
+    project: Option<String>,
+    entity_kind: Option<String>,
+    kind_prefix: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StartBody {
+    start: StartAt,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum StartAt {
+    Beginning,
+    Latest,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AckBody {
+    up_to: i64,
+}
+
+fn event_filter(
+    project: Option<String>,
+    entity_kind: Option<String>,
+    kind_prefix: Option<String>,
+) -> EventFilter {
+    EventFilter {
+        project,
+        entity_kind,
+        kind_prefix,
+    }
+}
+
+async fn list_events(
+    State(store): State<Store>,
+    ApiQuery(query): ApiQuery<EventQuery>,
+) -> ApiResult<Response> {
+    let filter = event_filter(query.project, query.entity_kind, query.kind_prefix);
+    let list = store
+        .read(move |c| events::read_events(c, query.after.unwrap_or(0), query.limit, &filter))
+        .await?;
+    Ok(Json(json!({ "events": list })).into_response())
+}
+
+async fn list_consumers(State(store): State<Store>) -> ApiResult<Response> {
+    let consumers = store.read(events::list_consumers).await?;
+    Ok(Json(consumers).into_response())
+}
+
+async fn register_consumer(
+    State(store): State<Store>,
+    Path(name): Path<String>,
+    ApiJson(body): ApiJson<StartBody>,
+) -> ApiResult<Response> {
+    let start = match body.start {
+        StartAt::Beginning => Start::Beginning,
+        StartAt::Latest => Start::Latest,
+    };
+    let (cursor, is_new) = store
+        .write(move |tx| events::register_consumer(tx, now_millis(), &name, start))
+        .await?;
+    Ok(if is_new {
+        created(cursor)
+    } else {
+        Json(cursor).into_response()
+    })
+}
+
+async fn delete_consumer(
+    State(store): State<Store>,
+    Path(name): Path<String>,
+) -> ApiResult<Response> {
+    events::validate_name(&name)?;
+    store
+        .write(move |tx| events::delete_consumer(tx, &name))
+        .await?;
+    Ok(no_content())
+}
+
+async fn poll_consumer(
+    State(store): State<Store>,
+    Path(name): Path<String>,
+    ApiQuery(query): ApiQuery<PollQuery>,
+) -> ApiResult<Response> {
+    events::validate_name(&name)?;
+    let filter = event_filter(query.project, query.entity_kind, query.kind_prefix);
+    let (cursor, list) = store
+        .read(move |c| {
+            let cursor = events::get_cursor(c, &name)?;
+            let list = events::read_events(c, cursor.last_event_id, query.limit, &filter)?;
+            Ok((cursor, list))
+        })
+        .await?;
+    Ok(Json(json!({ "consumer": cursor, "events": list })).into_response())
+}
+
+async fn ack_consumer(
+    State(store): State<Store>,
+    Path(name): Path<String>,
+    ApiJson(body): ApiJson<AckBody>,
+) -> ApiResult<Response> {
+    events::validate_name(&name)?;
+    let cursor = store
+        .write(move |tx| events::ack(tx, now_millis(), &name, body.up_to))
+        .await?;
+    Ok(Json(cursor).into_response())
 }
