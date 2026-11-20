@@ -142,6 +142,28 @@ pub fn read_events(
     Ok(rows.collect::<Result<_, _>>()?)
 }
 
+/// The newest `limit` events about one entity (at most 500), oldest first.
+pub fn entity_events(
+    conn: &Connection,
+    entity_kind: &str,
+    entity_id: i64,
+    limit: i64,
+) -> Result<Vec<Event>, StoreError> {
+    let mut stmt = conn.prepare(
+        "SELECT e.id, e.project_id, p.key, e.kind, e.entity_kind, e.entity_id, e.actor_id,
+                e.time, e.payload_json
+         FROM event e LEFT JOIN project p ON p.id = e.project_id
+         WHERE e.entity_kind = ?1 AND e.entity_id = ?2 ORDER BY e.id DESC LIMIT ?3",
+    )?;
+    let rows = stmt.query_map(
+        params![entity_kind, entity_id, limit.clamp(1, MAX_LIMIT)],
+        event_row,
+    )?;
+    let mut events = rows.collect::<Result<Vec<_>, _>>()?;
+    events.reverse();
+    Ok(events)
+}
+
 // ---- consumers ----
 
 /// 1-100 characters: ASCII letters, digits, `.`, `_` and `-`.

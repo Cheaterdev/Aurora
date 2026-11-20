@@ -98,6 +98,16 @@ pub struct ApiError {
     message: String,
 }
 
+impl ApiError {
+    pub(crate) fn status(&self) -> StatusCode {
+        self.status
+    }
+
+    pub(crate) fn message(&self) -> &str {
+        &self.message
+    }
+}
+
 impl From<StoreError> for ApiError {
     fn from(err: StoreError) -> Self {
         let (status, message) = match err {

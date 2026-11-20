@@ -2,6 +2,7 @@
 
 pub mod auth;
 pub mod config;
+pub mod pages;
 pub mod routes;
 pub mod shutdown;
 #[cfg_attr(windows, path = "signal/windows.rs")]
@@ -25,6 +26,7 @@ use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tower_http::catch_panic::CatchPanicLayer;
 
+use pages::Live;
 pub use shutdown::ShutdownHooks;
 pub use signal::shutdown_signal;
 pub use supervise::spawn_supervised;
@@ -49,9 +51,16 @@ async fn health(State(store): State<Store>) -> Json<Health> {
 }
 
 fn app_routes(store: Store) -> Router<Store> {
+    // Nothing stops these streams; only `serve` can end them at shutdown.
+    let (live, _control) = Live::start(store.clone());
+    app_routes_with(store, live)
+}
+
+fn app_routes_with(store: Store, live: Live) -> Router<Store> {
     Router::new()
         .route("/health", get(health))
-        .nest("/api/v1", routes::api_router(store))
+        .nest("/api/v1", routes::api_router(store.clone()))
+        .merge(pages::router(store, live))
 }
 
 fn panic_response(payload: Box<dyn Any + Send + 'static>) -> Response {
@@ -83,7 +92,14 @@ pub async fn serve(
     shutdown: impl Future<Output = ()> + Send + 'static,
     hooks: ShutdownHooks,
 ) -> Result<()> {
-    let app = router(store.clone());
+    // Open event streams never finish on their own: they must end when
+    // shutdown starts, or the drain would wait for them.
+    let (live, control) = Live::start(store.clone());
+    let app = with_layers(app_routes_with(store.clone(), live).with_state(store.clone()));
+    let shutdown = async move {
+        shutdown.await;
+        control.stop();
+    };
     serve_router(listener, app, store, shutdown, hooks, HTTP_DRAIN_TIMEOUT).await
 }
 

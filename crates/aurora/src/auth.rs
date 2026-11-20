@@ -98,7 +98,7 @@ fn forbidden(message: &str) -> ApiError {
     StoreError::from(Rejection::Forbidden(message.into())).into()
 }
 
-async fn authenticate(
+pub(crate) async fn authenticate(
     store: &Store,
     method: &Method,
     headers: &HeaderMap,
@@ -227,27 +227,38 @@ async fn blocking<T: Send + 'static>(
         .map_err(|_| StoreError::Panicked)
 }
 
-pub(crate) async fn setup(
-    State(store): State<Store>,
-    ApiJson(body): ApiJson<Credentials>,
-) -> ApiResult<Response> {
+/// Shared with the HTML setup form.
+pub(crate) async fn create_owner_account(
+    store: &Store,
+    name: String,
+    password: String,
+) -> ApiResult<User> {
     if store.read(auth::owner_exists).await? {
         return Err(StoreError::from(Rejection::Conflict("setup is already done".into())).into());
     }
-    let Credentials { name, password } = body;
     let hash = blocking(move || auth::hash_password(&password)).await??;
     let user = store
         .write(move |tx| auth::create_owner(tx, now_millis(), &name, &hash))
         .await?;
-    Ok(created(user))
+    Ok(user)
 }
 
-pub(crate) async fn sign_in(
+pub(crate) async fn setup(
     State(store): State<Store>,
-    headers: HeaderMap,
     ApiJson(body): ApiJson<Credentials>,
 ) -> ApiResult<Response> {
     let Credentials { name, password } = body;
+    Ok(created(create_owner_account(&store, name, password).await?))
+}
+
+/// Checks the password and opens a session; returns the user and the
+/// `Set-Cookie` value. Shared with the HTML sign-in form.
+pub(crate) async fn open_session_for(
+    store: &Store,
+    headers: &HeaderMap,
+    name: String,
+    password: String,
+) -> ApiResult<(User, HeaderValue)> {
     let login = store.read(move |c| auth::login_lookup(c, &name)).await?;
     let user = blocking(move || auth::check_password(login.as_ref(), &password))
         .await?
@@ -258,7 +269,17 @@ pub(crate) async fn sign_in(
         .write(move |tx| auth::open_session(tx, now, user_id))
         .await?;
     let max_age = (session.expires - now) / 1000;
-    let cookie = session_cookie(&headers, &session.token, max_age)?;
+    let cookie = session_cookie(headers, &session.token, max_age)?;
+    Ok((user, cookie))
+}
+
+pub(crate) async fn sign_in(
+    State(store): State<Store>,
+    headers: HeaderMap,
+    ApiJson(body): ApiJson<Credentials>,
+) -> ApiResult<Response> {
+    let Credentials { name, password } = body;
+    let (user, cookie) = open_session_for(&store, &headers, name, password).await?;
     Ok(no_store(with_cookie(
         StatusCode::OK,
         cookie,
