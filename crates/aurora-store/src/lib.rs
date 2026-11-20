@@ -2,11 +2,20 @@
 //! single writer task. Every write goes through [`Store::write`]; reads use
 //! their own read-only connections via [`Store::read`].
 
+/// SQL condition on a blocker issue `b` joined to its column `bc`; a macro so
+/// it can be part of `concat!` in constants. Defined before the modules that use it.
+macro_rules! open_blocker {
+    () => {
+        "b.archived = 0 AND bc.state_type NOT IN ('completed', 'canceled')"
+    };
+}
+
 pub mod auth;
 mod backup;
 pub mod events;
 mod integrity;
 pub mod issues;
+pub mod links;
 mod location;
 mod migrations;
 #[cfg_attr(windows, path = "platform/windows.rs")]
@@ -635,6 +644,35 @@ mod tests_support {
         }
     }
 
+    pub(crate) mod links {
+        pub(crate) use crate::links::*;
+
+        use rusqlite::Transaction;
+
+        use super::test_actor;
+        use crate::StoreError;
+
+        pub(crate) fn add_link(
+            tx: &Transaction<'_>,
+            now: i64,
+            project_key: &str,
+            from: i64,
+            to: i64,
+            kind: LinkKind,
+        ) -> Result<Link, StoreError> {
+            crate::links::add_link(tx, now, &test_actor(tx), project_key, from, to, kind)
+        }
+
+        pub(crate) fn remove_link(
+            tx: &Transaction<'_>,
+            now: i64,
+            project_key: &str,
+            link_id: i64,
+        ) -> Result<(), StoreError> {
+            crate::links::remove_link(tx, now, &test_actor(tx), project_key, link_id)
+        }
+    }
+
     /// Kills the process, simulating power loss, when a test child asks for it.
     /// Called inside the migration transaction after its SQL ran and before
     /// the version row is recorded or anything is committed.
@@ -655,6 +693,8 @@ mod tests_0004;
 #[cfg(test)]
 mod tests_0005;
 #[cfg(test)]
+mod tests_0006;
+#[cfg(test)]
 mod tests_actor;
 #[cfg(test)]
 mod tests_auth;
@@ -662,6 +702,8 @@ mod tests_auth;
 mod tests_events;
 #[cfg(test)]
 mod tests_issues;
+#[cfg(test)]
+mod tests_links;
 
 #[cfg(test)]
 mod tests {

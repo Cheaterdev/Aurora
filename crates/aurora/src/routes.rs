@@ -8,6 +8,7 @@
 use aurora_store::auth::Principal;
 use aurora_store::events::{self, EventFilter, Start};
 use aurora_store::issues::{self, IssueFilter, IssuePatch, MoveTarget, NewIssue, ParentFilter};
+use aurora_store::links::{self, LinkKind};
 use aurora_store::projects::{self, NewColumn, StateType};
 use aurora_store::{Rejection, Store, StoreError, now_millis};
 use axum::extract::rejection::JsonRejection;
@@ -81,6 +82,11 @@ pub fn api_router(store: Store) -> Router<Store> {
             "/projects/{key}/issues/{number}/unarchive",
             post(unarchive_issue),
         )
+        .route(
+            "/projects/{key}/issues/{number}/links",
+            get(list_links).post(add_link),
+        )
+        .route("/projects/{key}/links/{id}", delete(remove_link))
         .route("/events", get(list_events))
         .route("/consumers", get(list_consumers))
         .route(
@@ -605,6 +611,103 @@ async fn unarchive_issue(
         .write(move |tx| issues::unarchive_issue(tx, now_millis(), &actor, &key, number))
         .await?;
     Ok(Json(issue).into_response())
+}
+
+// ---- links ----
+
+/// The other issue: a number in this project, or `KEY-n` (which must name this project).
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum LinkTarget {
+    Number(i64),
+    Identifier(String),
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum LinkDirection {
+    /// This issue blocks `to`.
+    Blocks,
+    /// `to` blocks this issue.
+    BlockedBy,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NewLinkBody {
+    kind: LinkKind,
+    to: LinkTarget,
+    direction: Option<LinkDirection>,
+}
+
+impl LinkTarget {
+    fn number_in(self, key: &str) -> Result<i64, ApiError> {
+        match self {
+            LinkTarget::Number(number) => Ok(number),
+            LinkTarget::Identifier(text) => {
+                let (other, number) = text
+                    .rsplit_once('-')
+                    .and_then(|(k, n)| Some((k, n.parse::<i64>().ok()?)))
+                    .ok_or_else(|| {
+                        invalid(format!("to must be an issue number or KEY-n, not {text}"))
+                    })?;
+                if other == key {
+                    Ok(number)
+                } else {
+                    Err(invalid(format!(
+                        "links must connect issues of the same project; {text} is not in {key}"
+                    )))
+                }
+            }
+        }
+    }
+}
+
+async fn list_links(
+    State(store): State<Store>,
+    Path((key, number)): Path<(String, i64)>,
+) -> ApiResult<Response> {
+    let found = store
+        .read(move |c| links::list_links(c, &key, number))
+        .await?;
+    Ok(Json(found).into_response())
+}
+
+async fn add_link(
+    State(store): State<Store>,
+    Extension(actor): Extension<Principal>,
+    Path((key, number)): Path<(String, i64)>,
+    ApiJson(body): ApiJson<NewLinkBody>,
+) -> ApiResult<Response> {
+    let to = body.to.number_in(&key)?;
+    let blocked_by = matches!(body.direction, Some(LinkDirection::BlockedBy));
+    if blocked_by && body.kind != LinkKind::Blocks {
+        return Err(invalid(
+            "direction blocked_by only applies to kind blocks".into(),
+        ));
+    }
+    let link = store
+        .write(move |tx| {
+            let now = now_millis();
+            if blocked_by {
+                links::add_blocker(tx, now, &actor, &key, number, to)
+            } else {
+                links::add_link(tx, now, &actor, &key, number, to, body.kind)
+            }
+        })
+        .await?;
+    Ok(created(link))
+}
+
+async fn remove_link(
+    State(store): State<Store>,
+    Extension(actor): Extension<Principal>,
+    Path((key, id)): Path<(String, i64)>,
+) -> ApiResult<Response> {
+    store
+        .write(move |tx| links::remove_link(tx, now_millis(), &actor, &key, id))
+        .await?;
+    Ok(no_content())
 }
 
 // ---- events and consumers ----

@@ -898,6 +898,164 @@ async fn stream_delivers_new_events_and_resumes_after_last_event_id() {
     server.shutdown().await;
 }
 
+/// The board markup of the card with this identifier.
+fn card_of<'a>(board: &'a str, ident: &str) -> &'a str {
+    board
+        .split("<li class=\"card")
+        .find(|chunk| chunk.contains(&format!(">{ident}</span>")))
+        .unwrap_or_else(|| panic!("no card for {ident}"))
+}
+
+#[tokio::test]
+async fn board_marks_blocked_cards_until_their_blockers_are_done() {
+    let server = Server::start().await;
+    let cookie = server.owner_cookie().await;
+    seed(&server, &cookie).await; // WEB-1, WEB-2, WEB-3 in Backlog
+    let (_, columns) = server
+        .api(&cookie, "GET", "/projects/WEB/columns", Value::Null)
+        .await;
+    let done = columns[3]["id"].as_i64().unwrap();
+    let (status, _) = server
+        .api(
+            &cookie,
+            "POST",
+            "/projects/WEB/issues/1/links",
+            json!({"kind": "blocks", "to": 2}),
+        )
+        .await;
+    assert_eq!(status, 201);
+
+    for path in ["/p/WEB", "/p/WEB/board"] {
+        let body = get(server.addr, path, Some(&cookie)).await.body;
+        let blocked = card_of(&body, "WEB-2");
+        assert!(blocked.contains("chip-blocked"), "{path}: {blocked}");
+        assert!(blocked.starts_with(" blocked\""), "{blocked}");
+        assert!(blocked.contains(r#"title="Blocked by WEB-1""#), "{blocked}");
+        assert!(blocked.contains(">Blocked<span class=\"sr-only\"> by WEB-1</span>"));
+        // The blocker and the unrelated issue are not marked.
+        for free in ["WEB-1", "WEB-3"] {
+            let card = card_of(&body, free);
+            assert!(!card.contains("chip-blocked"), "{path} {free}: {card}");
+            assert!(!card.starts_with(" blocked"), "{free}");
+        }
+    }
+
+    // The blocker reaches a completed column: nothing is blocked any more.
+    let (status, _) = server
+        .api(
+            &cookie,
+            "POST",
+            "/projects/WEB/issues/1/move",
+            json!({"column_id": done}),
+        )
+        .await;
+    assert_eq!(status, 200);
+    let body = get(server.addr, "/p/WEB/board", Some(&cookie)).await.body;
+    assert!(!body.contains("chip-blocked"), "{body}");
+
+    // A link event is an event of the project, so the board's stream sees it.
+    let mut sse = Sse::open(server.addr, "/events/stream?project=WEB", &cookie, None).await;
+    let (status, _) = server
+        .api(
+            &cookie,
+            "POST",
+            "/projects/WEB/issues/3/links",
+            json!({"kind": "blocks", "to": 2}),
+        )
+        .await;
+    assert_eq!(status, 201);
+    sse.read_until("link.added").await;
+    let events = sse.events();
+    assert_eq!(events[0]["kind"], "link.added");
+    assert_eq!(events[0]["project"], "WEB");
+    drop(sse);
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn issue_page_lists_links_with_a_form_and_escapes_titles() {
+    let server = Server::start().await;
+    let cookie = server.owner_cookie().await;
+    seed(&server, &cookie).await;
+    let (status, nasty) = server
+        .api(
+            &cookie,
+            "POST",
+            "/projects/WEB/issues",
+            json!({"title": "<b>bold</b> & \"quoted\""}),
+        )
+        .await;
+    assert_eq!(status, 201);
+    assert_eq!(nasty["number"], 4);
+    for (from, to, kind) in [(1, 2, "blocks"), (4, 2, "blocks"), (2, 3, "relates")] {
+        let (status, body) = server
+            .api(
+                &cookie,
+                "POST",
+                &format!("/projects/WEB/issues/{from}/links"),
+                json!({"kind": kind, "to": to}),
+            )
+            .await;
+        assert_eq!(status, 201, "{body}");
+    }
+
+    let page = get(server.addr, "/p/WEB/2", Some(&cookie)).await;
+    assert_eq!(page.status, 200);
+    let body = &page.body;
+    assert!(
+        body.contains(r#"<h2 id="links-heading">Links</h2>"#),
+        "{body}"
+    );
+    assert!(body.contains("<h3>Blocked by</h3>"));
+    assert!(body.contains("<h3>Related</h3>"));
+    assert!(!body.contains("<h3>Blocks</h3>"), "WEB-2 blocks nothing");
+    assert!(body.contains(r#"href="/p/WEB/1""#));
+    assert!(body.contains(r#"href="/p/WEB/3""#));
+    assert!(body.contains(r#"data-form="add-link""#));
+    assert!(body.contains(r#"<option value="blocked_by">Is blocked by</option>"#));
+    assert!(body.contains(r#"name="to" type="number""#));
+    assert_eq!(body.matches(r#"data-action="remove-link""#).count(), 3);
+    assert!(body.contains("data-link-id="));
+    assert!(body.contains("chip chip-blocked"), "header marker");
+    assert!(body.contains("Blocked</strong> until its blockers are done"));
+    // Titles are escaped in the links, in the form of the blocker's own page and in activity.
+    assert!(body.contains("&lt;b&gt;bold&lt;/b&gt; &amp; &quot;quoted&quot;"));
+    assert!(!body.contains("<b>bold"));
+    assert_eq!(body.matches("<script").count(), 1, "only the app script");
+    assert!(!body.contains(" style="));
+
+    // An unblocked, unlinked issue shows the empty state and still has the form.
+    let (_, _) = server
+        .api(
+            &cookie,
+            "POST",
+            "/projects/WEB/issues",
+            json!({"title": "lonely"}),
+        )
+        .await;
+    let lonely = get(server.addr, "/p/WEB/5", Some(&cookie)).await.body;
+    assert!(lonely.contains("No links."));
+    assert!(lonely.contains(r#"data-form="add-link""#));
+    assert!(!lonely.contains("chip-blocked"));
+
+    // The blocker's page says what it blocks, and its activity tells about the link.
+    let one = get(server.addr, "/p/WEB/1", Some(&cookie)).await.body;
+    assert!(one.contains("<h3>Blocks</h3>"));
+    assert!(one.contains("added the link WEB-1 blocks WEB-2"), "{one}");
+    assert!(!one.contains("chip-blocked"));
+    let activity = get(server.addr, "/p/WEB/1/activity", Some(&cookie))
+        .await
+        .body;
+    assert!(activity.contains("added the link WEB-1 blocks WEB-2"));
+
+    // The script posts to the API and reports errors inline.
+    let js = get(server.addr, "/assets/app.js", None).await.body;
+    assert!(js.contains("'add-link'") && js.contains("remove-link"));
+
+    server.shutdown().await;
+}
+
 #[tokio::test]
 async fn shutdown_ends_open_streams_without_waiting_for_the_drain() {
     let server = Server::start().await;

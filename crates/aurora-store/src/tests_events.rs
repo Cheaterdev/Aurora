@@ -9,6 +9,7 @@ use serde_json::Value;
 use crate::events::{self, Event, EventFilter, Start};
 use crate::projects::{NewColumn, Rejection, StateType};
 use crate::tests_support::issues::{self, IssuePatch, MoveTarget, NewIssue, Priority};
+use crate::tests_support::links::{self, LinkKind};
 use crate::tests_support::projects;
 use crate::{Store, StoreError};
 
@@ -550,6 +551,17 @@ struct Snapshot {
     labels: BTreeMap<i64, (i64, String, String)>,
     /// issue id -> issue
     issues: BTreeMap<i64, IssueSnap>,
+    /// link id -> (kind, project id, from number, to number); a `relates` link
+    /// has the lower number first
+    links: BTreeMap<i64, (String, i64, i64, i64)>,
+}
+
+fn link_snap(kind: &str, pid: i64, from: i64, to: i64) -> (String, i64, i64, i64) {
+    if kind == "relates" {
+        (kind.to_string(), pid, from.min(to), from.max(to))
+    } else {
+        (kind.to_string(), pid, from, to)
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -664,6 +676,18 @@ fn replay(log: &[Event]) -> Snapshot {
             }
             "issue.archived" => s.issues.get_mut(&e.entity_id).unwrap().archived = true,
             "issue.unarchived" => s.issues.get_mut(&e.entity_id).unwrap().archived = false,
+            "link.added" => {
+                let snap = link_snap(
+                    &text(&p["kind"]),
+                    pid,
+                    p["from"]["number"].as_i64().unwrap(),
+                    p["to"]["number"].as_i64().unwrap(),
+                );
+                s.links.insert(p["link_id"].as_i64().unwrap(), snap);
+            }
+            "link.removed" => {
+                s.links.remove(&p["link_id"].as_i64().unwrap());
+            }
             other => panic!("replay does not know the event kind {other}"),
         }
     }
@@ -701,6 +725,21 @@ async fn read_state(store: &Store) -> Snapshot {
                         ..issues::IssueFilter::default()
                     },
                 )?;
+                for i in &list.issues {
+                    let found = links::list_links(c, &project.key, i.number)?;
+                    for other in &found.blocks {
+                        s.links.insert(
+                            other.link_id,
+                            link_snap("blocks", project.id, i.number, other.number),
+                        );
+                    }
+                    for other in &found.related {
+                        s.links.insert(
+                            other.link_id,
+                            link_snap("relates", project.id, i.number, other.number),
+                        );
+                    }
+                }
                 for i in list.issues {
                     s.issues.insert(
                         i.id,
@@ -975,11 +1014,31 @@ async fn replaying_the_log_rebuilds_the_state() {
     run(s, move |tx| projects::delete_label(tx, 53, "TRK", c_id)).await;
     run(s, |tx| projects::rename_project(tx, 54, "TRK", "Tracker 2")).await;
 
+    // Links: added, one removed, one re-added the other way, a symmetric one.
+    run(s, |tx| {
+        links::add_link(tx, 60, "TRK", 1, 2, LinkKind::Blocks)
+    })
+    .await;
+    let gone = run(s, |tx| {
+        links::add_link(tx, 61, "TRK", 3, 1, LinkKind::Blocks)
+    })
+    .await;
+    run(s, |tx| {
+        links::add_link(tx, 62, "TRK", 3, 2, LinkKind::Relates)
+    })
+    .await;
+    run(s, move |tx| links::remove_link(tx, 63, "TRK", gone.id)).await;
+    run(s, |tx| {
+        links::add_link(tx, 64, "TRK", 1, 3, LinkKind::Blocks)
+    })
+    .await;
+
     let log = all_events(s).await;
     assert!(log.len() > 30, "{} events", log.len());
     let replayed = replay(&log);
     let actual = read_state(s).await;
     assert_eq!(replayed, actual);
+    assert_eq!(actual.links.len(), 3);
 
     // The scenario really exercised the state, not an empty model.
     assert_eq!(actual.issues.len(), 4);

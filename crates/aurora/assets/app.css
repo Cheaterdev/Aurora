@@ -516,6 +516,18 @@ main {
   color: var(--danger);
 }
 
+/* The word "Blocked" carries the meaning; the border and colour only reinforce it. */
+.chip-blocked {
+  background: var(--danger-bg);
+  color: var(--danger);
+  border: 1px solid var(--danger);
+  font-weight: 700;
+}
+
+.card.blocked {
+  border-left: 4px solid var(--danger);
+}
+
 .move-to select {
   min-height: var(--target);
   font-size: 0.9rem;
@@ -617,6 +629,27 @@ main {
 
 .children li {
   min-height: 28px;
+}
+
+.links-list {
+  list-style: none;
+  margin: 0 0 var(--gap);
+  padding: 0;
+}
+
+.links-list li {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px 8px;
+  min-height: var(--target);
+}
+
+.blocked-note {
+  background: var(--danger-bg);
+  color: var(--danger);
+  border-radius: var(--radius-small);
+  padding: 6px 10px;
 }
 
 .activity-list {

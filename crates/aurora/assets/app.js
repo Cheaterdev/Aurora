@@ -262,6 +262,8 @@
       issueAction(button, action);
     } else if (action === 'save-description') {
       saveField($('#f-description'));
+    } else if (action === 'remove-link') {
+      removeLink(button);
     }
   });
 
@@ -308,6 +310,15 @@
     'new-type': function (form) {
       return api('POST', '/projects/' + encodeURIComponent(project) + '/issue-types',
         { name: form.elements.name.value.trim() }).then(function () { location.reload(); });
+    },
+    'add-link': function (form) {
+      var choice = form.elements.kind.value;
+      var payload = {
+        kind: choice === 'relates' ? 'relates' : 'blocks',
+        to: Number(form.elements.to.value)
+      };
+      if (choice === 'blocked_by') { payload.direction = 'blocked_by'; }
+      return api('POST', issuePath() + '/links', payload).then(function () { location.reload(); });
     },
     'new-label': function (form) {
       return api('POST', '/projects/' + encodeURIComponent(project) + '/labels',
@@ -399,6 +410,16 @@
       button.disabled = false;
       message($('#page-msg'), err.message, 'error');
     });
+  }
+
+  function removeLink(button) {
+    button.disabled = true;
+    message($('#links-msg'), '');
+    api('DELETE', '/projects/' + encodeURIComponent(project) + '/links/' + button.dataset.linkId)
+      .then(function () { location.reload(); }, function (err) {
+        button.disabled = false;
+        message($('#links-msg'), err.message, 'error');
+      });
   }
 
   function refreshActivity() {

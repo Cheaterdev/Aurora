@@ -20,6 +20,7 @@ use serde_json::{Map, Value, json};
 
 use crate::StoreError;
 use crate::auth::Principal;
+use crate::links::{IssueLinks, links_of};
 use crate::projects::{Project, StateType, conflict, emit, get_project, invalid, not_found};
 
 pub const MAX_TITLE_CHARS: usize = 300;
@@ -96,6 +97,10 @@ pub struct Issue {
     pub archived: bool,
     /// Label ids, ascending.
     pub labels: Vec<i64>,
+    /// At least one blocker is neither archived nor in a completed or canceled column.
+    pub blocked: bool,
+    /// How many such blockers.
+    pub blocker_count: i64,
     #[serde(skip)]
     parent_id: Option<i64>,
 }
@@ -114,6 +119,7 @@ pub struct IssueDetail {
     pub issue: Issue,
     /// Ordered by column position, then issue position.
     pub children: Vec<ChildRef>,
+    pub links: IssueLinks,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -210,15 +216,24 @@ const ISSUE_FROM: &str = "FROM issue i
      JOIN \"column\" c ON c.id = i.column_id
      LEFT JOIN issue par ON par.id = i.parent_id";
 
-const ISSUE_COLUMNS: &str = "SELECT i.id, i.project_id, i.number, p.key, i.type_id, i.column_id,
+const ISSUE_COLUMNS: &str = concat!(
+    "SELECT i.id, i.project_id, i.number, p.key, i.type_id, i.column_id,
             i.title, i.description, i.assignee_id, par.number, i.priority, i.position,
-            i.created, i.updated, i.archived, i.parent_id";
+            i.created, i.updated, i.archived, i.parent_id,
+            (SELECT COUNT(*) FROM issue_link l
+               JOIN issue b ON b.id = l.from_issue_id
+               JOIN \"column\" bc ON bc.id = b.column_id
+              WHERE l.kind = 'blocks' AND l.to_issue_id = i.id AND ",
+    open_blocker!(),
+    ")"
+);
 
 const ISSUE_ORDER: &str = "ORDER BY c.position, i.position, i.id";
 
 fn issue_row(row: &Row<'_>) -> rusqlite::Result<Issue> {
     let key: String = row.get(3)?;
     let number: i64 = row.get(2)?;
+    let blocker_count: i64 = row.get(16)?;
     Ok(Issue {
         id: row.get(0)?,
         project_id: row.get(1)?,
@@ -236,6 +251,8 @@ fn issue_row(row: &Row<'_>) -> rusqlite::Result<Issue> {
         updated: row.get(13)?,
         archived: row.get(14)?,
         labels: Vec::new(),
+        blocked: blocker_count > 0,
+        blocker_count,
         parent_id: row.get(15)?,
     })
 }
@@ -278,7 +295,12 @@ fn detail(conn: &Connection, project: &Project, number: i64) -> Result<IssueDeta
             })
         })?
         .collect::<Result<_, _>>()?;
-    Ok(IssueDetail { issue, children })
+    let links = links_of(conn, &project.key, issue.id)?;
+    Ok(IssueDetail {
+        issue,
+        children,
+        links,
+    })
 }
 
 fn issue_id(conn: &Connection, project_id: i64, number: i64) -> Result<Option<i64>, StoreError> {

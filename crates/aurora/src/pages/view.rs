@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use aurora_store::auth::User;
 use aurora_store::events::Event;
 use aurora_store::issues::{Issue, Priority};
+use aurora_store::links::{Blocker, IssueLinks, LinkedIssue};
 use aurora_store::projects::{Column, IssueType, Label, Project};
 use maud::{DOCTYPE, Markup, html};
 use serde_json::Value;
@@ -297,15 +298,35 @@ fn add_form(column: &Column, types: &[IssueType]) -> Markup {
     }
 }
 
+fn blocker_names(blockers: &[Blocker]) -> String {
+    blockers
+        .iter()
+        .map(|b| b.identifier.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 fn card(issue: &Issue, key: &str, data: &BoardData, lookup: &Lookup<'_>) -> Markup {
+    let blockers = data
+        .blockers
+        .get(&issue.id)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
     html! {
-        li.card draggable="true" data-number=(issue.number) data-column-id=(issue.column_id) {
+        li.card.blocked[issue.blocked] draggable="true" data-number=(issue.number)
+            data-column-id=(issue.column_id) {
             a.card-link href={ "/p/" (key) "/" (issue.number) } draggable="false" {
                 span.ident { (issue.identifier) }
                 " "
                 span.card-title { (issue.title) }
             }
             div.card-meta {
+                @if issue.blocked {
+                    span.chip.chip-blocked title={ "Blocked by " (blocker_names(blockers)) } {
+                        "Blocked"
+                        span.sr-only { " by " (blocker_names(blockers)) }
+                    }
+                }
                 span.chip.chip-type { (lookup.type_name(issue.type_id)) }
                 @if let Some(priority) = issue.priority {
                     span.chip.chip-priority data-priority=(priority.as_str()) {
@@ -468,6 +489,27 @@ fn describe(event: &Event, lookup: &Lookup<'_>) -> (String, Vec<String>) {
                 (format!("moved the issue from {from} to {to}"), Vec::new())
             }
         }
+        "link.added" | "link.removed" => {
+            let verb = if event.kind == "link.added" {
+                "added"
+            } else {
+                "removed"
+            };
+            let ident = |side: &str| payload[side]["identifier"].as_str().unwrap_or("?");
+            let relation = if payload["kind"] == "blocks" {
+                "blocks"
+            } else {
+                "relates to"
+            };
+            (
+                format!(
+                    "{verb} the link {} {relation} {}",
+                    ident("from"),
+                    ident("to")
+                ),
+                Vec::new(),
+            )
+        }
         "issue.archived" => ("archived the issue".to_string(), Vec::new()),
         "issue.unarchived" => ("restored the issue".to_string(), Vec::new()),
         "issue.updated" => {
@@ -530,6 +572,69 @@ fn activity_list(events: &[Event], lookup: &Lookup<'_>) -> Markup {
     }
 }
 
+fn link_group(title: &str, items: &[LinkedIssue], key: &str, lookup: &Lookup<'_>) -> Markup {
+    html! {
+        @if !items.is_empty() {
+            h3 { (title) }
+            ul.links-list {
+                @for item in items {
+                    li {
+                        a href={ "/p/" (key) "/" (item.number) } {
+                            span.ident { (item.identifier) }
+                            " "
+                            (item.title)
+                        }
+                        " "
+                        span.chip data-state=(item.state_type.as_str()) { (lookup.column(item.column_id)) }
+                        @if item.archived { " " span.chip.chip-archived { "archived" } }
+                        " "
+                        button type="button" data-action="remove-link" data-link-id=(item.link_id) {
+                            "Remove"
+                            span.sr-only { " link to " (item.identifier) }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn links_section(links: &IssueLinks, blocked: bool, key: &str, lookup: &Lookup<'_>) -> Markup {
+    let none = links.blocks.is_empty() && links.blocked_by.is_empty() && links.related.is_empty();
+    html! {
+        section #links aria-labelledby="links-heading" {
+            h2 #links-heading { "Links" }
+            @if blocked {
+                p.blocked-note { strong { "Blocked" } " until its blockers are done." }
+            }
+            @if none {
+                p.empty { "No links." }
+            }
+            (link_group("Blocks", &links.blocks, key, lookup))
+            (link_group("Blocked by", &links.blocked_by, key, lookup))
+            (link_group("Related", &links.related, key, lookup))
+            form.inline-form data-form="add-link" {
+                h3 { "Add a link" }
+                div.field {
+                    label for="link-kind" { "Link type" }
+                    select #link-kind name="kind" {
+                        option value="blocks" { "Blocks" }
+                        option value="blocked_by" { "Is blocked by" }
+                        option value="relates" { "Relates to" }
+                    }
+                }
+                div.field {
+                    label for="link-to" { "Issue number" }
+                    input #link-to name="to" type="number" min="1" inputmode="numeric" required;
+                }
+                button type="submit" { "Add link" }
+                p.field-msg role="alert" {}
+            }
+            p.field-msg #links-msg role="alert" {}
+        }
+    }
+}
+
 pub fn activity_fragment(data: &ActivityData) -> Markup {
     let lookup = Lookup::new(&data.columns, &data.types, &data.labels, &data.users);
     activity_list(&data.activity, &lookup)
@@ -558,6 +663,7 @@ pub fn issue_page(data: &IssueData) -> Markup {
                 div.issue-head {
                     h1 { span.ident { (issue.identifier) } }
                     @if issue.archived { span.chip.chip-archived { "archived" } }
+                    @if issue.blocked { span.chip.chip-blocked { "Blocked" } }
                     @if issue.archived {
                         button type="button" data-action="unarchive" { "Restore" }
                     } @else {
@@ -609,6 +715,7 @@ pub fn issue_page(data: &IssueData) -> Markup {
                                 }
                             }
                         }
+                        (links_section(&data.detail.links, issue.blocked, key, &lookup))
                         (activity_list(&data.activity, &lookup))
                     }
                     aside.issue-side aria-label="Fields" {

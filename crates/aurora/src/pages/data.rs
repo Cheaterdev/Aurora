@@ -1,9 +1,12 @@
 //! What each page needs from the store, read in one go on a read-only connection.
 
+use std::collections::HashMap;
+
 use aurora_store::StoreError;
 use aurora_store::auth::{self, User};
 use aurora_store::events::{self, Event};
 use aurora_store::issues::{self, Issue, IssueDetail, IssueFilter};
+use aurora_store::links::{self, Blocker};
 use aurora_store::projects::{self, Column, IssueType, Label, Project};
 use aurora_store::rusqlite::Connection;
 
@@ -23,6 +26,8 @@ pub struct BoardData {
     pub types: Vec<IssueType>,
     pub labels: Vec<Label>,
     pub users: Vec<User>,
+    /// Open blockers of the blocked issues, by issue id.
+    pub blockers: HashMap<i64, Vec<Blocker>>,
     /// Read before the rest, so a stream started after it misses nothing.
     pub last_event: i64,
 }
@@ -75,6 +80,7 @@ pub fn load_board(conn: &Connection, user_id: i64, key: &str) -> Result<BoardDat
         types: projects::list_issue_types(conn, key)?,
         labels: projects::list_labels(conn, key)?,
         users: auth::list_users(conn)?,
+        blockers: links::open_blockers(conn, key)?,
         last_event,
     })
 }

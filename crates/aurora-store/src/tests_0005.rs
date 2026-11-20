@@ -34,7 +34,8 @@ async fn populated_version_four_database_gains_auth_and_keeps_its_data() {
     .unwrap();
     v4.close().await;
 
-    let store = Store::open(&path).unwrap();
+    let store =
+        Store::open_with_migrations(&path, &OpenOptions::default(), &MIGRATIONS[..5]).unwrap();
     assert_eq!(store.schema_version(), 5);
     let backup = store.open_report().backup.clone().expect("backup taken");
     assert!(backup.starts_with(default_backup_dir(&path)));
