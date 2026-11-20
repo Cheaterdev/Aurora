@@ -39,7 +39,11 @@
         var data = null;
         if (text) { try { data = JSON.parse(text); } catch (err) { data = null; } }
         if (res.status === 401) { goSignIn(); throw new Error('You are signed out.'); }
-        if (!res.ok) { throw new Error((data && data.error) || 'The request failed (' + res.status + ').'); }
+        if (!res.ok) {
+          var failure = new Error((data && data.error) || 'The request failed (' + res.status + ').');
+          failure.status = res.status;
+          throw failure;
+        }
         return data;
       });
     }, function () {
@@ -272,6 +276,20 @@
       deleteComment(button);
     } else if (action === 'delete-initiative') {
       deleteInitiative(button);
+    } else if (action === 'edit-document') {
+      editDocument(true);
+    } else if (action === 'cancel-edit') {
+      editDocument(false);
+    } else if (action === 'preview-document') {
+      previewDocument(button);
+    } else if (action === 'archive-document' || action === 'unarchive-document') {
+      archiveDocument(button, action === 'archive-document' ? 'archive' : 'unarchive');
+    } else if (action === 'remove-doc-link') {
+      removeDocumentLink(button);
+    } else if (action === 'restore-revision') {
+      restoreRevision(button);
+    } else if (action === 'reload-page') {
+      location.reload();
     }
   });
 
@@ -345,6 +363,38 @@
       if (form.elements.target_date.value) { payload.target_date = form.elements.target_date.value; }
       return api('POST', '/projects/' + encodeURIComponent(project) + '/initiatives', payload).then(function (made) {
         location.href = '/p/' + encodeURIComponent(project) + '/initiatives/' + made.id;
+      });
+    },
+    'new-document': function (form) {
+      var payload = { title: form.elements.title.value.trim() };
+      if (form.elements.parent.value) { payload.parent = Number(form.elements.parent.value); }
+      return api('POST', '/projects/' + encodeURIComponent(project) + '/documents', payload).then(function (made) {
+        location.href = documentsPath() + '/' + made.id;
+      });
+    },
+    'save-document': function (form) {
+      var doc = $('#doc');
+      var payload = {
+        title: form.elements.title.value.trim(),
+        body: form.elements.body.value,
+        base_revision: Number(doc.dataset.revision)
+      };
+      return api('PATCH', documentApi(body.dataset.documentId), payload).then(function () {
+        location.reload();
+      }, function (err) {
+        if (err.status === 409) {
+          var reload = $('#doc-reload');
+          if (reload) { reload.hidden = false; }
+          throw new Error('Someone else changed this document since you opened it. Your text is still here; copy it, then reload to see the latest version.');
+        }
+        throw err;
+      });
+    },
+    'add-doc-link': function (form) {
+      var payload = {};
+      payload[form.elements.kind.value] = Number(form.elements.target.value);
+      return api('POST', documentApi(body.dataset.documentId) + '/links', payload).then(function () {
+        location.reload();
       });
     },
     'new-label': function (form) {
@@ -577,6 +627,110 @@
     initiativeTimer = setTimeout(refreshInitiative, 150);
   }
 
+  // ---- documents ----
+
+  var documentTimer = null;
+
+  function documentsPath() { return '/p/' + encodeURIComponent(project) + '/documents'; }
+
+  function documentApi(id) { return '/projects/' + encodeURIComponent(project) + '/documents/' + id; }
+
+  function editing() {
+    var editor = $('#doc-editor');
+    return !!(editor && !editor.hidden);
+  }
+
+  function editDocument(on) {
+    var editor = $('#doc-editor');
+    var view = $('#doc-body');
+    if (!editor || !view) { return; }
+    editor.hidden = !on;
+    view.hidden = on;
+    var preview = $('#doc-preview');
+    if (preview) { preview.hidden = true; preview.textContent = ''; }
+    if (on) {
+      $('#doc-edit-body').focus();
+    } else {
+      editor.reset();
+      message($('.field-msg', editor), '');
+      if (documentWanted) { refreshDocument(); }
+    }
+  }
+
+  function previewDocument(button) {
+    var preview = $('#doc-preview');
+    var area = $('#doc-edit-body');
+    var out = $('.field-msg', button.closest('form'));
+    if (!preview || !area) { return; }
+    button.disabled = true;
+    message(out, '');
+    api('POST', '/projects/' + encodeURIComponent(project) + '/documents/preview', { body: area.value })
+      .then(function (made) {
+        // The server's renderer is the only producer of this markup; see markdown.rs.
+        preview.innerHTML = made.html;
+        preview.hidden = false;
+        button.disabled = false;
+      }, function (err) {
+        button.disabled = false;
+        message(out, err.message, 'error');
+      });
+  }
+
+  function archiveDocument(button, action) {
+    button.disabled = true;
+    api('POST', documentApi(body.dataset.documentId) + '/' + action).then(function () { location.reload(); },
+      function (err) {
+        button.disabled = false;
+        message($('#page-msg'), err.message, 'error');
+      });
+  }
+
+  function removeDocumentLink(button) {
+    var id = button.dataset.documentId || body.dataset.documentId;
+    button.disabled = true;
+    api('DELETE', documentApi(id) + '/links/' + button.dataset.linkId).then(function () { location.reload(); },
+      function (err) {
+        button.disabled = false;
+        message($('#page-msg') || $('#links-msg'), err.message, 'error');
+      });
+  }
+
+  function restoreRevision(button) {
+    if (!window.confirm('Restore revision ' + button.dataset.revision + '? It becomes a new revision; nothing is lost.')) { return; }
+    button.disabled = true;
+    api('POST', documentApi(body.dataset.documentId) + '/restore',
+      { revision: Number(button.dataset.revision), base_revision: Number(button.dataset.baseRevision) })
+      .then(function () { location.href = documentsPath() + '/' + body.dataset.documentId; }, function (err) {
+        button.disabled = false;
+        message($('#page-msg'), err.status === 409
+          ? 'The document changed since this page was opened. Reload and try again.' : err.message, 'error');
+      });
+  }
+
+  var documentWanted = false;
+
+  // The tree or the document is swapped; a document being edited is left alone.
+  function refreshDocument() {
+    var onList = page === 'documents';
+    if (!onList && editing()) { documentWanted = true; return Promise.resolve(); }
+    documentWanted = false;
+    var url = onList ? documentsPath() + '/list' : documentsPath() + '/' + body.dataset.documentId + '/content';
+    return fetchFragment(url).then(function (html) {
+      var current = $(onList ? '#doc-tree' : '#doc');
+      if (!html || !current) { return; }
+      if (!onList && editing()) { documentWanted = true; return; }
+      var fresh = parseFragment(html);
+      if (!fresh) { return; }
+      current.replaceWith(fresh);
+      localizeTimes(fresh);
+    });
+  }
+
+  function scheduleDocumentRefresh() {
+    clearTimeout(documentTimer);
+    documentTimer = setTimeout(refreshDocument, 150);
+  }
+
   // ---- live updates ----
 
   var lastEvent = Number(body.dataset.lastEvent || 0);
@@ -600,11 +754,18 @@
       } else if (data.entity_kind === 'issue') {
         scheduleInitiativeRefresh();
       }
+    } else if (page === 'documents') {
+      if (data.entity_kind === 'document') { scheduleDocumentRefresh(); }
+    } else if (page === 'document') {
+      if (data.entity_kind === 'document' && String(data.entity_id) === body.dataset.documentId) {
+        scheduleDocumentRefresh();
+      }
     }
   }
 
   function connect() {
-    var live = page === 'board' || page === 'issue' || page === 'initiatives' || page === 'initiative';
+    var live = page === 'board' || page === 'issue' || page === 'initiatives' || page === 'initiative' ||
+      page === 'documents' || page === 'document';
     if (!window.EventSource || !project || !live) { return; }
     var url = '/events/stream?after=' + lastEvent + '&project=' + encodeURIComponent(project);
     source = new EventSource(url);

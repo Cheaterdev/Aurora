@@ -20,6 +20,7 @@ use serde_json::{Map, Value, json};
 
 use crate::StoreError;
 use crate::auth::Principal;
+use crate::documents::{LinkedDocument, documents_of_issue};
 use crate::links::{IssueLinks, links_of};
 use crate::projects::{Project, StateType, conflict, emit, get_project, invalid, not_found};
 
@@ -122,6 +123,8 @@ pub struct IssueDetail {
     /// Ordered by column position, then issue position.
     pub children: Vec<ChildRef>,
     pub links: IssueLinks,
+    /// The non-archived documents linked to this issue.
+    pub documents: Vec<LinkedDocument>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -304,10 +307,12 @@ fn detail(conn: &Connection, project: &Project, number: i64) -> Result<IssueDeta
         })?
         .collect::<Result<_, _>>()?;
     let links = links_of(conn, &project.key, issue.id)?;
+    let documents = documents_of_issue(conn, issue.id)?;
     Ok(IssueDetail {
         issue,
         children,
         links,
+        documents,
     })
 }
 

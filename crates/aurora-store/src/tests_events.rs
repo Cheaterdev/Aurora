@@ -10,6 +10,9 @@ use crate::auth::{Principal, Role, Scope};
 use crate::comments::{self, NewComment};
 use crate::events::{self, Event, EventFilter, Start};
 use crate::projects::{NewColumn, Rejection, StateType};
+use crate::tests_support::documents::{
+    self, DocumentMove, DocumentPatch, DocumentTarget, NewDocument,
+};
 use crate::tests_support::initiatives::{self, InitiativePatch, InitiativeStatus, NewInitiative};
 use crate::tests_support::issues::{self, IssuePatch, MoveTarget, NewIssue, Priority};
 use crate::tests_support::links::{self, LinkKind};
@@ -562,6 +565,30 @@ struct Snapshot {
     links: BTreeMap<i64, (String, i64, i64, i64)>,
     /// comment id -> comment, for the comments a reader sees
     comments: BTreeMap<i64, CommentSnap>,
+    /// document id -> document, archived ones included
+    docs: BTreeMap<i64, DocSnap>,
+    /// document link id -> (document id, "issue" or "initiative", issue number or initiative id)
+    doc_links: BTreeMap<i64, (i64, String, i64)>,
+}
+
+/// What the log can say about a document: where it is, its title, its
+/// revision number and the size of its body. The body text itself is never in
+/// an event, so it is verified through the revisions in the document tests.
+#[derive(Debug, PartialEq)]
+struct DocSnap {
+    project_id: i64,
+    parent: Option<i64>,
+    title: String,
+    archived: bool,
+    revision: i64,
+    chars: i64,
+}
+
+fn doc_target(target: &Value) -> (String, i64) {
+    match target["kind"].as_str().unwrap() {
+        "issue" => ("issue".to_string(), target["number"].as_i64().unwrap()),
+        _ => ("initiative".to_string(), target["id"].as_i64().unwrap()),
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -810,6 +837,49 @@ fn replay(log: &[Event]) -> Snapshot {
                 assert!(c.mentions.contains(&text(&p["user_name"])));
                 assert_eq!(c.issue_id, e.entity_id);
             }
+            "document.created" => {
+                s.docs.insert(
+                    e.entity_id,
+                    DocSnap {
+                        project_id: pid,
+                        parent: p["parent"].as_i64(),
+                        title: text(&p["title"]),
+                        archived: false,
+                        revision: p["revision"].as_i64().unwrap(),
+                        chars: p["chars"].as_i64().unwrap(),
+                    },
+                );
+            }
+            "document.updated" => {
+                let doc = s.docs.get_mut(&e.entity_id).unwrap();
+                doc.revision = p["revision"].as_i64().unwrap();
+                doc.chars = p["chars"].as_i64().unwrap();
+                for (field, change) in p["changes"].as_object().unwrap() {
+                    match field.as_str() {
+                        "title" => doc.title = text(&change["to"]),
+                        other => panic!("unknown document field {other}"),
+                    }
+                }
+            }
+            "document.moved" => {
+                s.docs.get_mut(&e.entity_id).unwrap().parent = p["to_parent"].as_i64();
+            }
+            "document.archived" => s.docs.get_mut(&e.entity_id).unwrap().archived = true,
+            "document.unarchived" => s.docs.get_mut(&e.entity_id).unwrap().archived = false,
+            "document.restored" => {
+                let doc = s.docs.get_mut(&e.entity_id).unwrap();
+                doc.title = text(&p["title"]);
+                doc.revision = p["revision"].as_i64().unwrap();
+                doc.chars = p["chars"].as_i64().unwrap();
+            }
+            "document.link_added" => {
+                let (kind, target) = doc_target(&p["target"]);
+                s.doc_links
+                    .insert(p["link_id"].as_i64().unwrap(), (e.entity_id, kind, target));
+            }
+            "document.link_removed" => {
+                s.doc_links.remove(&p["link_id"].as_i64().unwrap());
+            }
             other => panic!("replay does not know the event kind {other}"),
         }
     }
@@ -838,6 +908,29 @@ async fn read_state(store: &Store) -> Snapshot {
                 }
                 for l in projects::list_labels(c, &project.key)? {
                     s.labels.insert(l.id, (l.project_id, l.name, l.color));
+                }
+                for summary in documents::list_documents(c, &project.key, true)? {
+                    let found = documents::get_document(c, &project.key, summary.id)?;
+                    let d = &found.document;
+                    s.docs.insert(
+                        d.id,
+                        DocSnap {
+                            project_id: d.project_id,
+                            parent: d.parent,
+                            title: d.title.clone(),
+                            archived: d.archived,
+                            revision: d.revision,
+                            chars: i64::try_from(d.body.chars().count()).unwrap(),
+                        },
+                    );
+                    for l in &found.links.issues {
+                        s.doc_links
+                            .insert(l.link_id, (d.id, "issue".to_string(), l.number));
+                    }
+                    for l in &found.links.initiatives {
+                        s.doc_links
+                            .insert(l.link_id, (d.id, "initiative".to_string(), l.id));
+                    }
                 }
                 for view in initiatives::list_initiatives(c, 0, &project.key, None)? {
                     let i = view.initiative;
@@ -1385,12 +1478,176 @@ async fn replaying_the_log_rebuilds_the_state() {
     })
     .await;
 
+    // Documents: nested, edited, restored, moved, linked both ways, archived,
+    // and an initiative deleted while documents link to it.
+    let new_doc = |title: &str, body: &str, parent: Option<i64>| NewDocument {
+        title: title.into(),
+        body: Some(body.into()),
+        parent,
+    };
+    let handbook = run(s, move |tx| {
+        documents::create_document(tx, 90, "TRK", new_doc("Handbook", "# Hi", None))
+    })
+    .await
+    .document
+    .id;
+    let page = run(s, move |tx| {
+        documents::create_document(tx, 91, "TRK", new_doc("Page", "text", Some(handbook)))
+    })
+    .await
+    .document
+    .id;
+    let side = run(s, move |tx| {
+        documents::create_document(tx, 91, "TRK", new_doc("Side", "", Some(handbook)))
+    })
+    .await
+    .document
+    .id;
+    run(s, move |tx| {
+        documents::create_document(tx, 91, "OTH", new_doc("Theirs", "x", None))
+    })
+    .await;
+    run(s, move |tx| {
+        documents::update_document(
+            tx,
+            92,
+            "TRK",
+            page,
+            DocumentPatch {
+                body: Some("longer text".into()),
+                ..DocumentPatch::default()
+            },
+        )
+    })
+    .await;
+    run(s, move |tx| {
+        documents::update_document(
+            tx,
+            93,
+            "TRK",
+            page,
+            DocumentPatch {
+                title: Some("Pager".into()),
+                body: Some("é".into()),
+                ..DocumentPatch::default()
+            },
+        )
+    })
+    .await;
+    run(s, move |tx| {
+        documents::restore_revision(tx, 94, "TRK", page, 2)
+    })
+    .await;
+    run(s, move |tx| {
+        documents::update_document(
+            tx,
+            95,
+            "TRK",
+            side,
+            DocumentPatch {
+                parent: Some(None),
+                ..DocumentPatch::default()
+            },
+        )
+    })
+    .await;
+    run(s, move |tx| {
+        documents::move_document(
+            tx,
+            96,
+            "TRK",
+            side,
+            DocumentMove {
+                parent: Some(Some(page)),
+                ..DocumentMove::default()
+            },
+        )
+    })
+    .await;
+    let gone = run(s, move |tx| {
+        documents::add_link(tx, 97, "TRK", page, DocumentTarget::Issue(1))
+    })
+    .await;
+    run(s, move |tx| {
+        documents::add_link(tx, 97, "TRK", page, DocumentTarget::Initiative(launch_id))
+    })
+    .await;
+    run(s, move |tx| {
+        documents::add_link(tx, 97, "TRK", handbook, DocumentTarget::Issue(3))
+    })
+    .await;
+    run(s, move |tx| {
+        documents::remove_link(tx, 98, "TRK", page, gone.id)
+    })
+    .await;
+    let ephemeral = run(s, |tx| {
+        initiatives::create_initiative(
+            tx,
+            99,
+            "TRK",
+            NewInitiative {
+                name: "Ephemeral".into(),
+                ..NewInitiative::default()
+            },
+        )
+    })
+    .await
+    .initiative
+    .id;
+    for doc in [page, side] {
+        run(s, move |tx| {
+            documents::add_link(tx, 99, "TRK", doc, DocumentTarget::Initiative(ephemeral))
+        })
+        .await;
+    }
+    run(s, move |tx| {
+        initiatives::delete_initiative(tx, 100, "TRK", ephemeral)
+    })
+    .await;
+    run(s, move |tx| {
+        documents::archive_document(tx, 101, "TRK", side)
+    })
+    .await;
+    run(s, move |tx| {
+        documents::archive_document(tx, 102, "TRK", page)
+    })
+    .await;
+    run(s, move |tx| {
+        documents::unarchive_document(tx, 103, "TRK", page)
+    })
+    .await;
+
     let log = all_events(s).await;
     assert!(log.len() > 30, "{} events", log.len());
     let replayed = replay(&log);
     let actual = read_state(s).await;
     assert_eq!(replayed, actual);
     assert_eq!(actual.links.len(), 3);
+
+    assert_eq!(actual.docs.len(), 4);
+    assert_eq!(actual.docs[&page].title, "Page", "restored from revision 2");
+    assert_eq!(
+        (actual.docs[&page].revision, actual.docs[&page].chars),
+        (4, 11)
+    );
+    assert_eq!(actual.docs[&page].parent, Some(handbook));
+    assert_eq!(actual.docs[&side].parent, Some(page));
+    assert!(actual.docs[&side].archived && !actual.docs[&page].archived);
+    // Page: Issue 1 link removed; the initiative link stays; Handbook keeps its issue link; the
+    // links to the deleted initiative went with it.
+    assert_eq!(actual.doc_links.len(), 2);
+    assert!(
+        actual
+            .doc_links
+            .values()
+            .any(|l| l == &(page, "initiative".to_string(), launch_id))
+    );
+    assert!(
+        log.iter()
+            .filter(|e| e.kind == "document.link_removed")
+            .count()
+            >= 3
+    );
 
     // Visible: the placeholder of `hi` (its reply stays), the reply and the OTH
     // comment; the deleted reply and the deleted lone comment are gone.

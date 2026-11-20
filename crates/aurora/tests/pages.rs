@@ -1714,6 +1714,340 @@ async fn stream_reports_initiative_and_issue_events() {
     server.shutdown().await;
 }
 
+// ---- documents ----
+
+async fn document(server: &Server, cookie: &str, body: Value) -> i64 {
+    let (status, made) = server
+        .api(cookie, "POST", "/projects/WEB/documents", body)
+        .await;
+    assert_eq!(status, 201, "{made}");
+    made["id"].as_i64().unwrap()
+}
+
+#[tokio::test]
+async fn documents_pages_list_a_tree_render_safely_and_show_history() {
+    let server = Server::start().await;
+    let cookie = server.owner_cookie().await;
+    seed(&server, &cookie).await;
+
+    // Empty: the empty state, the form and the nav link.
+    let resp = get(server.addr, "/p/WEB/documents", Some(&cookie)).await;
+    assert_eq!(resp.status, 200);
+    assert!(resp.body.contains("No documents yet"));
+    assert!(resp.body.contains(r#"data-page="documents""#));
+    assert!(resp.body.contains(r#"data-form="new-document""#));
+    assert!(resp.body.contains(r#"href="/p/WEB/documents""#));
+
+    let hostile = "# Heading\n\n<script>alert(1)</script>\n\n[bad](javascript:alert(1)) \
+                   [good](https://example.com) ![pic](https://example.com/x.png)\n\n\
+                   <img src=x onerror=alert(2)>";
+    let top = document(
+        &server,
+        &cookie,
+        json!({"title": "<img src=x onerror=alert(3)>", "body": hostile}),
+    )
+    .await;
+    let child = document(
+        &server,
+        &cookie,
+        json!({"title": "Child doc", "parent": top}),
+    )
+    .await;
+
+    // The tree: both titles, the child indented one level, the title escaped.
+    let resp = get(server.addr, "/p/WEB/documents", Some(&cookie)).await;
+    assert!(
+        resp.body
+            .contains(&format!(r#"href="/p/WEB/documents/{top}""#))
+    );
+    assert!(resp.body.contains(r#"data-depth="0""#));
+    assert!(resp.body.contains(r#"data-depth="1""#));
+    assert!(resp.body.contains("&lt;img src=x onerror=alert(3)&gt;"));
+    assert!(!resp.body.contains("<img src=x"));
+    // The new-document form preselects a parent from the query.
+    let resp = get(
+        server.addr,
+        &format!("/p/WEB/documents?parent={child}"),
+        Some(&cookie),
+    )
+    .await;
+    assert!(
+        resp.body
+            .contains(&format!(r#"<option value="{child}" selected>"#)),
+        "{}",
+        resp.body
+    );
+
+    // The document page: rendered, escaped, with the editor and its revision.
+    let page = get(
+        server.addr,
+        &format!("/p/WEB/documents/{top}"),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(page.status, 200);
+    assert!(page.body.contains(r#"data-page="document""#));
+    assert!(page.body.contains(&format!(r#"data-document-id="{top}""#)));
+    assert!(page.body.contains(r#"id="doc""#));
+    assert!(page.body.contains(r#"data-revision="1""#));
+    assert!(page.body.contains(r#"data-form="save-document""#));
+    assert!(page.body.contains("<h1>Heading</h1>"));
+    assert!(page.body.contains("https://example.com"));
+    assert_eq!(
+        page.body.matches("<script").count(),
+        1,
+        "only the app script: {}",
+        page.body
+    );
+    // The editor's textarea holds the source as escaped text; the rendered part has no such address.
+    let rendered = &page.body[index_of(&page.body, r#"id="doc-body""#)
+        ..index_of(&page.body, r#"<form class="doc-editor""#)];
+    assert!(!rendered.contains("javascript:"), "{rendered}");
+    assert!(!page.body.contains("<img"), "no image is ever loaded");
+    assert!(!page.body.contains("onerror=alert(2)>"), "{}", page.body);
+    assert!(page.body.contains("&lt;script&gt;alert(1)&lt;/script&gt;"));
+    assert!(page.body.contains(r#"data-action="preview-document""#));
+    // The sub-document is listed, and the crumbs of the child lead back to the parent.
+    assert!(page.body.contains("Child doc"));
+    let page_child = get(
+        server.addr,
+        &format!("/p/WEB/documents/{child}"),
+        Some(&cookie),
+    )
+    .await;
+    assert!(
+        page_child
+            .body
+            .contains(&format!(r#"href="/p/WEB/documents/{top}""#))
+    );
+
+    // Edit twice, restore the first revision: history lists all four, newest first.
+    for text in ["two", "three"] {
+        let (status, _) = server
+            .api(
+                &cookie,
+                "PATCH",
+                &format!("/projects/WEB/documents/{child}"),
+                json!({"body": text}),
+            )
+            .await;
+        assert_eq!(status, 200);
+    }
+    let (status, _) = server
+        .api(
+            &cookie,
+            "POST",
+            &format!("/projects/WEB/documents/{child}/restore"),
+            json!({"revision": 2}),
+        )
+        .await;
+    assert_eq!(status, 200);
+    let history = get(
+        server.addr,
+        &format!("/p/WEB/documents/{child}/history"),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(history.status, 200);
+    let newest = index_of(&history.body, "Revision 4");
+    let oldest = index_of(&history.body, "Revision 1");
+    assert!(newest < oldest, "newest first");
+    assert!(history.body.contains("restored from 2"));
+    assert!(history.body.contains("current"));
+
+    // A past revision has a restore button; the current one does not.
+    let old = get(
+        server.addr,
+        &format!("/p/WEB/documents/{child}/history/2"),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(old.status, 200);
+    assert!(old.body.contains(r#"data-action="restore-revision""#));
+    assert!(old.body.contains(r#"data-revision="2""#));
+    assert!(old.body.contains(r#"data-base-revision="4""#));
+    assert!(old.body.contains("two"));
+    let current = get(
+        server.addr,
+        &format!("/p/WEB/documents/{child}/history/4"),
+        Some(&cookie),
+    )
+    .await;
+    assert!(!current.body.contains(r#"data-action="restore-revision""#));
+    assert_eq!(
+        get(
+            server.addr,
+            &format!("/p/WEB/documents/{child}/history/99"),
+            Some(&cookie)
+        )
+        .await
+        .status,
+        404
+    );
+    assert_eq!(
+        get(server.addr, "/p/WEB/documents/9999", Some(&cookie))
+            .await
+            .status,
+        404
+    );
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn document_fragments_need_a_session_and_issue_and_initiative_pages_list_documents() {
+    let server = Server::start().await;
+    let cookie = server.owner_cookie().await;
+    let numbers = seed(&server, &cookie).await;
+    let id = document(
+        &server,
+        &cookie,
+        json!({"title": "Spec <b>", "body": "text"}),
+    )
+    .await;
+    let initiative_id = initiative(&server, &cookie, json!({"name": "Launch"})).await;
+    for target in [
+        json!({"issue": numbers[0]}),
+        json!({"initiative": initiative_id}),
+    ] {
+        let (status, link) = server
+            .api(
+                &cookie,
+                "POST",
+                &format!("/projects/WEB/documents/{id}/links"),
+                target,
+            )
+            .await;
+        assert_eq!(status, 201, "{link}");
+    }
+
+    for path in [
+        "/p/WEB/documents/list".to_string(),
+        format!("/p/WEB/documents/{id}/content"),
+    ] {
+        let resp = get(server.addr, &path, Some(&cookie)).await;
+        assert_eq!(resp.status, 200, "{path}");
+        assert!(!resp.body.contains("<html"), "{path}");
+        assert_eq!(resp.header("cache-control"), Some("no-store"));
+        let anonymous = send(
+            server.addr,
+            "GET",
+            &path,
+            &[("X-Requested-With", "aurora")],
+            "",
+        )
+        .await;
+        assert_eq!(anonymous.status, 401, "{path}");
+        assert_eq!(get(server.addr, &path, None).await.status, 303, "{path}");
+    }
+    let fragment = get(
+        server.addr,
+        &format!("/p/WEB/documents/{id}/content"),
+        Some(&cookie),
+    )
+    .await;
+    assert!(fragment.body.starts_with("<article"), "{}", fragment.body);
+
+    // Both sides show the link, with the title escaped and an unlink button.
+    for path in [
+        format!("/p/WEB/{}", numbers[0]),
+        format!("/p/WEB/initiatives/{initiative_id}"),
+    ] {
+        let resp = get(server.addr, &path, Some(&cookie)).await;
+        assert_eq!(resp.status, 200, "{path}");
+        assert!(resp.body.contains("Documents"), "{path}");
+        assert!(
+            resp.body
+                .contains(&format!(r#"href="/p/WEB/documents/{id}""#)),
+            "{path}"
+        );
+        assert!(resp.body.contains("Spec &lt;b&gt;"), "{path}");
+        assert!(!resp.body.contains("Spec <b>"), "{path}");
+        assert!(
+            resp.body.contains(r#"data-action="remove-doc-link""#),
+            "{path}"
+        );
+    }
+    let doc_page = get(
+        server.addr,
+        &format!("/p/WEB/documents/{id}"),
+        Some(&cookie),
+    )
+    .await;
+    assert!(doc_page.body.contains(&format!("/p/WEB/{}", numbers[0])));
+    assert!(
+        doc_page
+            .body
+            .contains(&format!("/p/WEB/initiatives/{initiative_id}"))
+    );
+    assert!(doc_page.body.contains(r#"data-form="add-doc-link""#));
+
+    // An archived document is not offered an editor or a link form.
+    let (status, _) = server
+        .api(
+            &cookie,
+            "POST",
+            &format!("/projects/WEB/documents/{id}/archive"),
+            Value::Null,
+        )
+        .await;
+    assert_eq!(status, 200);
+    let archived = get(
+        server.addr,
+        &format!("/p/WEB/documents/{id}"),
+        Some(&cookie),
+    )
+    .await;
+    assert!(archived.body.contains("archived"));
+    assert!(!archived.body.contains(r#"data-form="save-document""#));
+    assert!(!archived.body.contains(r#"data-form="add-doc-link""#));
+    assert!(
+        archived
+            .body
+            .contains(r#"data-action="unarchive-document""#)
+    );
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn stream_reports_document_events_for_the_document() {
+    let server = Server::start().await;
+    let cookie = server.owner_cookie().await;
+    seed(&server, &cookie).await;
+    let mut sse = Sse::open(server.addr, "/events/stream?project=WEB", &cookie, None).await;
+
+    let id = document(
+        &server,
+        &cookie,
+        json!({"title": "Live", "body": "secret words"}),
+    )
+    .await;
+    sse.read_until("document.created").await;
+    let (status, _) = server
+        .api(
+            &cookie,
+            "PATCH",
+            &format!("/projects/WEB/documents/{id}"),
+            json!({"body": "other secret words"}),
+        )
+        .await;
+    assert_eq!(status, 200);
+    sse.read_until("document.updated").await;
+
+    let events = sse.events();
+    let created = events
+        .iter()
+        .find(|e| e["kind"] == "document.created")
+        .unwrap();
+    // The page reacts to events whose entity is its document.
+    assert_eq!(created["entity_kind"], "document");
+    assert_eq!(created["entity_id"], id);
+    assert!(
+        !sse.seen.contains("secret words"),
+        "the stream carries no text"
+    );
+    server.shutdown().await;
+}
+
 #[tokio::test]
 async fn shutdown_ends_open_streams_without_waiting_for_the_drain() {
     let server = Server::start().await;

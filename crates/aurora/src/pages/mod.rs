@@ -6,7 +6,8 @@
 //! `assets/app.js` talks to the JSON API and re-fetches the board, activity,
 //! comments and initiative fragments (`/p/{key}/board`, `/p/{key}/{n}/activity`,
 //! `/p/{key}/{n}/comments`, `/p/{key}/initiatives/list`,
-//! `/p/{key}/initiatives/{id}/progress`) when
+//! `/p/{key}/initiatives/{id}/progress`, `/p/{key}/documents/list`,
+//! `/p/{key}/documents/{id}/content`) when
 //! `/events/stream` reports a change. Pages need the session cookie; a request
 //! without one is redirected to `/sign-in` (or to `/setup` while there is no
 //! owner), except fragment requests from the script, which get a 401.
@@ -52,6 +53,15 @@ pub fn router(store: Store, live: Live) -> Router<Store> {
         .route(
             "/p/{key}/initiatives/{id}/progress",
             get(initiative_progress_fragment),
+        )
+        .route("/p/{key}/documents", get(documents_page))
+        .route("/p/{key}/documents/list", get(documents_fragment))
+        .route("/p/{key}/documents/{id}", get(document_page))
+        .route("/p/{key}/documents/{id}/content", get(document_fragment))
+        .route("/p/{key}/documents/{id}/history", get(history_page))
+        .route(
+            "/p/{key}/documents/{id}/history/{number}",
+            get(revision_page),
         )
         .route("/p/{key}/{number}", get(issue_page))
         .route("/p/{key}/{number}/activity", get(activity_fragment))
@@ -413,6 +423,92 @@ async fn initiative_progress_fragment(
 ) -> PageResult {
     let data = load_initiative(&store, principal, key, id).await?;
     Ok(ok(view::initiative_progress_fragment(&data)))
+}
+
+#[derive(Deserialize)]
+struct DocumentsQuery {
+    parent: Option<i64>,
+}
+
+async fn load_documents(
+    store: &Store,
+    principal: Principal,
+    key: String,
+    parent: Option<i64>,
+) -> Result<data::DocumentsData, PageError> {
+    Ok(store
+        .read(move |c| data::load_documents(c, principal.user_id, &key, parent))
+        .await?)
+}
+
+async fn documents_page(
+    State(store): State<Store>,
+    Extension(principal): Extension<Principal>,
+    Path(key): Path<String>,
+    Query(query): Query<DocumentsQuery>,
+) -> PageResult {
+    let data = load_documents(&store, principal, key, query.parent).await?;
+    Ok(ok(view::documents_page(&data)))
+}
+
+async fn documents_fragment(
+    State(store): State<Store>,
+    Extension(principal): Extension<Principal>,
+    Path(key): Path<String>,
+) -> PageResult {
+    let data = load_documents(&store, principal, key, None).await?;
+    Ok(ok(view::documents_fragment(&data)))
+}
+
+async fn load_document(
+    store: &Store,
+    principal: Principal,
+    key: String,
+    id: i64,
+) -> Result<data::DocumentData, PageError> {
+    Ok(store
+        .read(move |c| data::load_document(c, principal.user_id, &key, id))
+        .await?)
+}
+
+async fn document_page(
+    State(store): State<Store>,
+    Extension(principal): Extension<Principal>,
+    Path((key, id)): Path<(String, i64)>,
+) -> PageResult {
+    let data = load_document(&store, principal, key, id).await?;
+    Ok(ok(view::document_page(&data)))
+}
+
+async fn document_fragment(
+    State(store): State<Store>,
+    Extension(principal): Extension<Principal>,
+    Path((key, id)): Path<(String, i64)>,
+) -> PageResult {
+    let data = load_document(&store, principal, key, id).await?;
+    Ok(ok(view::document_fragment(&data)))
+}
+
+async fn history_page(
+    State(store): State<Store>,
+    Extension(principal): Extension<Principal>,
+    Path((key, id)): Path<(String, i64)>,
+) -> PageResult {
+    let data = store
+        .read(move |c| data::load_history(c, principal.user_id, &key, id))
+        .await?;
+    Ok(ok(view::history_page(&data)))
+}
+
+async fn revision_page(
+    State(store): State<Store>,
+    Extension(principal): Extension<Principal>,
+    Path((key, id, number)): Path<(String, i64, i64)>,
+) -> PageResult {
+    let data = store
+        .read(move |c| data::load_revision(c, principal.user_id, &key, id, number))
+        .await?;
+    Ok(ok(view::revision_page(&data)))
 }
 
 async fn issue_page(

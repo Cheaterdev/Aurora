@@ -20,6 +20,7 @@ use serde_json::{Map, Value, json};
 
 use crate::StoreError;
 use crate::auth::Principal;
+use crate::documents::{LinkedDocument, documents_of_initiative, unlink_initiative};
 use crate::issues::{DEFAULT_LIMIT, MAX_LIMIT, present};
 use crate::projects::{StateType, emit, get_project, invalid, not_found, refusal};
 
@@ -158,6 +159,8 @@ pub struct InitiativeDetail {
     pub view: InitiativeView,
     /// The non-archived issues, ordered by column position, then issue position.
     pub issues: Vec<InitiativeIssue>,
+    /// The non-archived documents linked to this initiative.
+    pub documents: Vec<LinkedDocument>,
     /// All of them, ignoring `limit` and `offset`.
     pub total: i64,
     pub limit: i64,
@@ -495,10 +498,12 @@ pub fn get_initiative(
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
+    let documents = documents_of_initiative(conn, id)?;
     Ok(InitiativeDetail {
         total: view.progress.total,
         view,
         issues,
+        documents,
         limit,
         offset,
     })
@@ -656,6 +661,7 @@ pub fn delete_initiative(
             &json!({ "changes": { "initiative": { "from": id, "to": null } } }),
         )?;
     }
+    unlink_initiative(tx, now, actor, project.id, id)?;
     tx.execute("DELETE FROM initiative WHERE id = ?1", [id])?;
     emit(
         tx,

@@ -2,6 +2,7 @@
 
 pub mod auth;
 pub mod config;
+pub mod markdown;
 pub mod pages;
 pub mod routes;
 pub mod shutdown;

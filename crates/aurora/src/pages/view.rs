@@ -1,12 +1,16 @@
 //! The HTML of every page, as `maud` templates. `maud` escapes every
 //! interpolated value, so user content is never raw HTML; nothing here uses
-//! `PreEscaped`. Data for the script goes in `data-*` attributes: the content
-//! security policy forbids inline script and style.
+//! `PreEscaped`. The one exception is a document body, which goes through
+//! `crate::markdown::render` and is interpolated as the `Markup` it returns:
+//! that renderer is the only producer of unescaped user-derived HTML. Data for
+//! the script goes in `data-*` attributes: the content security policy
+//! forbids inline script and style.
 
 use std::collections::HashMap;
 
 use aurora_store::auth::{Role, User};
 use aurora_store::comments::{Comment, mention_ranges};
+use aurora_store::documents::{DocumentDetail, DocumentLinks, DocumentSummary, LinkedDocument};
 use aurora_store::events::Event;
 use aurora_store::initiatives::{Health, Initiative, InitiativeStatus, InitiativeView, Progress};
 use aurora_store::issues::{Issue, Priority};
@@ -17,9 +21,11 @@ use serde_json::Value;
 
 use super::assets;
 use super::data::{
-    ActivityData, BoardData, CommentsData, HomeData, InitiativeData, InitiativesData, IssueData,
+    ActivityData, BoardData, CommentsData, DocumentData, DocumentsData, HistoryData, HomeData,
+    InitiativeData, InitiativesData, IssueData, RevisionData,
 };
 use super::time::{utc_iso, utc_text};
+use crate::markdown;
 
 const PRIORITIES: [Priority; 4] = [
     Priority::Urgent,
@@ -38,8 +44,8 @@ const STATUSES: [InitiativeStatus; 5] = [
 
 pub struct Frame<'a> {
     pub title: &'a str,
-    /// `board`, `issue`, `initiatives`, `initiative`, `home`, `sign-in` or `setup`; the
-    /// script picks its behaviour from it.
+    /// `board`, `issue`, `initiatives`, `initiative`, `documents`, `document`, `history`,
+    /// `revision`, `home`, `sign-in` or `setup`; the script picks its behaviour from it.
     pub page: &'static str,
     pub user: Option<&'a User>,
     pub project: Option<&'a Project>,
@@ -47,6 +53,7 @@ pub struct Frame<'a> {
     pub issue_id: Option<i64>,
     pub issue_number: Option<i64>,
     pub initiative_id: Option<i64>,
+    pub document_id: Option<i64>,
 }
 
 impl<'a> Frame<'a> {
@@ -60,6 +67,7 @@ impl<'a> Frame<'a> {
             issue_id: None,
             issue_number: None,
             initiative_id: None,
+            document_id: None,
         }
     }
 }
@@ -82,7 +90,8 @@ fn layout(frame: &Frame<'_>, content: Markup) -> Markup {
                 data-last-event=[frame.last_event]
                 data-issue-id=[frame.issue_id]
                 data-issue-number=[frame.issue_number]
-                data-initiative-id=[frame.initiative_id] {
+                data-initiative-id=[frame.initiative_id]
+                data-document-id=[frame.document_id] {
                 a.skip href="#main" { "Skip to content" }
                 header.topbar {
                     a.brand href="/" { "Aurora" }
@@ -94,6 +103,7 @@ fn layout(frame: &Frame<'_>, content: Markup) -> Markup {
                                 (project.name)
                             }
                             a href={ "/p/" (project.key) "/initiatives" } { "Initiatives" }
+                            a href={ "/p/" (project.key) "/documents" } { "Documents" }
                             a href="/?list=1" { "All projects" }
                         }
                     }
@@ -687,6 +697,7 @@ pub fn initiative_page(data: &InitiativeData) -> Markup {
                             p.field-msg role="alert" {}
                         }
                         (initiative_progress_fragment(data))
+                        (documents_section(&data.detail.documents, key))
                     }
                     aside.issue-side aria-label="Fields" {
                         div.field {
@@ -715,6 +726,382 @@ pub fn initiative_page(data: &InitiativeData) -> Markup {
                             "."
                         }
                     }
+                }
+            }
+        },
+    )
+}
+
+// ---- documents ----
+
+/// The documents linked to an issue or an initiative.
+fn documents_section(documents: &[LinkedDocument], key: &str) -> Markup {
+    html! {
+        section #documents aria-labelledby="documents-heading" {
+            h2 #documents-heading { "Documents" }
+            @if documents.is_empty() {
+                p.empty { "No linked documents. Link one from the document's page." }
+            } @else {
+                ul.links-list {
+                    @for doc in documents {
+                        li {
+                            a href={ "/p/" (key) "/documents/" (doc.id) } { (doc.title) }
+                            " "
+                            button type="button" data-action="remove-doc-link"
+                                data-document-id=(doc.id) data-link-id=(doc.link_id) {
+                                "Unlink"
+                                span.sr-only { " " (doc.title) }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn document_options(documents: &[(usize, DocumentSummary)], selected: Option<i64>) -> Markup {
+    html! {
+        option value="" selected[selected.is_none()] { "None (top level)" }
+        @for (depth, doc) in documents {
+            option value=(doc.id) selected[selected == Some(doc.id)] {
+                (" \u{b7} ".repeat(*depth)) (doc.title)
+            }
+        }
+    }
+}
+
+fn document_tree(data: &DocumentsData) -> Markup {
+    let key = data.project.key.as_str();
+    html! {
+        section #doc-tree aria-label="Documents" {
+            @if data.documents.is_empty() {
+                p.empty { "No documents yet. Create the first one below." }
+            } @else {
+                ul.doc-tree {
+                    @for (depth, doc) in &data.documents {
+                        li data-depth=(depth) {
+                            a href={ "/p/" (key) "/documents/" (doc.id) } { (doc.title) }
+                            " "
+                            span.meta {
+                                "updated "
+                                time.when datetime=(utc_iso(doc.updated)) data-ts=(doc.updated) {
+                                    (utc_text(doc.updated))
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The tree alone; also what `GET /p/{key}/documents/list` returns for live refreshes.
+pub fn documents_fragment(data: &DocumentsData) -> Markup {
+    document_tree(data)
+}
+
+pub fn documents_page(data: &DocumentsData) -> Markup {
+    let key = data.project.key.as_str();
+    let mut frame = Frame::new("Documents", "documents");
+    frame.user = Some(&data.user);
+    frame.project = Some(&data.project);
+    frame.last_event = Some(data.last_event);
+    layout(
+        &frame,
+        html! {
+            section.page {
+                nav.crumbs aria-label="Breadcrumb" {
+                    a href={ "/p/" (key) } { (data.project.name) }
+                    " / "
+                    span { "Documents" }
+                }
+                h1 { "Documents" }
+                (document_tree(data))
+                h2 { "New document" }
+                form.inline-form data-form="new-document" {
+                    div.field {
+                        label for="document-title" { "Title" }
+                        input #document-title name="title" required maxlength="200"
+                            placeholder="Design notes" autocomplete="off";
+                    }
+                    div.field {
+                        label for="document-parent" { "Parent" }
+                        select #document-parent name="parent" {
+                            (document_options(&data.documents, data.parent))
+                        }
+                    }
+                    button.primary type="submit" { "Create document" }
+                    p.field-msg role="alert" {}
+                }
+            }
+        },
+    )
+}
+
+fn links_of_document(links: &DocumentLinks, key: &str, archived: bool) -> Markup {
+    let none = links.issues.is_empty() && links.initiatives.is_empty();
+    html! {
+        section #doc-links aria-labelledby="doc-links-heading" {
+            h2 #doc-links-heading { "Linked to" }
+            @if none {
+                p.empty { "Not linked to any issue or initiative." }
+            } @else {
+                ul.links-list {
+                    @for issue in &links.issues {
+                        li {
+                            a href={ "/p/" (key) "/" (issue.number) } {
+                                span.ident { (issue.identifier) }
+                                " "
+                                (issue.title)
+                            }
+                            " "
+                            button type="button" data-action="remove-doc-link" data-link-id=(issue.link_id) {
+                                "Unlink"
+                                span.sr-only { " " (issue.identifier) }
+                            }
+                        }
+                    }
+                    @for initiative in &links.initiatives {
+                        li {
+                            a href={ "/p/" (key) "/initiatives/" (initiative.id) } {
+                                span.chip { "initiative" }
+                                " "
+                                (initiative.name)
+                            }
+                            " "
+                            button type="button" data-action="remove-doc-link" data-link-id=(initiative.link_id) {
+                                "Unlink"
+                                span.sr-only { " " (initiative.name) }
+                            }
+                        }
+                    }
+                }
+            }
+            @if !archived {
+                form.inline-form data-form="add-doc-link" {
+                    h3 { "Link to an issue or initiative" }
+                    div.field {
+                        label for="doc-link-kind" { "Kind" }
+                        select #doc-link-kind name="kind" {
+                            option value="issue" { "Issue number" }
+                            option value="initiative" { "Initiative id" }
+                        }
+                    }
+                    div.field {
+                        label for="doc-link-target" { "Number" }
+                        input #doc-link-target name="target" type="number" min="1"
+                            inputmode="numeric" required;
+                    }
+                    button type="submit" { "Add link" }
+                    p.field-msg role="alert" {}
+                }
+            }
+        }
+    }
+}
+
+/// The whole document, editor included; also what `GET /p/{key}/documents/{id}/content`
+/// returns for live refreshes. `data-revision` is the revision a save is based on.
+pub fn document_fragment(data: &DocumentData) -> Markup {
+    let key = data.project.key.as_str();
+    let doc = &data.detail.document;
+    html! {
+        article #doc data-revision=(doc.revision) data-archived=(doc.archived) {
+            div.issue-head {
+                h1 #doc-title { (doc.title) }
+                @if doc.archived { span.chip.chip-archived { "archived" } }
+                @if !doc.archived {
+                    button type="button" data-action="edit-document" { "Edit" }
+                }
+                @if doc.archived {
+                    button type="button" data-action="unarchive-document" { "Restore" }
+                } @else {
+                    button type="button" data-action="archive-document" { "Archive" }
+                }
+                a.button href={ "/p/" (key) "/documents/" (doc.id) "/history" } {
+                    "History (" (doc.revision) ")"
+                }
+            }
+            p.meta {
+                "Revision " (doc.revision) ", updated "
+                time.when datetime=(utc_iso(doc.updated)) data-ts=(doc.updated) {
+                    (utc_text(doc.updated))
+                }
+                "."
+            }
+            p.field-msg #page-msg role="alert" {}
+            section.markdown #doc-body aria-label="Document" {
+                @if doc.body.trim().is_empty() {
+                    p.empty { "This document is empty." }
+                } @else {
+                    (markdown::render(&doc.body))
+                }
+            }
+            @if !doc.archived {
+                form.doc-editor #doc-editor data-form="save-document" hidden {
+                    div.field {
+                        label for="doc-edit-title" { "Title" }
+                        input #doc-edit-title name="title" value=(doc.title) required maxlength="200";
+                    }
+                    div.field {
+                        label for="doc-edit-body" { "Body (Markdown)" }
+                        textarea #doc-edit-body name="body" rows="20" maxlength="200000" {
+                            "\n" (doc.body)
+                        }
+                    }
+                    div.row {
+                        button.primary type="submit" { "Save" }
+                        button type="button" data-action="preview-document" { "Preview" }
+                        button type="button" data-action="cancel-edit" { "Cancel" }
+                        button type="button" data-action="reload-page" #doc-reload hidden {
+                            "Reload the latest version"
+                        }
+                    }
+                    p.field-msg role="alert" {}
+                    div.markdown #doc-preview aria-label="Preview" hidden {}
+                }
+            }
+            section #doc-children aria-labelledby="doc-children-heading" {
+                h2 #doc-children-heading { "Sub-documents" }
+                @if data.detail.children.is_empty() {
+                    p.empty { "No sub-documents." }
+                } @else {
+                    ul.links-list {
+                        @for child in &data.detail.children {
+                            li { a href={ "/p/" (key) "/documents/" (child.id) } { (child.title) } }
+                        }
+                    }
+                }
+                @if !doc.archived {
+                    p {
+                        a href={ "/p/" (key) "/documents?parent=" (doc.id) } { "Add a sub-document" }
+                    }
+                }
+            }
+            (links_of_document(&data.detail.links, key, doc.archived))
+        }
+    }
+}
+
+fn document_crumbs(project: &Project, detail: &DocumentDetail) -> Markup {
+    let key = project.key.as_str();
+    html! {
+        nav.crumbs aria-label="Breadcrumb" {
+            a href={ "/p/" (key) } { (project.name) }
+            " / "
+            a href={ "/p/" (key) "/documents" } { "Documents" }
+            @for ancestor in &detail.ancestors {
+                " / "
+                a href={ "/p/" (key) "/documents/" (ancestor.id) } { (ancestor.title) }
+            }
+            " / "
+            a href={ "/p/" (key) "/documents/" (detail.document.id) } { (detail.document.title) }
+        }
+    }
+}
+
+pub fn document_page(data: &DocumentData) -> Markup {
+    let doc = &data.detail.document;
+    let mut frame = Frame::new(&doc.title, "document");
+    frame.user = Some(&data.user);
+    frame.project = Some(&data.project);
+    frame.last_event = Some(data.last_event);
+    frame.document_id = Some(doc.id);
+    layout(
+        &frame,
+        html! {
+            section.page.doc-page {
+                (document_crumbs(&data.project, &data.detail))
+                (document_fragment(data))
+            }
+        },
+    )
+}
+
+pub fn history_page(data: &HistoryData) -> Markup {
+    let key = data.project.key.as_str();
+    let doc = &data.detail.document;
+    let title = format!("History of {}", doc.title);
+    let mut frame = Frame::new(&title, "history");
+    frame.user = Some(&data.user);
+    frame.project = Some(&data.project);
+    frame.document_id = Some(doc.id);
+    layout(
+        &frame,
+        html! {
+            section.page {
+                (document_crumbs(&data.project, &data.detail))
+                h1 { "History" }
+                ol.revisions reversed {
+                    @for revision in &data.revisions {
+                        li {
+                            a href={ "/p/" (key) "/documents/" (doc.id) "/history/" (revision.number) } {
+                                "Revision " (revision.number)
+                            }
+                            " "
+                            @if revision.number == doc.revision {
+                                span.chip { "current" }
+                                " "
+                            }
+                            span.meta {
+                                (revision.title) ", " (revision.chars) " characters, by "
+                                (revision.author.as_deref().unwrap_or("unknown")) " "
+                                time.when datetime=(utc_iso(revision.created)) data-ts=(revision.created) {
+                                    (utc_text(revision.created))
+                                }
+                                @if let Some(note) = &revision.note { " \u{2013} " (note) }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+    )
+}
+
+pub fn revision_page(data: &RevisionData) -> Markup {
+    let key = data.project.key.as_str();
+    let doc = &data.detail.document;
+    let revision = &data.revision;
+    let title = format!("{} revision {}", doc.title, revision.number);
+    let mut frame = Frame::new(&title, "revision");
+    frame.user = Some(&data.user);
+    frame.project = Some(&data.project);
+    frame.document_id = Some(doc.id);
+    layout(
+        &frame,
+        html! {
+            section.page {
+                (document_crumbs(&data.project, &data.detail))
+                nav.crumbs aria-label="History" {
+                    a href={ "/p/" (key) "/documents/" (doc.id) "/history" } { "History" }
+                    " / "
+                    span { "Revision " (revision.number) }
+                }
+                div.issue-head {
+                    h1 { (revision.title) }
+                    @if revision.number == doc.revision {
+                        span.chip { "current" }
+                    } @else if !doc.archived {
+                        button type="button" data-action="restore-revision"
+                            data-revision=(revision.number) data-base-revision=(doc.revision) {
+                            "Restore this revision"
+                        }
+                    }
+                }
+                p.meta {
+                    "Revision " (revision.number) " by "
+                    (revision.author.as_deref().unwrap_or("unknown")) " "
+                    time.when datetime=(utc_iso(revision.created)) data-ts=(revision.created) {
+                        (utc_text(revision.created))
+                    }
+                    @if let Some(note) = &revision.note { " \u{2013} " (note) }
+                }
+                p.field-msg #page-msg role="alert" {}
+                section.markdown aria-label="Document" {
+                    (markdown::render(&revision.body))
                 }
             }
         },
@@ -1166,6 +1553,7 @@ pub fn issue_page(data: &IssueData) -> Markup {
                             }
                         }
                         (links_section(&data.detail.links, issue.blocked, key, &lookup))
+                        (documents_section(&data.detail.documents, key))
                         (comments_list(&data.comments, &data.user))
                         (activity_list(&data.activity, &lookup))
                     }

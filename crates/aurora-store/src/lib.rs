@@ -13,6 +13,7 @@ macro_rules! open_blocker {
 pub mod auth;
 mod backup;
 pub mod comments;
+pub mod documents;
 pub mod events;
 pub mod initiatives;
 mod integrity;
@@ -683,6 +684,100 @@ mod tests_support {
         }
     }
 
+    pub(crate) mod documents {
+        pub(crate) use crate::documents::*;
+
+        use rusqlite::Transaction;
+
+        use super::test_actor;
+        use crate::StoreError;
+
+        pub(crate) fn create_document(
+            tx: &Transaction<'_>,
+            now: i64,
+            project_key: &str,
+            new: NewDocument,
+        ) -> Result<DocumentDetail, StoreError> {
+            crate::documents::create_document(tx, now, &test_actor(tx), project_key, new)
+        }
+
+        pub(crate) fn update_document(
+            tx: &Transaction<'_>,
+            now: i64,
+            project_key: &str,
+            id: i64,
+            patch: DocumentPatch,
+        ) -> Result<DocumentDetail, StoreError> {
+            crate::documents::update_document(tx, now, &test_actor(tx), project_key, id, patch)
+        }
+
+        pub(crate) fn move_document(
+            tx: &Transaction<'_>,
+            now: i64,
+            project_key: &str,
+            id: i64,
+            target: DocumentMove,
+        ) -> Result<DocumentDetail, StoreError> {
+            crate::documents::move_document(tx, now, &test_actor(tx), project_key, id, target)
+        }
+
+        pub(crate) fn archive_document(
+            tx: &Transaction<'_>,
+            now: i64,
+            project_key: &str,
+            id: i64,
+        ) -> Result<DocumentDetail, StoreError> {
+            crate::documents::archive_document(tx, now, &test_actor(tx), project_key, id)
+        }
+
+        pub(crate) fn unarchive_document(
+            tx: &Transaction<'_>,
+            now: i64,
+            project_key: &str,
+            id: i64,
+        ) -> Result<DocumentDetail, StoreError> {
+            crate::documents::unarchive_document(tx, now, &test_actor(tx), project_key, id)
+        }
+
+        pub(crate) fn restore_revision(
+            tx: &Transaction<'_>,
+            now: i64,
+            project_key: &str,
+            id: i64,
+            number: i64,
+        ) -> Result<DocumentDetail, StoreError> {
+            crate::documents::restore_revision(
+                tx,
+                now,
+                &test_actor(tx),
+                project_key,
+                id,
+                number,
+                None,
+            )
+        }
+
+        pub(crate) fn add_link(
+            tx: &Transaction<'_>,
+            now: i64,
+            project_key: &str,
+            id: i64,
+            target: DocumentTarget,
+        ) -> Result<DocumentLink, StoreError> {
+            crate::documents::add_link(tx, now, &test_actor(tx), project_key, id, target)
+        }
+
+        pub(crate) fn remove_link(
+            tx: &Transaction<'_>,
+            now: i64,
+            project_key: &str,
+            id: i64,
+            link_id: i64,
+        ) -> Result<(), StoreError> {
+            crate::documents::remove_link(tx, now, &test_actor(tx), project_key, id, link_id)
+        }
+    }
+
     pub(crate) mod links {
         pub(crate) use crate::links::*;
 
@@ -738,11 +833,15 @@ mod tests_0007;
 #[cfg(test)]
 mod tests_0008;
 #[cfg(test)]
+mod tests_0009;
+#[cfg(test)]
 mod tests_actor;
 #[cfg(test)]
 mod tests_auth;
 #[cfg(test)]
 mod tests_comments;
+#[cfg(test)]
+mod tests_documents;
 #[cfg(test)]
 mod tests_events;
 #[cfg(test)]

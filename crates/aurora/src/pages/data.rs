@@ -4,6 +4,7 @@ use std::collections::HashMap;
 
 use aurora_store::auth::{self, User};
 use aurora_store::comments::{self, Comment};
+use aurora_store::documents::{self, DocumentDetail, DocumentSummary, Revision, RevisionSummary};
 use aurora_store::events::{self, Event};
 use aurora_store::initiatives::{self, Initiative, InitiativeDetail, InitiativeView};
 use aurora_store::issues::{self, Issue, IssueDetail, IssueFilter};
@@ -63,6 +64,38 @@ pub struct InitiativeData {
     pub detail: InitiativeDetail,
     pub columns: Vec<Column>,
     pub last_event: i64,
+}
+
+pub struct DocumentsData {
+    pub user: User,
+    pub project: Project,
+    /// `(depth, document)` in tree order.
+    pub documents: Vec<(usize, DocumentSummary)>,
+    /// Preselected parent of the new-document form.
+    pub parent: Option<i64>,
+    pub last_event: i64,
+}
+
+pub struct DocumentData {
+    pub user: User,
+    pub project: Project,
+    pub detail: DocumentDetail,
+    pub last_event: i64,
+}
+
+pub struct HistoryData {
+    pub user: User,
+    pub project: Project,
+    pub detail: DocumentDetail,
+    /// Newest first.
+    pub revisions: Vec<RevisionSummary>,
+}
+
+pub struct RevisionData {
+    pub user: User,
+    pub project: Project,
+    pub detail: DocumentDetail,
+    pub revision: Revision,
 }
 
 /// The project's initiatives without their progress, to name them.
@@ -179,6 +212,66 @@ pub fn load_issue(
         activity,
         comments: comments::list_comments(conn, key, number)?,
         last_event,
+    })
+}
+
+pub fn load_documents(
+    conn: &Connection,
+    user_id: i64,
+    key: &str,
+    parent: Option<i64>,
+) -> Result<DocumentsData, StoreError> {
+    let last_event = events::latest_event_id(conn)?;
+    Ok(DocumentsData {
+        user: auth::get_user(conn, user_id)?,
+        project: projects::get_project(conn, key)?,
+        documents: documents::in_tree_order(documents::list_documents(conn, key, false)?),
+        parent,
+        last_event,
+    })
+}
+
+pub fn load_document(
+    conn: &Connection,
+    user_id: i64,
+    key: &str,
+    id: i64,
+) -> Result<DocumentData, StoreError> {
+    let last_event = events::latest_event_id(conn)?;
+    Ok(DocumentData {
+        user: auth::get_user(conn, user_id)?,
+        project: projects::get_project(conn, key)?,
+        detail: documents::get_document(conn, key, id)?,
+        last_event,
+    })
+}
+
+pub fn load_history(
+    conn: &Connection,
+    user_id: i64,
+    key: &str,
+    id: i64,
+) -> Result<HistoryData, StoreError> {
+    Ok(HistoryData {
+        user: auth::get_user(conn, user_id)?,
+        project: projects::get_project(conn, key)?,
+        detail: documents::get_document(conn, key, id)?,
+        revisions: documents::list_revisions(conn, key, id)?,
+    })
+}
+
+pub fn load_revision(
+    conn: &Connection,
+    user_id: i64,
+    key: &str,
+    id: i64,
+    number: i64,
+) -> Result<RevisionData, StoreError> {
+    Ok(RevisionData {
+        user: auth::get_user(conn, user_id)?,
+        project: projects::get_project(conn, key)?,
+        detail: documents::get_document(conn, key, id)?,
+        revision: documents::get_revision(conn, key, id, number)?,
     })
 }
 

@@ -7,6 +7,7 @@
 
 use aurora_store::auth::Principal;
 use aurora_store::comments::{self, NewComment};
+use aurora_store::documents::{self, DocumentMove, DocumentPatch, DocumentTarget, NewDocument};
 use aurora_store::events::{self, EventFilter, Start};
 use aurora_store::initiatives::{self, InitiativePatch, InitiativeStatus, NewInitiative};
 use aurora_store::issues::{self, IssueFilter, IssuePatch, MoveTarget, NewIssue, ParentFilter};
@@ -24,7 +25,7 @@ use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::json;
 
-use crate::auth;
+use crate::{auth, markdown};
 
 const DEFAULT_LABEL_COLOR: &str = "#808080";
 
@@ -106,6 +107,44 @@ pub fn api_router(store: Store) -> Router<Store> {
             get(get_initiative)
                 .patch(update_initiative)
                 .delete(delete_initiative),
+        )
+        .route(
+            "/projects/{key}/documents",
+            get(list_documents).post(create_document),
+        )
+        .route("/projects/{key}/documents/preview", post(preview_document))
+        .route(
+            "/projects/{key}/documents/{id}",
+            get(get_document).patch(update_document),
+        )
+        .route("/projects/{key}/documents/{id}/move", post(move_document))
+        .route(
+            "/projects/{key}/documents/{id}/archive",
+            post(archive_document),
+        )
+        .route(
+            "/projects/{key}/documents/{id}/unarchive",
+            post(unarchive_document),
+        )
+        .route(
+            "/projects/{key}/documents/{id}/revisions",
+            get(list_revisions),
+        )
+        .route(
+            "/projects/{key}/documents/{id}/revisions/{number}",
+            get(get_revision),
+        )
+        .route(
+            "/projects/{key}/documents/{id}/restore",
+            post(restore_revision),
+        )
+        .route(
+            "/projects/{key}/documents/{id}/links",
+            post(add_document_link),
+        )
+        .route(
+            "/projects/{key}/documents/{id}/links/{link_id}",
+            delete(remove_document_link),
         )
         .route("/events", get(list_events))
         .route("/consumers", get(list_consumers))
@@ -866,6 +905,203 @@ async fn delete_initiative(
         .write(move |tx| initiatives::delete_initiative(tx, now_millis(), &actor, &key, id))
         .await?;
     Ok(no_content())
+}
+
+// ---- documents ----
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DocumentQuery {
+    include_archived: Option<bool>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RestoreBody {
+    revision: i64,
+    base_revision: Option<i64>,
+}
+
+/// Exactly one of the two.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DocumentLinkBody {
+    issue: Option<i64>,
+    initiative: Option<i64>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PreviewBody {
+    body: String,
+}
+
+async fn list_documents(
+    State(store): State<Store>,
+    Path(key): Path<String>,
+    ApiQuery(query): ApiQuery<DocumentQuery>,
+) -> ApiResult<Response> {
+    let include_archived = query.include_archived.unwrap_or(false);
+    let list = store
+        .read(move |c| documents::list_documents(c, &key, include_archived))
+        .await?;
+    Ok(Json(list).into_response())
+}
+
+async fn create_document(
+    State(store): State<Store>,
+    Extension(actor): Extension<Principal>,
+    Path(key): Path<String>,
+    ApiJson(body): ApiJson<NewDocument>,
+) -> ApiResult<Response> {
+    let document = store
+        .write(move |tx| documents::create_document(tx, now_millis(), &actor, &key, body))
+        .await?;
+    Ok(created(document))
+}
+
+async fn get_document(
+    State(store): State<Store>,
+    Path((key, id)): Path<(String, i64)>,
+) -> ApiResult<Response> {
+    let document = store
+        .read(move |c| documents::get_document(c, &key, id))
+        .await?;
+    Ok(Json(document).into_response())
+}
+
+async fn update_document(
+    State(store): State<Store>,
+    Extension(actor): Extension<Principal>,
+    Path((key, id)): Path<(String, i64)>,
+    ApiJson(body): ApiJson<DocumentPatch>,
+) -> ApiResult<Response> {
+    let document = store
+        .write(move |tx| documents::update_document(tx, now_millis(), &actor, &key, id, body))
+        .await?;
+    Ok(Json(document).into_response())
+}
+
+async fn move_document(
+    State(store): State<Store>,
+    Extension(actor): Extension<Principal>,
+    Path((key, id)): Path<(String, i64)>,
+    ApiJson(body): ApiJson<DocumentMove>,
+) -> ApiResult<Response> {
+    let document = store
+        .write(move |tx| documents::move_document(tx, now_millis(), &actor, &key, id, body))
+        .await?;
+    Ok(Json(document).into_response())
+}
+
+async fn archive_document(
+    State(store): State<Store>,
+    Extension(actor): Extension<Principal>,
+    Path((key, id)): Path<(String, i64)>,
+) -> ApiResult<Response> {
+    let document = store
+        .write(move |tx| documents::archive_document(tx, now_millis(), &actor, &key, id))
+        .await?;
+    Ok(Json(document).into_response())
+}
+
+async fn unarchive_document(
+    State(store): State<Store>,
+    Extension(actor): Extension<Principal>,
+    Path((key, id)): Path<(String, i64)>,
+) -> ApiResult<Response> {
+    let document = store
+        .write(move |tx| documents::unarchive_document(tx, now_millis(), &actor, &key, id))
+        .await?;
+    Ok(Json(document).into_response())
+}
+
+async fn list_revisions(
+    State(store): State<Store>,
+    Path((key, id)): Path<(String, i64)>,
+) -> ApiResult<Response> {
+    let list = store
+        .read(move |c| documents::list_revisions(c, &key, id))
+        .await?;
+    Ok(Json(list).into_response())
+}
+
+async fn get_revision(
+    State(store): State<Store>,
+    Path((key, id, number)): Path<(String, i64, i64)>,
+) -> ApiResult<Response> {
+    let revision = store
+        .read(move |c| documents::get_revision(c, &key, id, number))
+        .await?;
+    Ok(Json(revision).into_response())
+}
+
+async fn restore_revision(
+    State(store): State<Store>,
+    Extension(actor): Extension<Principal>,
+    Path((key, id)): Path<(String, i64)>,
+    ApiJson(body): ApiJson<RestoreBody>,
+) -> ApiResult<Response> {
+    let document = store
+        .write(move |tx| {
+            documents::restore_revision(
+                tx,
+                now_millis(),
+                &actor,
+                &key,
+                id,
+                body.revision,
+                body.base_revision,
+            )
+        })
+        .await?;
+    Ok(Json(document).into_response())
+}
+
+async fn add_document_link(
+    State(store): State<Store>,
+    Extension(actor): Extension<Principal>,
+    Path((key, id)): Path<(String, i64)>,
+    ApiJson(body): ApiJson<DocumentLinkBody>,
+) -> ApiResult<Response> {
+    let target = match (body.issue, body.initiative) {
+        (Some(number), None) => DocumentTarget::Issue(number),
+        (None, Some(initiative)) => DocumentTarget::Initiative(initiative),
+        _ => return Err(invalid("give exactly one of issue and initiative".into())),
+    };
+    let link = store
+        .write(move |tx| documents::add_link(tx, now_millis(), &actor, &key, id, target))
+        .await?;
+    Ok(created(link))
+}
+
+async fn remove_document_link(
+    State(store): State<Store>,
+    Extension(actor): Extension<Principal>,
+    Path((key, id, link_id)): Path<(String, i64, i64)>,
+) -> ApiResult<Response> {
+    store
+        .write(move |tx| documents::remove_link(tx, now_millis(), &actor, &key, id, link_id))
+        .await?;
+    Ok(no_content())
+}
+
+/// The server-rendered HTML of a draft body, for the editor's Preview button;
+/// the same renderer as the document page, so what is previewed is what is shown.
+async fn preview_document(
+    State(store): State<Store>,
+    Path(key): Path<String>,
+    ApiJson(body): ApiJson<PreviewBody>,
+) -> ApiResult<Response> {
+    store.read(move |c| projects::get_project(c, &key)).await?;
+    if body.body.chars().count() > documents::MAX_BODY_CHARS {
+        return Err(invalid(format!(
+            "body must be at most {} characters",
+            documents::MAX_BODY_CHARS
+        )));
+    }
+    let html = markdown::render(&body.body).into_string();
+    Ok(Json(json!({ "html": html })).into_response())
 }
 
 // ---- events and consumers ----

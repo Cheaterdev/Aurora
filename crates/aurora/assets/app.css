@@ -823,6 +823,141 @@ main {
   min-height: 88px;
 }
 
+/* ---- documents ---- */
+
+[hidden] {
+  display: none !important;
+}
+
+.doc-tree {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.doc-tree li {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  align-items: baseline;
+  min-height: 40px;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.doc-tree li[data-depth="1"] { padding-left: 20px; }
+.doc-tree li[data-depth="2"] { padding-left: 40px; }
+.doc-tree li[data-depth="3"] { padding-left: 60px; }
+.doc-tree li[data-depth="4"] { padding-left: 80px; }
+.doc-tree li[data-depth="5"] { padding-left: 100px; }
+.doc-tree li[data-depth="6"] { padding-left: 120px; }
+.doc-tree li[data-depth="7"] { padding-left: 140px; }
+.doc-tree li[data-depth="8"] { padding-left: 160px; }
+
+a.button {
+  display: inline-flex;
+  align-items: center;
+  min-height: 40px;
+  padding: 0 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-small);
+  background: var(--surface);
+  color: var(--text);
+  text-decoration: none;
+}
+
+.revisions {
+  padding-left: 28px;
+}
+
+.revisions li {
+  padding: 8px 0;
+}
+
+.doc-editor textarea {
+  min-height: 320px;
+  font-family: var(--font-mono);
+}
+
+.markdown {
+  overflow-wrap: anywhere;
+  line-height: 1.6;
+}
+
+.markdown h1,
+.markdown h2,
+.markdown h3,
+.markdown h4,
+.markdown h5,
+.markdown h6 {
+  margin: 1.2em 0 0.5em;
+  line-height: 1.25;
+}
+
+.markdown p,
+.markdown ul,
+.markdown ol,
+.markdown blockquote,
+.markdown pre,
+.markdown .table-wrap {
+  margin: 0 0 1em;
+}
+
+.markdown code {
+  font-family: var(--font-mono);
+  font-size: 0.92em;
+  background: var(--surface-alt);
+  border-radius: var(--radius-small);
+  padding: 1px 4px;
+}
+
+.markdown pre {
+  overflow-x: auto;
+  background: var(--surface-alt);
+  border-radius: var(--radius);
+  padding: 12px;
+}
+
+.markdown pre code {
+  background: none;
+  padding: 0;
+}
+
+.markdown blockquote {
+  border-left: 3px solid var(--border);
+  padding-left: 12px;
+  color: var(--muted);
+}
+
+.markdown .table-wrap {
+  overflow-x: auto;
+}
+
+.markdown table {
+  border-collapse: collapse;
+}
+
+.markdown th,
+.markdown td {
+  border: 1px solid var(--border);
+  padding: 6px 10px;
+}
+
+.markdown .align-left { text-align: left; }
+.markdown .align-center { text-align: center; }
+.markdown .align-right { text-align: right; }
+
+.markdown .raw-html {
+  white-space: pre-wrap;
+  font-family: var(--font-mono);
+  color: var(--muted);
+}
+
+.markdown .image-link::before {
+  content: "Image: ";
+  color: var(--muted);
+}
+
 /* ---- toasts ---- */
 
 .toasts {
