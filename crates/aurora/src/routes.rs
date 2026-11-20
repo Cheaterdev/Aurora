@@ -5,6 +5,7 @@
 //! authentication layer in [`crate::auth`] except `POST /setup` and
 //! `POST /auth/sign-in`; `/health` lives outside the API.
 
+use aurora_store::auth::Principal;
 use aurora_store::events::{self, EventFilter, Start};
 use aurora_store::issues::{self, IssueFilter, IssuePatch, MoveTarget, NewIssue, ParentFilter};
 use aurora_store::projects::{self, NewColumn, StateType};
@@ -15,7 +16,7 @@ use axum::http::request::Parts;
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, patch, post, put};
-use axum::{Json, Router, middleware};
+use axum::{Extension, Json, Router, middleware};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::json;
@@ -223,6 +224,7 @@ async fn list_projects(State(store): State<Store>) -> ApiResult<Response> {
 
 async fn create_project(
     State(store): State<Store>,
+    Extension(actor): Extension<Principal>,
     ApiJson(body): ApiJson<NewProject>,
 ) -> ApiResult<Response> {
     let project = store
@@ -230,6 +232,7 @@ async fn create_project(
             projects::create_project(
                 tx,
                 now_millis(),
+                &actor,
                 &body.key,
                 &body.name,
                 body.columns.as_deref(),
@@ -246,11 +249,12 @@ async fn get_project(State(store): State<Store>, Path(key): Path<String>) -> Api
 
 async fn rename_project(
     State(store): State<Store>,
+    Extension(actor): Extension<Principal>,
     Path(key): Path<String>,
     ApiJson(body): ApiJson<NameBody>,
 ) -> ApiResult<Response> {
     let project = store
-        .write(move |tx| projects::rename_project(tx, now_millis(), &key, &body.name))
+        .write(move |tx| projects::rename_project(tx, now_millis(), &actor, &key, &body.name))
         .await?;
     Ok(Json(project).into_response())
 }
@@ -296,12 +300,13 @@ async fn list_columns(
 
 async fn create_column(
     State(store): State<Store>,
+    Extension(actor): Extension<Principal>,
     Path(key): Path<String>,
     ApiJson(body): ApiJson<NewColumnBody>,
 ) -> ApiResult<Response> {
     let column = store
         .write(move |tx| {
-            projects::create_column(tx, now_millis(), &key, &body.name, body.state_type)
+            projects::create_column(tx, now_millis(), &actor, &key, &body.name, body.state_type)
         })
         .await?;
     Ok(created(column))
@@ -309,32 +314,35 @@ async fn create_column(
 
 async fn rename_column(
     State(store): State<Store>,
+    Extension(actor): Extension<Principal>,
     Path((key, id)): Path<(String, i64)>,
     ApiJson(body): ApiJson<NameBody>,
 ) -> ApiResult<Response> {
     let column = store
-        .write(move |tx| projects::rename_column(tx, now_millis(), &key, id, &body.name))
+        .write(move |tx| projects::rename_column(tx, now_millis(), &actor, &key, id, &body.name))
         .await?;
     Ok(Json(column).into_response())
 }
 
 async fn reorder_columns(
     State(store): State<Store>,
+    Extension(actor): Extension<Principal>,
     Path(key): Path<String>,
     ApiJson(body): ApiJson<OrderBody>,
 ) -> ApiResult<Response> {
     let columns = store
-        .write(move |tx| projects::reorder_columns(tx, now_millis(), &key, &body.ids))
+        .write(move |tx| projects::reorder_columns(tx, now_millis(), &actor, &key, &body.ids))
         .await?;
     Ok(Json(columns).into_response())
 }
 
 async fn delete_column(
     State(store): State<Store>,
+    Extension(actor): Extension<Principal>,
     Path((key, id)): Path<(String, i64)>,
 ) -> ApiResult<Response> {
     store
-        .write(move |tx| projects::delete_column(tx, now_millis(), &key, id))
+        .write(move |tx| projects::delete_column(tx, now_millis(), &actor, &key, id))
         .await?;
     Ok(no_content())
 }
@@ -353,32 +361,37 @@ async fn list_issue_types(
 
 async fn create_issue_type(
     State(store): State<Store>,
+    Extension(actor): Extension<Principal>,
     Path(key): Path<String>,
     ApiJson(body): ApiJson<NameBody>,
 ) -> ApiResult<Response> {
     let issue_type = store
-        .write(move |tx| projects::create_issue_type(tx, now_millis(), &key, &body.name))
+        .write(move |tx| projects::create_issue_type(tx, now_millis(), &actor, &key, &body.name))
         .await?;
     Ok(created(issue_type))
 }
 
 async fn rename_issue_type(
     State(store): State<Store>,
+    Extension(actor): Extension<Principal>,
     Path((key, id)): Path<(String, i64)>,
     ApiJson(body): ApiJson<NameBody>,
 ) -> ApiResult<Response> {
     let issue_type = store
-        .write(move |tx| projects::rename_issue_type(tx, now_millis(), &key, id, &body.name))
+        .write(move |tx| {
+            projects::rename_issue_type(tx, now_millis(), &actor, &key, id, &body.name)
+        })
         .await?;
     Ok(Json(issue_type).into_response())
 }
 
 async fn delete_issue_type(
     State(store): State<Store>,
+    Extension(actor): Extension<Principal>,
     Path((key, id)): Path<(String, i64)>,
 ) -> ApiResult<Response> {
     store
-        .write(move |tx| projects::delete_issue_type(tx, now_millis(), &key, id))
+        .write(move |tx| projects::delete_issue_type(tx, now_millis(), &actor, &key, id))
         .await?;
     Ok(no_content())
 }
@@ -406,13 +419,14 @@ async fn list_labels(State(store): State<Store>, Path(key): Path<String>) -> Api
 
 async fn create_label(
     State(store): State<Store>,
+    Extension(actor): Extension<Principal>,
     Path(key): Path<String>,
     ApiJson(body): ApiJson<NewLabelBody>,
 ) -> ApiResult<Response> {
     let label = store
         .write(move |tx| {
             let color = body.color.as_deref().unwrap_or(DEFAULT_LABEL_COLOR);
-            projects::create_label(tx, now_millis(), &key, &body.name, color)
+            projects::create_label(tx, now_millis(), &actor, &key, &body.name, color)
         })
         .await?;
     Ok(created(label))
@@ -420,6 +434,7 @@ async fn create_label(
 
 async fn update_label(
     State(store): State<Store>,
+    Extension(actor): Extension<Principal>,
     Path((key, id)): Path<(String, i64)>,
     ApiJson(body): ApiJson<LabelPatch>,
 ) -> ApiResult<Response> {
@@ -434,10 +449,10 @@ async fn update_label(
             let now = now_millis();
             let mut label = None;
             if let Some(name) = &body.name {
-                label = Some(projects::rename_label(tx, now, &key, id, name)?);
+                label = Some(projects::rename_label(tx, now, &actor, &key, id, name)?);
             }
             if let Some(color) = &body.color {
-                label = Some(projects::recolor_label(tx, now, &key, id, color)?);
+                label = Some(projects::recolor_label(tx, now, &actor, &key, id, color)?);
             }
             label.ok_or_else(|| StoreError::from(Rejection::NotFound("label".into())))
         })
@@ -447,10 +462,11 @@ async fn update_label(
 
 async fn delete_label(
     State(store): State<Store>,
+    Extension(actor): Extension<Principal>,
     Path((key, id)): Path<(String, i64)>,
 ) -> ApiResult<Response> {
     store
-        .write(move |tx| projects::delete_label(tx, now_millis(), &key, id))
+        .write(move |tx| projects::delete_label(tx, now_millis(), &actor, &key, id))
         .await?;
     Ok(no_content())
 }
@@ -515,11 +531,12 @@ async fn list_issues(
 
 async fn create_issue(
     State(store): State<Store>,
+    Extension(actor): Extension<Principal>,
     Path(key): Path<String>,
     ApiJson(body): ApiJson<NewIssue>,
 ) -> ApiResult<Response> {
     let issue = store
-        .write(move |tx| issues::create_issue(tx, now_millis(), &key, body))
+        .write(move |tx| issues::create_issue(tx, now_millis(), &actor, &key, body))
         .await?;
     Ok(created(issue))
 }
@@ -536,42 +553,46 @@ async fn get_issue(
 
 async fn update_issue(
     State(store): State<Store>,
+    Extension(actor): Extension<Principal>,
     Path((key, number)): Path<(String, i64)>,
     ApiJson(body): ApiJson<IssuePatch>,
 ) -> ApiResult<Response> {
     let issue = store
-        .write(move |tx| issues::update_issue(tx, now_millis(), &key, number, body))
+        .write(move |tx| issues::update_issue(tx, now_millis(), &actor, &key, number, body))
         .await?;
     Ok(Json(issue).into_response())
 }
 
 async fn move_issue(
     State(store): State<Store>,
+    Extension(actor): Extension<Principal>,
     Path((key, number)): Path<(String, i64)>,
     ApiJson(body): ApiJson<MoveTarget>,
 ) -> ApiResult<Response> {
     let issue = store
-        .write(move |tx| issues::move_issue(tx, now_millis(), &key, number, body))
+        .write(move |tx| issues::move_issue(tx, now_millis(), &actor, &key, number, body))
         .await?;
     Ok(Json(issue).into_response())
 }
 
 async fn archive_issue(
     State(store): State<Store>,
+    Extension(actor): Extension<Principal>,
     Path((key, number)): Path<(String, i64)>,
 ) -> ApiResult<Response> {
     let issue = store
-        .write(move |tx| issues::archive_issue(tx, now_millis(), &key, number))
+        .write(move |tx| issues::archive_issue(tx, now_millis(), &actor, &key, number))
         .await?;
     Ok(Json(issue).into_response())
 }
 
 async fn unarchive_issue(
     State(store): State<Store>,
+    Extension(actor): Extension<Principal>,
     Path((key, number)): Path<(String, i64)>,
 ) -> ApiResult<Response> {
     let issue = store
-        .write(move |tx| issues::unarchive_issue(tx, now_millis(), &key, number))
+        .write(move |tx| issues::unarchive_issue(tx, now_millis(), &actor, &key, number))
         .await?;
     Ok(Json(issue).into_response())
 }

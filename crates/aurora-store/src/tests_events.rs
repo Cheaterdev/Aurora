@@ -7,8 +7,9 @@ use rusqlite::Transaction;
 use serde_json::Value;
 
 use crate::events::{self, Event, EventFilter, Start};
-use crate::issues::{self, IssuePatch, MoveTarget, NewIssue, Priority};
-use crate::projects::{self, NewColumn, Rejection, StateType};
+use crate::projects::{NewColumn, Rejection, StateType};
+use crate::tests_support::issues::{self, IssuePatch, MoveTarget, NewIssue, Priority};
+use crate::tests_support::projects;
 use crate::{Store, StoreError};
 
 fn is_not_found(err: &StoreError) -> bool {
@@ -107,7 +108,7 @@ async fn events_are_ordered_and_carry_their_fields() {
     let last = &list[3];
     assert_eq!(last.project.as_deref(), Some("TRK"));
     assert_eq!(last.entity_kind, "issue");
-    assert_eq!(last.actor, None);
+    assert_eq!(last.actor, Some(crate::tests_support::TEST_USER_ID));
     assert_eq!(last.created, 1001);
     assert_eq!(last.payload["title"], "issue 1");
     assert_eq!(last.payload["identifier"], "TRK-2");

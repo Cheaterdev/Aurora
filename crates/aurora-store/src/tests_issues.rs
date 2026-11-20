@@ -2,10 +2,9 @@
 
 use serde_json::{Value, json};
 
-use crate::issues::*;
-use crate::projects::{
-    ProjectDetail, Rejection, StateType, create_issue_type, create_label, create_project,
-};
+use crate::projects::{ProjectDetail, Rejection, StateType};
+use crate::tests_support::issues::*;
+use crate::tests_support::projects::{create_issue_type, create_label, create_project};
 use crate::{Store, StoreError};
 
 struct Setup {
@@ -136,7 +135,11 @@ impl Setup {
                 )?;
                 let rows = stmt.query_map([], |r| {
                     let payload: String = r.get(4)?;
-                    assert_eq!(r.get::<_, Option<i64>>(5)?, None, "actor is NULL for now");
+                    assert_eq!(
+                        r.get::<_, Option<i64>>(5)?,
+                        Some(crate::tests_support::TEST_USER_ID),
+                        "actor is the acting user"
+                    );
                     Ok((
                         r.get(0)?,
                         r.get(1)?,

@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::StoreError;
+use crate::auth::Principal;
 
 /// Why a request was refused. Nothing was changed.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -232,21 +233,24 @@ fn clean_color(color: &str) -> Result<String, StoreError> {
     }
 }
 
+/// Appends a project event on behalf of `actor`. The actor is required so a
+/// writer cannot forget it; only setup, which has no principal yet, uses
+/// [`emit_as`] with `None`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn emit(
     conn: &Connection,
     now: i64,
+    actor: &Principal,
     project_id: i64,
     entity_kind: &str,
     entity_id: i64,
     kind: &str,
     payload: &Value,
 ) -> Result<(), StoreError> {
-    // The actor stays NULL for project and issue events until the HTTP layer
-    // passes the principal down to these functions (a follow-up to TRK-2).
     emit_as(
         conn,
         now,
-        None,
+        Some(actor.user_id),
         Some(project_id),
         entity_kind,
         entity_id,
@@ -304,6 +308,7 @@ pub fn list_projects(conn: &Connection) -> Result<Vec<Project>, StoreError> {
 pub fn create_project(
     tx: &Transaction<'_>,
     now: i64,
+    actor: &Principal,
     key: &str,
     name: &str,
     columns: Option<&[NewColumn]>,
@@ -339,6 +344,7 @@ pub fn create_project(
     emit(
         tx,
         now,
+        actor,
         project.id,
         "project",
         project.id,
@@ -353,6 +359,7 @@ pub fn create_project(
 pub fn rename_project(
     tx: &Transaction<'_>,
     now: i64,
+    actor: &Principal,
     key: &str,
     name: &str,
 ) -> Result<Project, StoreError> {
@@ -366,6 +373,7 @@ pub fn rename_project(
         emit(
             tx,
             now,
+            actor,
             project.id,
             "project",
             project.id,
@@ -416,6 +424,7 @@ fn get_column(conn: &Connection, project_id: i64, id: i64) -> Result<Column, Sto
 pub fn create_column(
     tx: &Transaction<'_>,
     now: i64,
+    actor: &Principal,
     project: &str,
     name: &str,
     state_type: StateType,
@@ -440,6 +449,7 @@ pub fn create_column(
     emit(
         tx,
         now,
+        actor,
         project.id,
         "column",
         column.id,
@@ -452,6 +462,7 @@ pub fn create_column(
 pub fn rename_column(
     tx: &Transaction<'_>,
     now: i64,
+    actor: &Principal,
     project: &str,
     id: i64,
     name: &str,
@@ -472,6 +483,7 @@ pub fn rename_column(
         emit(
             tx,
             now,
+            actor,
             project.id,
             "column",
             id,
@@ -487,6 +499,7 @@ pub fn rename_column(
 pub fn reorder_columns(
     tx: &Transaction<'_>,
     now: i64,
+    actor: &Principal,
     project: &str,
     ids: &[i64],
 ) -> Result<Vec<Column>, StoreError> {
@@ -513,6 +526,7 @@ pub fn reorder_columns(
     emit(
         tx,
         now,
+        actor,
         project.id,
         "project",
         project.id,
@@ -526,6 +540,7 @@ pub fn reorder_columns(
 pub fn delete_column(
     tx: &Transaction<'_>,
     now: i64,
+    actor: &Principal,
     project: &str,
     id: i64,
 ) -> Result<(), StoreError> {
@@ -547,6 +562,7 @@ pub fn delete_column(
     emit(
         tx,
         now,
+        actor,
         project.id,
         "column",
         id,
@@ -578,6 +594,7 @@ fn get_issue_type(conn: &Connection, project_id: i64, id: i64) -> Result<IssueTy
 pub fn create_issue_type(
     tx: &Transaction<'_>,
     now: i64,
+    actor: &Principal,
     project: &str,
     name: &str,
 ) -> Result<IssueType, StoreError> {
@@ -596,6 +613,7 @@ pub fn create_issue_type(
     emit(
         tx,
         now,
+        actor,
         project.id,
         "issue_type",
         issue_type.id,
@@ -608,6 +626,7 @@ pub fn create_issue_type(
 pub fn rename_issue_type(
     tx: &Transaction<'_>,
     now: i64,
+    actor: &Principal,
     project: &str,
     id: i64,
     name: &str,
@@ -628,6 +647,7 @@ pub fn rename_issue_type(
         emit(
             tx,
             now,
+            actor,
             project.id,
             "issue_type",
             id,
@@ -643,6 +663,7 @@ pub fn rename_issue_type(
 pub fn delete_issue_type(
     tx: &Transaction<'_>,
     now: i64,
+    actor: &Principal,
     project: &str,
     id: i64,
 ) -> Result<(), StoreError> {
@@ -668,6 +689,7 @@ pub fn delete_issue_type(
     emit(
         tx,
         now,
+        actor,
         project.id,
         "issue_type",
         id,
@@ -700,6 +722,7 @@ fn get_label(conn: &Connection, project_id: i64, id: i64) -> Result<Label, Store
 pub fn create_label(
     tx: &Transaction<'_>,
     now: i64,
+    actor: &Principal,
     project: &str,
     name: &str,
     color: &str,
@@ -720,6 +743,7 @@ pub fn create_label(
     emit(
         tx,
         now,
+        actor,
         project.id,
         "label",
         label.id,
@@ -732,6 +756,7 @@ pub fn create_label(
 pub fn rename_label(
     tx: &Transaction<'_>,
     now: i64,
+    actor: &Principal,
     project: &str,
     id: i64,
     name: &str,
@@ -752,6 +777,7 @@ pub fn rename_label(
         emit(
             tx,
             now,
+            actor,
             project.id,
             "label",
             id,
@@ -766,6 +792,7 @@ pub fn rename_label(
 pub fn recolor_label(
     tx: &Transaction<'_>,
     now: i64,
+    actor: &Principal,
     project: &str,
     id: i64,
     color: &str,
@@ -781,6 +808,7 @@ pub fn recolor_label(
         emit(
             tx,
             now,
+            actor,
             project.id,
             "label",
             id,
@@ -796,6 +824,7 @@ pub fn recolor_label(
 pub fn delete_label(
     tx: &Transaction<'_>,
     now: i64,
+    actor: &Principal,
     project: &str,
     id: i64,
 ) -> Result<(), StoreError> {
@@ -810,6 +839,7 @@ pub fn delete_label(
     emit(
         tx,
         now,
+        actor,
         project.id,
         "label",
         id,
@@ -822,6 +852,12 @@ pub fn delete_label(
 mod tests {
     use super::*;
     use crate::Store;
+    // Explicit imports win over the glob above: the same functions without the actor.
+    use crate::tests_support::projects::{
+        create_column, create_issue_type, create_label, create_project, delete_column,
+        delete_issue_type, delete_label, recolor_label, rename_column, rename_issue_type,
+        rename_label, rename_project, reorder_columns,
+    };
 
     fn temp_store() -> (tempfile::TempDir, Store) {
         let dir = tempfile::tempdir().unwrap();
@@ -846,7 +882,11 @@ mod tests {
                 )?;
                 let rows = stmt.query_map([], |r| {
                     let payload: String = r.get(4)?;
-                    assert_eq!(r.get::<_, Option<i64>>(5)?, None, "actor is NULL for now");
+                    assert_eq!(
+                        r.get::<_, Option<i64>>(5)?,
+                        Some(crate::tests_support::TEST_USER_ID),
+                        "actor is the acting user"
+                    );
                     Ok((
                         r.get(0)?,
                         r.get(1)?,

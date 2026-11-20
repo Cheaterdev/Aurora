@@ -19,6 +19,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value, json};
 
 use crate::StoreError;
+use crate::auth::Principal;
 use crate::projects::{Project, StateType, conflict, emit, get_project, invalid, not_found};
 
 pub const MAX_TITLE_CHARS: usize = 300;
@@ -556,6 +557,7 @@ pub fn list_issues(
 pub fn create_issue(
     tx: &Transaction<'_>,
     now: i64,
+    actor: &Principal,
     project_key: &str,
     new: NewIssue,
 ) -> Result<IssueDetail, StoreError> {
@@ -634,6 +636,7 @@ pub fn create_issue(
     emit(
         tx,
         now,
+        actor,
         project.id,
         "issue",
         id,
@@ -682,6 +685,7 @@ fn changed(changes: &mut Map<String, Value>, field: &str, from: Value, to: Value
 pub fn update_issue(
     tx: &Transaction<'_>,
     now: i64,
+    actor: &Principal,
     project_key: &str,
     number: i64,
     patch: IssuePatch,
@@ -796,6 +800,7 @@ pub fn update_issue(
     emit(
         tx,
         now,
+        actor,
         project.id,
         "issue",
         current.id,
@@ -889,6 +894,7 @@ fn position_for(
 pub fn move_issue(
     tx: &Transaction<'_>,
     now: i64,
+    actor: &Principal,
     project_key: &str,
     number: i64,
     target: MoveTarget,
@@ -949,6 +955,7 @@ pub fn move_issue(
     emit(
         tx,
         now,
+        actor,
         project.id,
         "issue",
         current.id,
@@ -965,6 +972,7 @@ pub fn move_issue(
 fn set_archived(
     tx: &Transaction<'_>,
     now: i64,
+    actor: &Principal,
     project_key: &str,
     number: i64,
     archived: bool,
@@ -986,6 +994,7 @@ fn set_archived(
     emit(
         tx,
         now,
+        actor,
         project.id,
         "issue",
         current.id,
@@ -999,17 +1008,19 @@ fn set_archived(
 pub fn archive_issue(
     tx: &Transaction<'_>,
     now: i64,
+    actor: &Principal,
     project_key: &str,
     number: i64,
 ) -> Result<IssueDetail, StoreError> {
-    set_archived(tx, now, project_key, number, true)
+    set_archived(tx, now, actor, project_key, number, true)
 }
 
 pub fn unarchive_issue(
     tx: &Transaction<'_>,
     now: i64,
+    actor: &Principal,
     project_key: &str,
     number: i64,
 ) -> Result<IssueDetail, StoreError> {
-    set_archived(tx, now, project_key, number, false)
+    set_archived(tx, now, actor, project_key, number, false)
 }

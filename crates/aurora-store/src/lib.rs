@@ -421,6 +421,220 @@ fn apply_pragmas(conn: &Connection, writable: bool) -> Result<(), StoreError> {
 
 #[cfg(test)]
 mod tests_support {
+    use rusqlite::Transaction;
+
+    use crate::auth::{Principal, Role, Scope};
+
+    /// The user the plain `projects` and `issues` wrappers below act as. Tests
+    /// that care who acted call the real functions with their own principal.
+    pub(crate) const TEST_USER_ID: i64 = 4242;
+
+    /// The wrappers' principal; the user row is created on first use because
+    /// `event.actor_id` is a foreign key.
+    pub(crate) fn test_actor(tx: &Transaction<'_>) -> Principal {
+        let inserted = tx.execute(
+            "INSERT OR IGNORE INTO user (id, name, kind) VALUES (?1, 'test actor', 'human')",
+            [TEST_USER_ID],
+        );
+        assert!(inserted.is_ok(), "the test actor must be insertable");
+        Principal {
+            user_id: TEST_USER_ID,
+            role: Role::Owner,
+            scope: Scope::Write,
+        }
+    }
+
+    /// The store's write functions, minus the acting user: for tests that do
+    /// not look at it. Items defined here shadow the re-exported originals.
+    pub(crate) mod projects {
+        pub(crate) use crate::projects::*;
+
+        use rusqlite::Transaction;
+
+        use super::test_actor;
+        use crate::StoreError;
+
+        pub(crate) fn create_project(
+            tx: &Transaction<'_>,
+            now: i64,
+            key: &str,
+            name: &str,
+            columns: Option<&[NewColumn]>,
+        ) -> Result<ProjectDetail, StoreError> {
+            crate::projects::create_project(tx, now, &test_actor(tx), key, name, columns)
+        }
+
+        pub(crate) fn rename_project(
+            tx: &Transaction<'_>,
+            now: i64,
+            key: &str,
+            name: &str,
+        ) -> Result<Project, StoreError> {
+            crate::projects::rename_project(tx, now, &test_actor(tx), key, name)
+        }
+
+        pub(crate) fn create_column(
+            tx: &Transaction<'_>,
+            now: i64,
+            project: &str,
+            name: &str,
+            state_type: StateType,
+        ) -> Result<Column, StoreError> {
+            crate::projects::create_column(tx, now, &test_actor(tx), project, name, state_type)
+        }
+
+        pub(crate) fn rename_column(
+            tx: &Transaction<'_>,
+            now: i64,
+            project: &str,
+            id: i64,
+            name: &str,
+        ) -> Result<Column, StoreError> {
+            crate::projects::rename_column(tx, now, &test_actor(tx), project, id, name)
+        }
+
+        pub(crate) fn reorder_columns(
+            tx: &Transaction<'_>,
+            now: i64,
+            project: &str,
+            ids: &[i64],
+        ) -> Result<Vec<Column>, StoreError> {
+            crate::projects::reorder_columns(tx, now, &test_actor(tx), project, ids)
+        }
+
+        pub(crate) fn delete_column(
+            tx: &Transaction<'_>,
+            now: i64,
+            project: &str,
+            id: i64,
+        ) -> Result<(), StoreError> {
+            crate::projects::delete_column(tx, now, &test_actor(tx), project, id)
+        }
+
+        pub(crate) fn create_issue_type(
+            tx: &Transaction<'_>,
+            now: i64,
+            project: &str,
+            name: &str,
+        ) -> Result<IssueType, StoreError> {
+            crate::projects::create_issue_type(tx, now, &test_actor(tx), project, name)
+        }
+
+        pub(crate) fn rename_issue_type(
+            tx: &Transaction<'_>,
+            now: i64,
+            project: &str,
+            id: i64,
+            name: &str,
+        ) -> Result<IssueType, StoreError> {
+            crate::projects::rename_issue_type(tx, now, &test_actor(tx), project, id, name)
+        }
+
+        pub(crate) fn delete_issue_type(
+            tx: &Transaction<'_>,
+            now: i64,
+            project: &str,
+            id: i64,
+        ) -> Result<(), StoreError> {
+            crate::projects::delete_issue_type(tx, now, &test_actor(tx), project, id)
+        }
+
+        pub(crate) fn create_label(
+            tx: &Transaction<'_>,
+            now: i64,
+            project: &str,
+            name: &str,
+            color: &str,
+        ) -> Result<Label, StoreError> {
+            crate::projects::create_label(tx, now, &test_actor(tx), project, name, color)
+        }
+
+        pub(crate) fn rename_label(
+            tx: &Transaction<'_>,
+            now: i64,
+            project: &str,
+            id: i64,
+            name: &str,
+        ) -> Result<Label, StoreError> {
+            crate::projects::rename_label(tx, now, &test_actor(tx), project, id, name)
+        }
+
+        pub(crate) fn recolor_label(
+            tx: &Transaction<'_>,
+            now: i64,
+            project: &str,
+            id: i64,
+            color: &str,
+        ) -> Result<Label, StoreError> {
+            crate::projects::recolor_label(tx, now, &test_actor(tx), project, id, color)
+        }
+
+        pub(crate) fn delete_label(
+            tx: &Transaction<'_>,
+            now: i64,
+            project: &str,
+            id: i64,
+        ) -> Result<(), StoreError> {
+            crate::projects::delete_label(tx, now, &test_actor(tx), project, id)
+        }
+    }
+
+    pub(crate) mod issues {
+        pub(crate) use crate::issues::*;
+
+        use rusqlite::Transaction;
+
+        use super::test_actor;
+        use crate::StoreError;
+
+        pub(crate) fn create_issue(
+            tx: &Transaction<'_>,
+            now: i64,
+            project_key: &str,
+            new: NewIssue,
+        ) -> Result<IssueDetail, StoreError> {
+            crate::issues::create_issue(tx, now, &test_actor(tx), project_key, new)
+        }
+
+        pub(crate) fn update_issue(
+            tx: &Transaction<'_>,
+            now: i64,
+            project_key: &str,
+            number: i64,
+            patch: IssuePatch,
+        ) -> Result<IssueDetail, StoreError> {
+            crate::issues::update_issue(tx, now, &test_actor(tx), project_key, number, patch)
+        }
+
+        pub(crate) fn move_issue(
+            tx: &Transaction<'_>,
+            now: i64,
+            project_key: &str,
+            number: i64,
+            target: MoveTarget,
+        ) -> Result<IssueDetail, StoreError> {
+            crate::issues::move_issue(tx, now, &test_actor(tx), project_key, number, target)
+        }
+
+        pub(crate) fn archive_issue(
+            tx: &Transaction<'_>,
+            now: i64,
+            project_key: &str,
+            number: i64,
+        ) -> Result<IssueDetail, StoreError> {
+            crate::issues::archive_issue(tx, now, &test_actor(tx), project_key, number)
+        }
+
+        pub(crate) fn unarchive_issue(
+            tx: &Transaction<'_>,
+            now: i64,
+            project_key: &str,
+            number: i64,
+        ) -> Result<IssueDetail, StoreError> {
+            crate::issues::unarchive_issue(tx, now, &test_actor(tx), project_key, number)
+        }
+    }
+
     /// Kills the process, simulating power loss, when a test child asks for it.
     /// Called inside the migration transaction after its SQL ran and before
     /// the version row is recorded or anything is committed.
@@ -440,6 +654,8 @@ mod tests_0003;
 mod tests_0004;
 #[cfg(test)]
 mod tests_0005;
+#[cfg(test)]
+mod tests_actor;
 #[cfg(test)]
 mod tests_auth;
 #[cfg(test)]

@@ -102,7 +102,8 @@ async fn events_and_consumers_over_http() {
     assert_eq!(first["project"], "TRK");
     assert_eq!(first["payload"]["key"], "TRK");
     assert!(first["created"].is_i64());
-    assert!(first["actor"].is_null());
+    // common::owner_key creates the owner as user 1.
+    assert_eq!(first["actor"], 1);
     let (_, body) = api.call("GET", "/events?after=2&limit=1", None).await;
     assert_eq!(event_ids(&body), [3]);
     let (_, body) = api.call("GET", "/events?project=OTH", None).await;
