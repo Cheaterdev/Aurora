@@ -85,6 +85,26 @@ bounded: descriptions are cut to 300 characters and comments to 2000
 `get_document` return full text), and every list has a default page size and a
 `next_offset` while more remain.
 
+## Request ids (safe retries)
+
+Every tool that changes data (the ones that are not `readOnlyHint`) accepts an
+optional string argument `request_id`: 8 to 128 characters of `A-Z a-z 0-9 . _ : -`.
+Call it again with the same `request_id` and the same arguments, for example
+after a timeout, and the first result comes back instead of the change being
+made twice. The repeated result has `_meta.idempotent_replay: true`; nothing is
+changed and no event is written.
+
+* The same `request_id` with other arguments (or for another tool) is an error
+  result `invalid: request id was already used for a different request`. A
+  malformed id is an error result too, and a read tool does not accept one.
+* Only successful calls are remembered. A call that returned an error result
+  changed nothing and can be repeated after the cause is fixed.
+* An id belongs to the key's user and is shared with the REST API's
+  `Idempotency-Key`; it is remembered for 7 days, and the id and the result are
+  stored in the same transaction as the change, so a crash cannot apply a
+  call twice. See "Idempotency" in [api.md](api.md) for the rules, the
+  retention and the size limit (a result over 256 KiB is replayed as a note).
+
 ## Addressing
 
 An issue is named by `issue: "TRK-12"` or by `project: "TRK"` plus `number: 12`.
@@ -131,8 +151,8 @@ No arguments. `{"projects": [{id, key, name, created}]}`.
 `project`, `title`; optional `description`, `type_id` or `type` (needed unless
 the project has one type), `column_id` / `column` / `state_type` (default first
 backlog column), `assignee_id` or `assignee` (user name), `parent`, `initiative`
-(id), `priority` (`urgent`, `high`, `medium`, `low`), `labels` (ids or names).
-Returns the issue detail.
+(id), `priority` (`urgent`, `high`, `medium`, `low`), `labels` (ids or names),
+`request_id`. Returns the issue detail.
 
 ```json
 {"name": "create_issue", "arguments": {"project": "TRK", "title": "Fix login", "priority": "high", "labels": ["bug"]}}
@@ -144,7 +164,7 @@ Returns the issue detail.
 `type_id` / `type`, `assignee_id` / `assignee`, `parent`, `initiative`,
 `priority`, `labels` (replaces the set). Only what is passed changes; `null`
 clears `description`, `assignee_id`, `assignee`, `parent`, `initiative` and
-`priority`. The column is changed with `move_issue`.
+`priority`. The column is changed with `move_issue`. Optional `request_id`.
 
 ```json
 {"name": "update_issue", "arguments": {"issue": "TRK-12", "priority": null, "assignee": "alice"}}
@@ -154,7 +174,7 @@ clears `description`, `assignee_id`, `assignee`, `parent`, `initiative` and
 
 `issue` or `project` + `number`; one of `column_id`, `column`, `state_type`;
 optionally one of `before` / `after` (issue numbers in the target column).
-Without them the issue goes to the end of the column.
+Without them the issue goes to the end of the column. Optional `request_id`.
 
 ```json
 {"name": "move_issue", "arguments": {"issue": "TRK-12", "state_type": "completed"}}
@@ -162,16 +182,19 @@ Without them the issue goes to the end of the column.
 
 ### `archive_issue`
 
-`issue` or `project` + `number`. Soft delete; the issue keeps its number.
+`issue` or `project` + `number`; optional `request_id`. Soft delete; the issue
+keeps its number.
 
 ### `unarchive_issue`
 
-`issue` or `project` + `number`. Restores an archived issue.
+`issue` or `project` + `number`; optional `request_id`. Restores an archived
+issue.
 
 ### `add_comment`
 
 `issue` or `project` + `number`, `body` (plain text, 1 to 20000 characters),
-optional `parent` (id of a top-level comment, to reply). `@name` mentions a user
+optional `parent` (id of a top-level comment, to reply) and `request_id`.
+`@name` mentions a user
 and emits `mention.created`, which an agent user's runner is woken by.
 
 ```json
@@ -185,18 +208,19 @@ top-level comments; replies come with their comment. Oldest first.
 
 ### `edit_comment`
 
-`comment_id`, `body`, and `project` or `issue` to name the project. Author or
-owner only.
+`comment_id`, `body`, and `project` or `issue` to name the project; optional
+`request_id`. Author or owner only.
 
 ### `delete_comment`
 
-`comment_id` and `project` or `issue`. Author or owner only; replies stay.
+`comment_id` and `project` or `issue`; optional `request_id`. Author or owner
+only; replies stay.
 
 ### `link_issues`
 
 `issue` or `project` + `number`, `to` (number or `"KEY-n"`), `kind`:
 `blocks` (this blocks `to`), `blocked_by` (`to` blocks this) or `relates`.
-A duplicate link or a blocking cycle is an error result.
+Optional `request_id`. A duplicate link or a blocking cycle is an error result.
 
 ```json
 {"name": "link_issues", "arguments": {"issue": "TRK-12", "to": "TRK-13", "kind": "blocks"}}
@@ -204,7 +228,7 @@ A duplicate link or a blocking cycle is an error result.
 
 ### `unlink_issues`
 
-`link_id` (from `get_issue`) and `project` or `issue`.
+`link_id` (from `get_issue`) and `project` or `issue`; optional `request_id`.
 
 ### `search`
 
@@ -225,13 +249,14 @@ order, each with `depth`, no bodies.
 
 ### `create_document`
 
-`project`, `title`; optional `body` (Markdown), `parent` (document id).
+`project`, `title`; optional `body` (Markdown), `parent` (document id),
+`request_id`.
 
 ### `update_document`
 
 `project`, `id`, at least one of `title`, `body`, `parent` (`null`: top level);
 pass `base_revision` (from `get_document`) to get a `conflict` error instead of
-overwriting a newer edit.
+overwriting a newer edit. Optional `request_id`.
 
 ```json
 {"name": "update_document", "arguments": {"project": "TRK", "id": 3, "body": "# New", "base_revision": 2}}

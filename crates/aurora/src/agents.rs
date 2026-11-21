@@ -5,12 +5,14 @@ use aurora_store::agents::{self, Agent, AgentPatch, NewAgent};
 use aurora_store::auth::{self, Principal, Scope};
 use aurora_store::{Rejection, Store, StoreError, now_millis};
 use axum::extract::{Path, State};
+use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
 use serde_json::{Map, Value, json};
 
 use crate::auth::{Access, no_store};
-use crate::routes::{ApiError, ApiJson, ApiResult, created, no_content};
+use crate::idem;
+use crate::routes::{ApiError, ApiJson, ApiResult};
 
 /// Name of the key `create_key: true` issues.
 const AGENT_KEY_NAME: &str = "agent key";
@@ -61,33 +63,31 @@ pub(crate) async fn create_agent(
     let new: NewAgent = serde_json::from_value(Value::Object(body))
         .map_err(|err| invalid(format!("invalid agent: {err}")))?;
     if !with_key {
-        let agent = store
-            .write(move |tx| agents::create_agent(tx, now_millis(), &principal, new))
-            .await?;
-        return Ok(created(agent));
+        return idem::json(&store, StatusCode::CREATED, move |tx| {
+            agents::create_agent(tx, now_millis(), &principal, new)
+        })
+        .await;
     }
     // One transaction: a failure to issue the key must not leave a keyless agent.
-    let (agent, key) = store
-        .write(move |tx| {
-            let now = now_millis();
-            let agent = agents::create_agent(tx, now, &principal, new)?;
-            let key = auth::create_key(
-                tx,
-                now,
-                &principal,
-                agent.user_id,
-                AGENT_KEY_NAME,
-                Scope::Write,
-            )?;
-            Ok((agent, key))
-        })
-        .await?;
-    let info = key.info.clone();
-    Ok(no_store(created(json!({
-        "agent": agent,
-        "key": key.key,
-        "key_info": info,
-    }))))
+    idem::secret(&store, StatusCode::CREATED, move |tx| {
+        let now = now_millis();
+        let agent = agents::create_agent(tx, now, &principal, new)?;
+        let key = auth::create_key(
+            tx,
+            now,
+            &principal,
+            agent.user_id,
+            AGENT_KEY_NAME,
+            Scope::Write,
+        )?;
+        Ok(json!({
+            "agent": agent,
+            "key": key.key,
+            "key_info": key.info,
+        }))
+    })
+    .await
+    .map(no_store)
 }
 
 pub(crate) async fn update_agent(
@@ -96,10 +96,10 @@ pub(crate) async fn update_agent(
     Path(id): Path<i64>,
     ApiJson(patch): ApiJson<AgentPatch>,
 ) -> ApiResult<Response> {
-    let agent = store
-        .write(move |tx| agents::update_agent(tx, now_millis(), &principal, id, patch))
-        .await?;
-    Ok(Json(agent).into_response())
+    idem::json(&store, StatusCode::OK, move |tx| {
+        agents::update_agent(tx, now_millis(), &principal, id, patch)
+    })
+    .await
 }
 
 pub(crate) async fn delete_agent(
@@ -107,10 +107,10 @@ pub(crate) async fn delete_agent(
     Extension(principal): Extension<Principal>,
     Path(id): Path<i64>,
 ) -> ApiResult<Response> {
-    store
-        .write(move |tx| agents::delete_agent(tx, now_millis(), &principal, id))
-        .await?;
-    Ok(no_content())
+    idem::empty(&store, move |tx| {
+        agents::delete_agent(tx, now_millis(), &principal, id)
+    })
+    .await
 }
 
 pub(crate) async fn enable_agent(
@@ -135,10 +135,10 @@ async fn set_enabled(
     id: i64,
     enabled: bool,
 ) -> ApiResult<Response> {
-    let agent = store
-        .write(move |tx| agents::set_enabled(tx, now_millis(), &principal, id, enabled))
-        .await?;
-    Ok(Json(agent).into_response())
+    idem::json(&store, StatusCode::OK, move |tx| {
+        agents::set_enabled(tx, now_millis(), &principal, id, enabled)
+    })
+    .await
 }
 
 fn invalid(reason: String) -> ApiError {

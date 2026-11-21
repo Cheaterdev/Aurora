@@ -1,5 +1,6 @@
 use std::net::IpAddr;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 
@@ -25,6 +26,9 @@ pub struct Config {
     pub port: u16,
     pub backup_dir: Option<PathBuf>,
     pub allow_unsafe_location: bool,
+    /// How long request ids are remembered; `None` means 7 days. Not in the
+    /// usage text: `--request-retention-days <n>` / `AURORA_REQUEST_RETENTION_DAYS`.
+    pub request_retention: Option<Duration>,
 }
 
 impl Default for Config {
@@ -35,6 +39,7 @@ impl Default for Config {
             port: 8787,
             backup_dir: None,
             allow_unsafe_location: false,
+            request_retention: None,
         }
     }
 }
@@ -67,6 +72,10 @@ impl Config {
         if let Some(v) = env("AURORA_ALLOW_UNSAFE_LOCATION") {
             config.allow_unsafe_location = matches!(v.as_str(), "1" | "true");
         }
+        if let Some(v) = env("AURORA_REQUEST_RETENTION_DAYS") {
+            config.request_retention =
+                Some(parse_days(&v).context("AURORA_REQUEST_RETENTION_DAYS")?);
+        }
 
         let mut args = args.into_iter();
         while let Some(arg) = args.next() {
@@ -81,7 +90,10 @@ impl Config {
                 config.allow_unsafe_location = true;
                 continue;
             }
-            if !matches!(flag.as_str(), "--db" | "--host" | "--port" | "--backup-dir") {
+            if !matches!(
+                flag.as_str(),
+                "--db" | "--host" | "--port" | "--backup-dir" | "--request-retention-days"
+            ) {
                 bail!("unknown argument {flag:?}\n\n{USAGE}");
             }
             let Some(value) = inline.or_else(|| args.next()) else {
@@ -91,6 +103,10 @@ impl Config {
                 "--db" => config.db_path = PathBuf::from(value),
                 "--host" => config.host = parse_host(&value).context("--host")?,
                 "--backup-dir" => config.backup_dir = Some(PathBuf::from(value)),
+                "--request-retention-days" => {
+                    config.request_retention =
+                        Some(parse_days(&value).context("--request-retention-days")?);
+                }
                 _ => config.port = parse_port(&value).context("--port")?,
             }
         }
@@ -101,6 +117,15 @@ impl Config {
 fn parse_host(v: &str) -> Result<IpAddr> {
     v.parse()
         .with_context(|| format!("{v:?} is not an IP address"))
+}
+
+fn parse_days(v: &str) -> Result<Duration> {
+    let days: u64 = v
+        .parse()
+        .ok()
+        .filter(|days| (1..=3650).contains(days))
+        .with_context(|| format!("{v:?} is not a number of days from 1 to 3650"))?;
+    Ok(Duration::from_secs(days * 24 * 60 * 60))
 }
 
 fn parse_port(v: &str) -> Result<u16> {
@@ -154,6 +179,18 @@ mod tests {
         .unwrap();
         assert_eq!(c.backup_dir, Some(PathBuf::from("e")));
         assert!(c.allow_unsafe_location);
+    }
+
+    #[test]
+    fn request_retention_is_set_in_days() {
+        let week = Duration::from_secs(7 * 24 * 60 * 60);
+        assert_eq!(run(&[], &[]).unwrap().request_retention, None);
+        let c = run(&["--request-retention-days", "7"], &[]).unwrap();
+        assert_eq!(c.request_retention, Some(week));
+        let c = run(&[], &[("AURORA_REQUEST_RETENTION_DAYS", "1")]).unwrap();
+        assert_eq!(c.request_retention, Some(Duration::from_secs(86_400)));
+        assert!(run(&["--request-retention-days", "0"], &[]).is_err());
+        assert!(run(&[], &[("AURORA_REQUEST_RETENTION_DAYS", "x")]).is_err());
     }
 
     #[test]

@@ -20,19 +20,23 @@ use aurora_store::initiatives::{self, InitiativeStatus};
 use aurora_store::issues::{self, IssueFilter, IssuePatch, MoveTarget, NewIssue, ParentFilter};
 use aurora_store::links::{self, LinkKind};
 use aurora_store::projects::{self, StateType};
-use aurora_store::rusqlite::Connection;
+use aurora_store::request_log::{self, Reply, RequestKey, Run};
+use aurora_store::rusqlite::{Connection, Transaction};
 use aurora_store::search::{self, Kind, SearchQuery, Segment};
 use aurora_store::{Rejection, Store, StoreError, now_millis};
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 
 use crate::auth::Access;
+use crate::idem::failpoint;
 use crate::routes::LinkTarget;
 
 /// What a successful tool returns: a short sentence and the data.
 struct Done {
     summary: String,
     data: Value,
+    /// The answer of an earlier call with the same `request_id`.
+    replayed: bool,
 }
 
 type Outcome = Result<Done, String>;
@@ -202,13 +206,19 @@ fn read_spec(name: &'static str, description: &'static str, schema: Value) -> Sp
     }
 }
 
+const REQUEST_ID_HELP: &str = "Optional request id, 8 to 128 characters of A-Z a-z 0-9 . _ : -. Repeating a call with the same id and the same arguments returns the first result and changes nothing; the same id with other arguments is an error. Use it to retry safely after a timeout.";
+
+/// Every tool that changes data also accepts `request_id`.
 fn write_spec(
     name: &'static str,
     description: &'static str,
-    schema: Value,
+    mut schema: Value,
     destructive: bool,
     idempotent: bool,
 ) -> Spec {
+    if let Some(properties) = schema.get_mut("properties").and_then(Value::as_object_mut) {
+        properties.insert("request_id".into(), string(REQUEST_ID_HELP));
+    }
     Spec {
         name,
         description,
@@ -919,16 +929,21 @@ fn js<T: Serialize>(value: &T) -> Value {
     serde_json::to_value(value).unwrap_or(Value::Null)
 }
 
-fn done(summary: impl Into<String>, data: Value) -> Outcome {
+fn made(summary: impl Into<String>, data: Value) -> Done {
     let data = if data.is_object() {
         data
     } else {
         json!({ "result": data })
     };
-    Ok(Done {
+    Done {
         summary: summary.into(),
         data,
-    })
+        replayed: false,
+    }
+}
+
+fn done(summary: impl Into<String>, data: Value) -> Outcome {
+    Ok(made(summary, data))
 }
 
 fn text_block(text: &str) -> Value {
@@ -937,13 +952,93 @@ fn text_block(text: &str) -> Value {
 
 fn render(outcome: Outcome) -> Value {
     match outcome {
-        Ok(Done { summary, data }) => json!({
-            "content": [text_block(&summary), text_block(&data.to_string())],
-            "structuredContent": data,
-            "isError": false,
-        }),
+        Ok(Done {
+            summary,
+            data,
+            replayed,
+        }) => {
+            let mut result = json!({
+                "content": [text_block(&summary), text_block(&data.to_string())],
+                "structuredContent": data,
+                "isError": false,
+            });
+            if replayed {
+                result["_meta"] = json!({ "idempotent_replay": true });
+            }
+            result
+        }
         Err(message) => error_result(&message),
     }
+}
+
+/// The `request_id` argument of a write tool, with the call's fingerprint:
+/// the tool and every other argument, so the same id with other arguments is
+/// refused. `Ok(None)` when no id was passed.
+fn take_request_key(
+    principal: &Principal,
+    name: &str,
+    arguments: &mut Value,
+) -> Result<Option<RequestKey>, String> {
+    let Some(map) = arguments.as_object_mut() else {
+        return Ok(None);
+    };
+    let id = match map.remove("request_id") {
+        None | Some(Value::Null) => return Ok(None),
+        Some(Value::String(id)) => id,
+        Some(_) => return Err(expected("request_id", "a string")),
+    };
+    let canonical = serde_json::to_vec(&*map).unwrap_or_default();
+    RequestKey::new(
+        principal.user_id,
+        &id,
+        &[b"MCP", name.as_bytes(), &canonical],
+    )
+    .map(Some)
+    .map_err(|rejection| describe(rejection.into()))
+}
+
+/// Runs a changing tool in one transaction. With a request id the id is
+/// checked first and recorded together with the result before the commit, so
+/// a repeated call returns the first result and changes nothing; a failed
+/// call is not recorded.
+async fn write_tool<F>(store: &Store, key: Option<RequestKey>, change: F) -> Outcome
+where
+    F: FnOnce(&Transaction<'_>) -> Result<Done, StoreError> + Send + 'static,
+{
+    let now = now_millis();
+    let retention = store.request_retention();
+    let run = store
+        .write(move |tx| {
+            let run = request_log::run(tx, key.as_ref(), now, retention, || {
+                let done = change(tx)?;
+                let body = json!({ "summary": done.summary, "data": done.data });
+                Ok(Reply::new(200, body.to_string()))
+            })?;
+            failpoint("before_commit");
+            Ok(run)
+        })
+        .await
+        .map_err(describe)?;
+    failpoint("after_commit_before_response");
+    let (body, replayed) = match run {
+        Run::Fresh(reply) => (Some(reply.body), false),
+        Run::Replayed(replayed) => (replayed.body, true),
+    };
+    let Some(body) = body else {
+        return Ok(Done {
+            summary: "This call was already applied; the original result is too large to replay"
+                .into(),
+            data: json!({ "replayed": true, "note": "original response too large to replay" }),
+            replayed: true,
+        });
+    };
+    let stored: Value =
+        serde_json::from_str(&body).map_err(|_| "internal error; try again".to_string())?;
+    Ok(Done {
+        summary: stored["summary"].as_str().unwrap_or_default().to_string(),
+        data: stored["data"].clone(),
+        replayed,
+    })
 }
 
 fn error_result(message: &str) -> Value {
@@ -1002,7 +1097,7 @@ pub async fn call(
     principal: &Principal,
     access: &Access,
     name: &str,
-    arguments: Value,
+    mut arguments: Value,
 ) -> Option<Value> {
     let spec = specs().iter().find(|s| s.name == name)?;
     if !spec.read_only && !principal.scope.allows_writes() {
@@ -1013,36 +1108,52 @@ pub async fn call(
     if let Err(message) = guard(access, &arguments) {
         return Some(error_result(&message));
     }
+    // Read tools do not list `request_id`, so passing one is an unknown argument.
+    let key = if spec.read_only {
+        None
+    } else {
+        match take_request_key(principal, name, &mut arguments) {
+            Ok(key) => key,
+            Err(message) => return Some(error_result(&message)),
+        }
+    };
     let outcome = match Args::new(arguments) {
-        Ok(args) => run(store, *principal, access, name, args).await,
+        Ok(args) => run(store, *principal, access, name, args, key).await,
         Err(message) => Err(message),
     };
     Some(render(outcome))
 }
 
-async fn run(store: &Store, p: Principal, access: &Access, name: &str, args: Args) -> Outcome {
+async fn run(
+    store: &Store,
+    p: Principal,
+    access: &Access,
+    name: &str,
+    args: Args,
+    key: Option<RequestKey>,
+) -> Outcome {
     match name {
         "list_projects" => list_projects(store, access, args).await,
         "list_agents" => list_agents(store, p, access, args).await,
         "get_project" => get_project(store, args).await,
         "list_issues" => list_issues(store, args).await,
         "get_issue" => get_issue(store, args).await,
-        "create_issue" => create_issue(store, p, args).await,
-        "update_issue" => update_issue(store, p, args).await,
-        "move_issue" => move_issue(store, p, args).await,
-        "archive_issue" => set_archived(store, p, args, true).await,
-        "unarchive_issue" => set_archived(store, p, args, false).await,
-        "add_comment" => add_comment(store, p, args).await,
+        "create_issue" => create_issue(store, p, args, key).await,
+        "update_issue" => update_issue(store, p, args, key).await,
+        "move_issue" => move_issue(store, p, args, key).await,
+        "archive_issue" => set_archived(store, p, args, key, true).await,
+        "unarchive_issue" => set_archived(store, p, args, key, false).await,
+        "add_comment" => add_comment(store, p, args, key).await,
         "list_comments" => list_comments(store, args).await,
-        "edit_comment" => edit_comment(store, p, args).await,
-        "delete_comment" => delete_comment(store, p, args).await,
-        "link_issues" => link_issues(store, p, args).await,
-        "unlink_issues" => unlink_issues(store, p, args).await,
+        "edit_comment" => edit_comment(store, p, args, key).await,
+        "delete_comment" => delete_comment(store, p, args, key).await,
+        "link_issues" => link_issues(store, p, args, key).await,
+        "unlink_issues" => unlink_issues(store, p, args, key).await,
         "search" => search_tool(store, access, args).await,
         "list_documents" => list_documents(store, args).await,
         "get_document" => get_document(store, args).await,
-        "create_document" => create_document(store, p, args).await,
-        "update_document" => update_document(store, p, args).await,
+        "create_document" => create_document(store, p, args, key).await,
+        "update_document" => update_document(store, p, args, key).await,
         "list_initiatives" => list_initiatives(store, args).await,
         "get_current_user" => get_current_user(store, p, args).await,
         _ => Err(format!("tool {name} is not implemented")),
@@ -1317,8 +1428,8 @@ async fn get_issue(store: &Store, mut args: Args) -> Outcome {
     done(summary, data)
 }
 
-fn issue_done(verb: &str, detail: &issues::IssueDetail) -> Outcome {
-    done(
+fn issue_made(verb: &str, detail: &issues::IssueDetail) -> Done {
+    made(
         format!(
             "{verb} {} {:?}",
             detail.issue.identifier, detail.issue.title
@@ -1333,7 +1444,12 @@ fn parse_priority(key: &str, value: Value) -> Result<aurora_store::issues::Prior
         .ok_or_else(|| format!("unknown priority {text}; use urgent, high, medium or low"))
 }
 
-async fn create_issue(store: &Store, p: Principal, mut args: Args) -> Outcome {
+async fn create_issue(
+    store: &Store,
+    p: Principal,
+    mut args: Args,
+    request: Option<RequestKey>,
+) -> Outcome {
     let key = args.req_str("project")?;
     let title = args.req_str("title")?;
     let description = args.opt_str("description")?;
@@ -1353,42 +1469,45 @@ async fn create_issue(store: &Store, p: Principal, mut args: Args) -> Outcome {
     if assignee_id.is_some() && assignee.is_some() {
         return Err("give only one of assignee_id and assignee".into());
     }
-    let detail = store
-        .write(move |tx| {
-            let type_id = match type_name {
-                Some(name) => Some(resolve_type(tx, &key, &name)?),
-                None => type_id,
-            };
-            let column_id = column
-                .map(|sel| resolve_column(tx, &key, sel))
-                .transpose()?;
-            let assignee_id = match assignee {
-                Some(name) => Some(resolve_user(tx, &name)?),
-                None => assignee_id,
-            };
-            let labels = labels
-                .map(|l| resolve_labels(tx, &key, l))
-                .transpose()?
-                .unwrap_or_default();
-            let new = NewIssue {
-                title,
-                description,
-                type_id,
-                column_id,
-                assignee_id,
-                parent,
-                initiative,
-                priority,
-                labels,
-            };
-            issues::create_issue(tx, now_millis(), &p, &key, new)
-        })
-        .await
-        .map_err(describe)?;
-    issue_done("Created", &detail)
+    write_tool(store, request, move |tx| {
+        let type_id = match type_name {
+            Some(name) => Some(resolve_type(tx, &key, &name)?),
+            None => type_id,
+        };
+        let column_id = column
+            .map(|sel| resolve_column(tx, &key, sel))
+            .transpose()?;
+        let assignee_id = match assignee {
+            Some(name) => Some(resolve_user(tx, &name)?),
+            None => assignee_id,
+        };
+        let labels = labels
+            .map(|l| resolve_labels(tx, &key, l))
+            .transpose()?
+            .unwrap_or_default();
+        let new = NewIssue {
+            title,
+            description,
+            type_id,
+            column_id,
+            assignee_id,
+            parent,
+            initiative,
+            priority,
+            labels,
+        };
+        let detail = issues::create_issue(tx, now_millis(), &p, &key, new)?;
+        Ok(issue_made("Created", &detail))
+    })
+    .await
 }
 
-async fn update_issue(store: &Store, p: Principal, mut args: Args) -> Outcome {
+async fn update_issue(
+    store: &Store,
+    p: Principal,
+    mut args: Args,
+    request: Option<RequestKey>,
+) -> Outcome {
     let target = take_issue(&mut args)?;
     let (key, number) = (target.key, target.number);
     let title = args.opt_str("title")?;
@@ -1425,36 +1544,39 @@ async fn update_issue(store: &Store, p: Principal, mut args: Args) -> Outcome {
                 .into(),
         );
     }
-    let detail = store
-        .write(move |tx| {
-            let type_id = match type_name {
-                Some(name) => Some(resolve_type(tx, &key, &name)?),
-                None => type_id,
-            };
-            let assignee_id = match assignee {
-                Some(Some(name)) => Some(Some(resolve_user(tx, &name)?)),
-                Some(None) => Some(None),
-                None => assignee_id,
-            };
-            let labels = labels.map(|l| resolve_labels(tx, &key, l)).transpose()?;
-            let patch = IssuePatch {
-                title,
-                description,
-                type_id,
-                assignee_id,
-                parent,
-                initiative,
-                priority,
-                labels,
-            };
-            issues::update_issue(tx, now_millis(), &p, &key, number, patch)
-        })
-        .await
-        .map_err(describe)?;
-    issue_done("Updated", &detail)
+    write_tool(store, request, move |tx| {
+        let type_id = match type_name {
+            Some(name) => Some(resolve_type(tx, &key, &name)?),
+            None => type_id,
+        };
+        let assignee_id = match assignee {
+            Some(Some(name)) => Some(Some(resolve_user(tx, &name)?)),
+            Some(None) => Some(None),
+            None => assignee_id,
+        };
+        let labels = labels.map(|l| resolve_labels(tx, &key, l)).transpose()?;
+        let patch = IssuePatch {
+            title,
+            description,
+            type_id,
+            assignee_id,
+            parent,
+            initiative,
+            priority,
+            labels,
+        };
+        let detail = issues::update_issue(tx, now_millis(), &p, &key, number, patch)?;
+        Ok(issue_made("Updated", &detail))
+    })
+    .await
 }
 
-async fn move_issue(store: &Store, p: Principal, mut args: Args) -> Outcome {
+async fn move_issue(
+    store: &Store,
+    p: Principal,
+    mut args: Args,
+    request: Option<RequestKey>,
+) -> Outcome {
     let target = take_issue(&mut args)?;
     let (key, number) = (target.key, target.number);
     let column =
@@ -1465,74 +1587,82 @@ async fn move_issue(store: &Store, p: Principal, mut args: Args) -> Outcome {
     if before.is_some() && after.is_some() {
         return Err("give only one of before and after".into());
     }
-    let detail = store
-        .write(move |tx| {
-            let column_id = resolve_column(tx, &key, column)?;
-            let target = MoveTarget {
-                column_id,
-                before,
-                after,
-                position: None,
-            };
-            issues::move_issue(tx, now_millis(), &p, &key, number, target)
-        })
-        .await
-        .map_err(describe)?;
-    issue_done("Moved", &detail)
+    write_tool(store, request, move |tx| {
+        let column_id = resolve_column(tx, &key, column)?;
+        let target = MoveTarget {
+            column_id,
+            before,
+            after,
+            position: None,
+        };
+        let detail = issues::move_issue(tx, now_millis(), &p, &key, number, target)?;
+        Ok(issue_made("Moved", &detail))
+    })
+    .await
 }
 
-async fn set_archived(store: &Store, p: Principal, mut args: Args, archive: bool) -> Outcome {
+async fn set_archived(
+    store: &Store,
+    p: Principal,
+    mut args: Args,
+    request: Option<RequestKey>,
+    archive: bool,
+) -> Outcome {
     let target = take_issue(&mut args)?;
     args.finish()?;
     let (key, number) = (target.key, target.number);
-    let detail = store
-        .write(move |tx| {
-            if archive {
-                issues::archive_issue(tx, now_millis(), &p, &key, number)
-            } else {
-                issues::unarchive_issue(tx, now_millis(), &p, &key, number)
-            }
-        })
-        .await
-        .map_err(describe)?;
-    issue_done(if archive { "Archived" } else { "Unarchived" }, &detail)
+    write_tool(store, request, move |tx| {
+        let detail = if archive {
+            issues::archive_issue(tx, now_millis(), &p, &key, number)?
+        } else {
+            issues::unarchive_issue(tx, now_millis(), &p, &key, number)?
+        };
+        Ok(issue_made(
+            if archive { "Archived" } else { "Unarchived" },
+            &detail,
+        ))
+    })
+    .await
 }
 
 // ---- comments ----
 
-async fn add_comment(store: &Store, p: Principal, mut args: Args) -> Outcome {
+async fn add_comment(
+    store: &Store,
+    p: Principal,
+    mut args: Args,
+    request: Option<RequestKey>,
+) -> Outcome {
     let target = take_issue(&mut args)?;
     let body = args.req_str("body")?;
     let parent = args.opt_i64("parent")?;
     args.finish()?;
     let (key, number) = (target.key, target.number);
-    let comment = store
-        .write(move |tx| {
-            comments::add_comment(
-                tx,
-                now_millis(),
-                &p,
-                &key,
-                number,
-                NewComment { body, parent },
-            )
-        })
-        .await
-        .map_err(describe)?;
-    let mentions: Vec<&str> = comment.mentions.iter().map(|m| m.name.as_str()).collect();
-    done(
-        format!(
-            "Added comment {} on {}{}",
-            comment.id,
-            comment.issue.identifier,
-            if mentions.is_empty() {
-                String::new()
-            } else {
-                format!(", mentioning {}", mentions.join(", "))
-            }
-        ),
-        js(&comment),
-    )
+    write_tool(store, request, move |tx| {
+        let comment = comments::add_comment(
+            tx,
+            now_millis(),
+            &p,
+            &key,
+            number,
+            NewComment { body, parent },
+        )?;
+        let mentions: Vec<&str> = comment.mentions.iter().map(|m| m.name.as_str()).collect();
+        Ok(made(
+            format!(
+                "Added comment {} on {}{}",
+                comment.id,
+                comment.issue.identifier,
+                if mentions.is_empty() {
+                    String::new()
+                } else {
+                    format!(", mentioning {}", mentions.join(", "))
+                }
+            ),
+            js(&comment),
+        ))
+    })
+    .await
 }
 
 fn shrink_comment(value: &mut Value) {
@@ -1581,38 +1711,56 @@ async fn list_comments(store: &Store, mut args: Args) -> Outcome {
     )
 }
 
-async fn edit_comment(store: &Store, p: Principal, mut args: Args) -> Outcome {
+async fn edit_comment(
+    store: &Store,
+    p: Principal,
+    mut args: Args,
+    request: Option<RequestKey>,
+) -> Outcome {
     let key = take_project_or_issue(&mut args)?;
     let id = args.req_i64("comment_id")?;
     let body = args.req_str("body")?;
     args.finish()?;
-    let comment = store
-        .write(move |tx| comments::edit_comment(tx, now_millis(), &p, &key, id, &body))
-        .await
-        .map_err(describe)?;
-    done(
-        format!(
-            "Edited comment {} on {}",
-            comment.id, comment.issue.identifier
-        ),
-        js(&comment),
-    )
+    write_tool(store, request, move |tx| {
+        let comment = comments::edit_comment(tx, now_millis(), &p, &key, id, &body)?;
+        Ok(made(
+            format!(
+                "Edited comment {} on {}",
+                comment.id, comment.issue.identifier
+            ),
+            js(&comment),
+        ))
+    })
+    .await
 }
 
-async fn delete_comment(store: &Store, p: Principal, mut args: Args) -> Outcome {
+async fn delete_comment(
+    store: &Store,
+    p: Principal,
+    mut args: Args,
+    request: Option<RequestKey>,
+) -> Outcome {
     let key = take_project_or_issue(&mut args)?;
     let id = args.req_i64("comment_id")?;
     args.finish()?;
-    store
-        .write(move |tx| comments::delete_comment(tx, now_millis(), &p, &key, id))
-        .await
-        .map_err(describe)?;
-    done(format!("Deleted comment {id}"), json!({ "deleted": id }))
+    write_tool(store, request, move |tx| {
+        comments::delete_comment(tx, now_millis(), &p, &key, id)?;
+        Ok(made(
+            format!("Deleted comment {id}"),
+            json!({ "deleted": id }),
+        ))
+    })
+    .await
 }
 
 // ---- links ----
 
-async fn link_issues(store: &Store, p: Principal, mut args: Args) -> Outcome {
+async fn link_issues(
+    store: &Store,
+    p: Principal,
+    mut args: Args,
+    request: Option<RequestKey>,
+) -> Outcome {
     let target = take_issue(&mut args)?;
     let (key, number) = (target.key, target.number);
     let to = args.take("to").ok_or("argument `to` is required")?;
@@ -1629,38 +1777,41 @@ async fn link_issues(store: &Store, p: Principal, mut args: Args) -> Outcome {
             ));
         }
     };
-    let link = store
-        .write(move |tx| {
-            let now = now_millis();
-            if blocked_by {
-                links::add_blocker(tx, now, &p, &key, number, to)
-            } else {
-                links::add_link(tx, now, &p, &key, number, to, kind)
-            }
-        })
-        .await
-        .map_err(describe)?;
-    done(
-        format!(
-            "Linked: {} {} {} (link {})",
-            link.from.identifier,
-            link.kind.as_str(),
-            link.to.identifier,
-            link.id
-        ),
-        json!({ "link": link }),
-    )
+    write_tool(store, request, move |tx| {
+        let now = now_millis();
+        let link = if blocked_by {
+            links::add_blocker(tx, now, &p, &key, number, to)?
+        } else {
+            links::add_link(tx, now, &p, &key, number, to, kind)?
+        };
+        Ok(made(
+            format!(
+                "Linked: {} {} {} (link {})",
+                link.from.identifier,
+                link.kind.as_str(),
+                link.to.identifier,
+                link.id
+            ),
+            json!({ "link": link }),
+        ))
+    })
+    .await
 }
 
-async fn unlink_issues(store: &Store, p: Principal, mut args: Args) -> Outcome {
+async fn unlink_issues(
+    store: &Store,
+    p: Principal,
+    mut args: Args,
+    request: Option<RequestKey>,
+) -> Outcome {
     let key = take_project_or_issue(&mut args)?;
     let id = args.req_i64("link_id")?;
     args.finish()?;
-    store
-        .write(move |tx| links::remove_link(tx, now_millis(), &p, &key, id))
-        .await
-        .map_err(describe)?;
-    done(format!("Removed link {id}"), json!({ "removed": id }))
+    write_tool(store, request, move |tx| {
+        links::remove_link(tx, now_millis(), &p, &key, id)?;
+        Ok(made(format!("Removed link {id}"), json!({ "removed": id })))
+    })
+    .await
 }
 
 // ---- search ----
@@ -1808,38 +1959,46 @@ async fn get_document(store: &Store, mut args: Args) -> Outcome {
     )
 }
 
-async fn create_document(store: &Store, p: Principal, mut args: Args) -> Outcome {
+async fn create_document(
+    store: &Store,
+    p: Principal,
+    mut args: Args,
+    request: Option<RequestKey>,
+) -> Outcome {
     let key = args.req_str("project")?;
     let title = args.req_str("title")?;
     let body = args.opt_str("body")?;
     let parent = args.opt_i64("parent")?;
     args.finish()?;
-    let detail = store
-        .write(move |tx| {
-            documents::create_document(
-                tx,
-                now_millis(),
-                &p,
-                &key,
-                NewDocument {
-                    title,
-                    body,
-                    parent,
-                },
-            )
-        })
-        .await
-        .map_err(describe)?;
-    done(
-        format!(
-            "Created document {} {:?}",
-            detail.document.id, detail.document.title
-        ),
-        js(&detail),
-    )
+    write_tool(store, request, move |tx| {
+        let detail = documents::create_document(
+            tx,
+            now_millis(),
+            &p,
+            &key,
+            NewDocument {
+                title,
+                body,
+                parent,
+            },
+        )?;
+        Ok(made(
+            format!(
+                "Created document {} {:?}",
+                detail.document.id, detail.document.title
+            ),
+            js(&detail),
+        ))
+    })
+    .await
 }
 
-async fn update_document(store: &Store, p: Principal, mut args: Args) -> Outcome {
+async fn update_document(
+    store: &Store,
+    p: Principal,
+    mut args: Args,
+    request: Option<RequestKey>,
+) -> Outcome {
     let key = args.req_str("project")?;
     let id = args.req_i64("id")?;
     let title = args.opt_str("title")?;
@@ -1850,33 +2009,31 @@ async fn update_document(store: &Store, p: Principal, mut args: Args) -> Outcome
     if title.is_none() && body.is_none() && parent.is_none() {
         return Err("nothing to change: pass title, body or parent".into());
     }
-    let detail = store
-        .write(move |tx| {
-            documents::update_document(
-                tx,
-                now_millis(),
-                &p,
-                &key,
-                id,
-                DocumentPatch {
-                    title,
-                    body,
-                    parent,
-                    base_revision,
-                },
-            )
-        })
-        .await
-        .map_err(describe)?;
-    let mut data = js(&detail);
-    shorten(&mut data, "body", DEFAULT_BODY_CHARS);
-    done(
-        format!(
-            "Updated document {} {:?}, now revision {}",
-            detail.document.id, detail.document.title, detail.document.revision
-        ),
-        data,
-    )
+    write_tool(store, request, move |tx| {
+        let detail = documents::update_document(
+            tx,
+            now_millis(),
+            &p,
+            &key,
+            id,
+            DocumentPatch {
+                title,
+                body,
+                parent,
+                base_revision,
+            },
+        )?;
+        let mut data = js(&detail);
+        shorten(&mut data, "body", DEFAULT_BODY_CHARS);
+        Ok(made(
+            format!(
+                "Updated document {} {:?}, now revision {}",
+                detail.document.id, detail.document.title, detail.document.revision
+            ),
+            data,
+        ))
+    })
+    .await
 }
 
 #[cfg(test)]

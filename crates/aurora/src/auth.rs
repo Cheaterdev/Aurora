@@ -51,6 +51,7 @@ use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 use serde_json::json;
 
+use crate::idem;
 use crate::routes::{ApiError, ApiJson, ApiQuery, ApiResult, created, no_content};
 
 pub const SESSION_COOKIE: &str = "aurora_session";
@@ -500,10 +501,10 @@ pub(crate) async fn create_user(
     Extension(principal): Extension<Principal>,
     ApiJson(body): ApiJson<NewAgent>,
 ) -> ApiResult<Response> {
-    let user = store
-        .write(move |tx| auth::create_agent_user(tx, now_millis(), &principal, &body.name))
-        .await?;
-    Ok(created(user))
+    idem::json(&store, StatusCode::CREATED, move |tx| {
+        auth::create_agent_user(tx, now_millis(), &principal, &body.name)
+    })
+    .await
 }
 
 pub async fn list_users(
@@ -554,10 +555,11 @@ pub(crate) async fn create_key(
 ) -> ApiResult<Response> {
     let user_id = body.user_id.unwrap_or(principal.user_id);
     let scope = body.scope.unwrap_or(Scope::Write);
-    let key = store
-        .write(move |tx| auth::create_key(tx, now_millis(), &principal, user_id, &body.name, scope))
-        .await?;
-    Ok(no_store(created(key)))
+    idem::secret(&store, StatusCode::CREATED, move |tx| {
+        auth::create_key(tx, now_millis(), &principal, user_id, &body.name, scope)
+    })
+    .await
+    .map(no_store)
 }
 
 pub async fn rotate_key(
@@ -565,10 +567,11 @@ pub async fn rotate_key(
     Extension(principal): Extension<Principal>,
     Path(id): Path<i64>,
 ) -> ApiResult<Response> {
-    let key = store
-        .write(move |tx| auth::rotate_key(tx, now_millis(), &principal, id))
-        .await?;
-    Ok(no_store(Json(key).into_response()))
+    idem::secret(&store, StatusCode::OK, move |tx| {
+        auth::rotate_key(tx, now_millis(), &principal, id)
+    })
+    .await
+    .map(no_store)
 }
 
 pub async fn revoke_key(
@@ -576,8 +579,8 @@ pub async fn revoke_key(
     Extension(principal): Extension<Principal>,
     Path(id): Path<i64>,
 ) -> ApiResult<Response> {
-    store
-        .write(move |tx| auth::revoke_key(tx, now_millis(), &principal, id))
-        .await?;
-    Ok(no_content())
+    idem::empty(&store, move |tx| {
+        auth::revoke_key(tx, now_millis(), &principal, id).map(drop)
+    })
+    .await
 }

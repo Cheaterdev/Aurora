@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::auth::Access;
-use crate::{agents, auth, markdown};
+use crate::{agents, auth, idem, markdown};
 
 const DEFAULT_LABEL_COLOR: &str = "#808080";
 
@@ -303,8 +303,10 @@ pub fn api_endpoints() -> Vec<Endpoint> {
 /// `store` is only needed to build the authentication layer.
 pub fn api_router(store: Store) -> Router<Store> {
     let (public, protected) = api_tables();
+    // Layers added later run first: authentication, then the request id.
     let protected = protected
         .router
+        .layer(middleware::from_fn(idem::layer))
         .layer(middleware::from_fn_with_state(store, auth::require_auth));
     public.router.merge(protected)
 }
@@ -476,19 +478,17 @@ async fn create_project(
         ))
         .into());
     }
-    let project = store
-        .write(move |tx| {
-            projects::create_project(
-                tx,
-                now_millis(),
-                &actor,
-                &body.key,
-                &body.name,
-                body.columns.as_deref(),
-            )
-        })
-        .await?;
-    Ok(created(project))
+    idem::json(&store, StatusCode::CREATED, move |tx| {
+        projects::create_project(
+            tx,
+            now_millis(),
+            &actor,
+            &body.key,
+            &body.name,
+            body.columns.as_deref(),
+        )
+    })
+    .await
 }
 
 async fn get_project(State(store): State<Store>, Path(key): Path<String>) -> ApiResult<Response> {
@@ -502,10 +502,10 @@ async fn rename_project(
     Path(key): Path<String>,
     ApiJson(body): ApiJson<NameBody>,
 ) -> ApiResult<Response> {
-    let project = store
-        .write(move |tx| projects::rename_project(tx, now_millis(), &actor, &key, &body.name))
-        .await?;
-    Ok(Json(project).into_response())
+    idem::json(&store, StatusCode::OK, move |tx| {
+        projects::rename_project(tx, now_millis(), &actor, &key, &body.name)
+    })
+    .await
 }
 
 // ---- columns ----
@@ -553,12 +553,10 @@ async fn create_column(
     Path(key): Path<String>,
     ApiJson(body): ApiJson<NewColumnBody>,
 ) -> ApiResult<Response> {
-    let column = store
-        .write(move |tx| {
-            projects::create_column(tx, now_millis(), &actor, &key, &body.name, body.state_type)
-        })
-        .await?;
-    Ok(created(column))
+    idem::json(&store, StatusCode::CREATED, move |tx| {
+        projects::create_column(tx, now_millis(), &actor, &key, &body.name, body.state_type)
+    })
+    .await
 }
 
 async fn rename_column(
@@ -567,10 +565,10 @@ async fn rename_column(
     Path((key, id)): Path<(String, i64)>,
     ApiJson(body): ApiJson<NameBody>,
 ) -> ApiResult<Response> {
-    let column = store
-        .write(move |tx| projects::rename_column(tx, now_millis(), &actor, &key, id, &body.name))
-        .await?;
-    Ok(Json(column).into_response())
+    idem::json(&store, StatusCode::OK, move |tx| {
+        projects::rename_column(tx, now_millis(), &actor, &key, id, &body.name)
+    })
+    .await
 }
 
 async fn reorder_columns(
@@ -579,10 +577,10 @@ async fn reorder_columns(
     Path(key): Path<String>,
     ApiJson(body): ApiJson<OrderBody>,
 ) -> ApiResult<Response> {
-    let columns = store
-        .write(move |tx| projects::reorder_columns(tx, now_millis(), &actor, &key, &body.ids))
-        .await?;
-    Ok(Json(columns).into_response())
+    idem::json(&store, StatusCode::OK, move |tx| {
+        projects::reorder_columns(tx, now_millis(), &actor, &key, &body.ids)
+    })
+    .await
 }
 
 async fn delete_column(
@@ -590,10 +588,10 @@ async fn delete_column(
     Extension(actor): Extension<Principal>,
     Path((key, id)): Path<(String, i64)>,
 ) -> ApiResult<Response> {
-    store
-        .write(move |tx| projects::delete_column(tx, now_millis(), &actor, &key, id))
-        .await?;
-    Ok(no_content())
+    idem::empty(&store, move |tx| {
+        projects::delete_column(tx, now_millis(), &actor, &key, id)
+    })
+    .await
 }
 
 // ---- issue types ----
@@ -614,10 +612,10 @@ async fn create_issue_type(
     Path(key): Path<String>,
     ApiJson(body): ApiJson<NameBody>,
 ) -> ApiResult<Response> {
-    let issue_type = store
-        .write(move |tx| projects::create_issue_type(tx, now_millis(), &actor, &key, &body.name))
-        .await?;
-    Ok(created(issue_type))
+    idem::json(&store, StatusCode::CREATED, move |tx| {
+        projects::create_issue_type(tx, now_millis(), &actor, &key, &body.name)
+    })
+    .await
 }
 
 async fn rename_issue_type(
@@ -626,12 +624,10 @@ async fn rename_issue_type(
     Path((key, id)): Path<(String, i64)>,
     ApiJson(body): ApiJson<NameBody>,
 ) -> ApiResult<Response> {
-    let issue_type = store
-        .write(move |tx| {
-            projects::rename_issue_type(tx, now_millis(), &actor, &key, id, &body.name)
-        })
-        .await?;
-    Ok(Json(issue_type).into_response())
+    idem::json(&store, StatusCode::OK, move |tx| {
+        projects::rename_issue_type(tx, now_millis(), &actor, &key, id, &body.name)
+    })
+    .await
 }
 
 async fn delete_issue_type(
@@ -639,10 +635,10 @@ async fn delete_issue_type(
     Extension(actor): Extension<Principal>,
     Path((key, id)): Path<(String, i64)>,
 ) -> ApiResult<Response> {
-    store
-        .write(move |tx| projects::delete_issue_type(tx, now_millis(), &actor, &key, id))
-        .await?;
-    Ok(no_content())
+    idem::empty(&store, move |tx| {
+        projects::delete_issue_type(tx, now_millis(), &actor, &key, id)
+    })
+    .await
 }
 
 // ---- labels ----
@@ -672,13 +668,11 @@ async fn create_label(
     Path(key): Path<String>,
     ApiJson(body): ApiJson<NewLabelBody>,
 ) -> ApiResult<Response> {
-    let label = store
-        .write(move |tx| {
-            let color = body.color.as_deref().unwrap_or(DEFAULT_LABEL_COLOR);
-            projects::create_label(tx, now_millis(), &actor, &key, &body.name, color)
-        })
-        .await?;
-    Ok(created(label))
+    idem::json(&store, StatusCode::CREATED, move |tx| {
+        let color = body.color.as_deref().unwrap_or(DEFAULT_LABEL_COLOR);
+        projects::create_label(tx, now_millis(), &actor, &key, &body.name, color)
+    })
+    .await
 }
 
 async fn update_label(
@@ -693,20 +687,18 @@ async fn update_label(
         );
     }
     // One transaction, so a bad color does not leave the rename behind.
-    let label = store
-        .write(move |tx| {
-            let now = now_millis();
-            let mut label = None;
-            if let Some(name) = &body.name {
-                label = Some(projects::rename_label(tx, now, &actor, &key, id, name)?);
-            }
-            if let Some(color) = &body.color {
-                label = Some(projects::recolor_label(tx, now, &actor, &key, id, color)?);
-            }
-            label.ok_or_else(|| StoreError::from(Rejection::NotFound("label".into())))
-        })
-        .await?;
-    Ok(Json(label).into_response())
+    idem::json(&store, StatusCode::OK, move |tx| {
+        let now = now_millis();
+        let mut label = None;
+        if let Some(name) = &body.name {
+            label = Some(projects::rename_label(tx, now, &actor, &key, id, name)?);
+        }
+        if let Some(color) = &body.color {
+            label = Some(projects::recolor_label(tx, now, &actor, &key, id, color)?);
+        }
+        label.ok_or_else(|| StoreError::from(Rejection::NotFound("label".into())))
+    })
+    .await
 }
 
 async fn delete_label(
@@ -714,10 +706,10 @@ async fn delete_label(
     Extension(actor): Extension<Principal>,
     Path((key, id)): Path<(String, i64)>,
 ) -> ApiResult<Response> {
-    store
-        .write(move |tx| projects::delete_label(tx, now_millis(), &actor, &key, id))
-        .await?;
-    Ok(no_content())
+    idem::empty(&store, move |tx| {
+        projects::delete_label(tx, now_millis(), &actor, &key, id)
+    })
+    .await
 }
 
 // ---- issues ----
@@ -784,10 +776,10 @@ async fn create_issue(
     Path(key): Path<String>,
     ApiJson(body): ApiJson<NewIssue>,
 ) -> ApiResult<Response> {
-    let issue = store
-        .write(move |tx| issues::create_issue(tx, now_millis(), &actor, &key, body))
-        .await?;
-    Ok(created(issue))
+    idem::json(&store, StatusCode::CREATED, move |tx| {
+        issues::create_issue(tx, now_millis(), &actor, &key, body)
+    })
+    .await
 }
 
 async fn get_issue(
@@ -806,10 +798,10 @@ async fn update_issue(
     Path((key, number)): Path<(String, i64)>,
     ApiJson(body): ApiJson<IssuePatch>,
 ) -> ApiResult<Response> {
-    let issue = store
-        .write(move |tx| issues::update_issue(tx, now_millis(), &actor, &key, number, body))
-        .await?;
-    Ok(Json(issue).into_response())
+    idem::json(&store, StatusCode::OK, move |tx| {
+        issues::update_issue(tx, now_millis(), &actor, &key, number, body)
+    })
+    .await
 }
 
 async fn move_issue(
@@ -818,10 +810,10 @@ async fn move_issue(
     Path((key, number)): Path<(String, i64)>,
     ApiJson(body): ApiJson<MoveTarget>,
 ) -> ApiResult<Response> {
-    let issue = store
-        .write(move |tx| issues::move_issue(tx, now_millis(), &actor, &key, number, body))
-        .await?;
-    Ok(Json(issue).into_response())
+    idem::json(&store, StatusCode::OK, move |tx| {
+        issues::move_issue(tx, now_millis(), &actor, &key, number, body)
+    })
+    .await
 }
 
 async fn archive_issue(
@@ -829,10 +821,10 @@ async fn archive_issue(
     Extension(actor): Extension<Principal>,
     Path((key, number)): Path<(String, i64)>,
 ) -> ApiResult<Response> {
-    let issue = store
-        .write(move |tx| issues::archive_issue(tx, now_millis(), &actor, &key, number))
-        .await?;
-    Ok(Json(issue).into_response())
+    idem::json(&store, StatusCode::OK, move |tx| {
+        issues::archive_issue(tx, now_millis(), &actor, &key, number)
+    })
+    .await
 }
 
 async fn unarchive_issue(
@@ -840,10 +832,10 @@ async fn unarchive_issue(
     Extension(actor): Extension<Principal>,
     Path((key, number)): Path<(String, i64)>,
 ) -> ApiResult<Response> {
-    let issue = store
-        .write(move |tx| issues::unarchive_issue(tx, now_millis(), &actor, &key, number))
-        .await?;
-    Ok(Json(issue).into_response())
+    idem::json(&store, StatusCode::OK, move |tx| {
+        issues::unarchive_issue(tx, now_millis(), &actor, &key, number)
+    })
+    .await
 }
 
 #[derive(Deserialize)]
@@ -940,17 +932,15 @@ async fn add_link(
             "direction blocked_by only applies to kind blocks".into(),
         ));
     }
-    let link = store
-        .write(move |tx| {
-            let now = now_millis();
-            if blocked_by {
-                links::add_blocker(tx, now, &actor, &key, number, to)
-            } else {
-                links::add_link(tx, now, &actor, &key, number, to, body.kind)
-            }
-        })
-        .await?;
-    Ok(created(link))
+    idem::json(&store, StatusCode::CREATED, move |tx| {
+        let now = now_millis();
+        if blocked_by {
+            links::add_blocker(tx, now, &actor, &key, number, to)
+        } else {
+            links::add_link(tx, now, &actor, &key, number, to, body.kind)
+        }
+    })
+    .await
 }
 
 async fn remove_link(
@@ -958,10 +948,10 @@ async fn remove_link(
     Extension(actor): Extension<Principal>,
     Path((key, id)): Path<(String, i64)>,
 ) -> ApiResult<Response> {
-    store
-        .write(move |tx| links::remove_link(tx, now_millis(), &actor, &key, id))
-        .await?;
-    Ok(no_content())
+    idem::empty(&store, move |tx| {
+        links::remove_link(tx, now_millis(), &actor, &key, id)
+    })
+    .await
 }
 
 // ---- comments ----
@@ -988,10 +978,10 @@ async fn add_comment(
     Path((key, number)): Path<(String, i64)>,
     ApiJson(body): ApiJson<NewComment>,
 ) -> ApiResult<Response> {
-    let comment = store
-        .write(move |tx| comments::add_comment(tx, now_millis(), &actor, &key, number, body))
-        .await?;
-    Ok(created(comment))
+    idem::json(&store, StatusCode::CREATED, move |tx| {
+        comments::add_comment(tx, now_millis(), &actor, &key, number, body)
+    })
+    .await
 }
 
 async fn get_comment(
@@ -1010,10 +1000,10 @@ async fn edit_comment(
     Path((key, id)): Path<(String, i64)>,
     ApiJson(body): ApiJson<CommentBody>,
 ) -> ApiResult<Response> {
-    let comment = store
-        .write(move |tx| comments::edit_comment(tx, now_millis(), &actor, &key, id, &body.body))
-        .await?;
-    Ok(Json(comment).into_response())
+    idem::json(&store, StatusCode::OK, move |tx| {
+        comments::edit_comment(tx, now_millis(), &actor, &key, id, &body.body)
+    })
+    .await
 }
 
 async fn delete_comment(
@@ -1021,10 +1011,10 @@ async fn delete_comment(
     Extension(actor): Extension<Principal>,
     Path((key, id)): Path<(String, i64)>,
 ) -> ApiResult<Response> {
-    store
-        .write(move |tx| comments::delete_comment(tx, now_millis(), &actor, &key, id))
-        .await?;
-    Ok(no_content())
+    idem::empty(&store, move |tx| {
+        comments::delete_comment(tx, now_millis(), &actor, &key, id)
+    })
+    .await
 }
 
 // ---- initiatives ----
@@ -1070,10 +1060,10 @@ async fn create_initiative(
     Path(key): Path<String>,
     ApiJson(body): ApiJson<NewInitiative>,
 ) -> ApiResult<Response> {
-    let initiative = store
-        .write(move |tx| initiatives::create_initiative(tx, now_millis(), &actor, &key, body))
-        .await?;
-    Ok(created(initiative))
+    idem::json(&store, StatusCode::CREATED, move |tx| {
+        initiatives::create_initiative(tx, now_millis(), &actor, &key, body)
+    })
+    .await
 }
 
 async fn get_initiative(
@@ -1095,10 +1085,10 @@ async fn update_initiative(
     Path((key, id)): Path<(String, i64)>,
     ApiJson(body): ApiJson<InitiativePatch>,
 ) -> ApiResult<Response> {
-    let initiative = store
-        .write(move |tx| initiatives::update_initiative(tx, now_millis(), &actor, &key, id, body))
-        .await?;
-    Ok(Json(initiative).into_response())
+    idem::json(&store, StatusCode::OK, move |tx| {
+        initiatives::update_initiative(tx, now_millis(), &actor, &key, id, body)
+    })
+    .await
 }
 
 async fn delete_initiative(
@@ -1106,10 +1096,10 @@ async fn delete_initiative(
     Extension(actor): Extension<Principal>,
     Path((key, id)): Path<(String, i64)>,
 ) -> ApiResult<Response> {
-    store
-        .write(move |tx| initiatives::delete_initiative(tx, now_millis(), &actor, &key, id))
-        .await?;
-    Ok(no_content())
+    idem::empty(&store, move |tx| {
+        initiatives::delete_initiative(tx, now_millis(), &actor, &key, id)
+    })
+    .await
 }
 
 // ---- documents ----
@@ -1159,10 +1149,10 @@ async fn create_document(
     Path(key): Path<String>,
     ApiJson(body): ApiJson<NewDocument>,
 ) -> ApiResult<Response> {
-    let document = store
-        .write(move |tx| documents::create_document(tx, now_millis(), &actor, &key, body))
-        .await?;
-    Ok(created(document))
+    idem::json(&store, StatusCode::CREATED, move |tx| {
+        documents::create_document(tx, now_millis(), &actor, &key, body)
+    })
+    .await
 }
 
 async fn get_document(
@@ -1181,10 +1171,10 @@ async fn update_document(
     Path((key, id)): Path<(String, i64)>,
     ApiJson(body): ApiJson<DocumentPatch>,
 ) -> ApiResult<Response> {
-    let document = store
-        .write(move |tx| documents::update_document(tx, now_millis(), &actor, &key, id, body))
-        .await?;
-    Ok(Json(document).into_response())
+    idem::json(&store, StatusCode::OK, move |tx| {
+        documents::update_document(tx, now_millis(), &actor, &key, id, body)
+    })
+    .await
 }
 
 async fn move_document(
@@ -1193,10 +1183,10 @@ async fn move_document(
     Path((key, id)): Path<(String, i64)>,
     ApiJson(body): ApiJson<DocumentMove>,
 ) -> ApiResult<Response> {
-    let document = store
-        .write(move |tx| documents::move_document(tx, now_millis(), &actor, &key, id, body))
-        .await?;
-    Ok(Json(document).into_response())
+    idem::json(&store, StatusCode::OK, move |tx| {
+        documents::move_document(tx, now_millis(), &actor, &key, id, body)
+    })
+    .await
 }
 
 async fn archive_document(
@@ -1204,10 +1194,10 @@ async fn archive_document(
     Extension(actor): Extension<Principal>,
     Path((key, id)): Path<(String, i64)>,
 ) -> ApiResult<Response> {
-    let document = store
-        .write(move |tx| documents::archive_document(tx, now_millis(), &actor, &key, id))
-        .await?;
-    Ok(Json(document).into_response())
+    idem::json(&store, StatusCode::OK, move |tx| {
+        documents::archive_document(tx, now_millis(), &actor, &key, id)
+    })
+    .await
 }
 
 async fn unarchive_document(
@@ -1215,10 +1205,10 @@ async fn unarchive_document(
     Extension(actor): Extension<Principal>,
     Path((key, id)): Path<(String, i64)>,
 ) -> ApiResult<Response> {
-    let document = store
-        .write(move |tx| documents::unarchive_document(tx, now_millis(), &actor, &key, id))
-        .await?;
-    Ok(Json(document).into_response())
+    idem::json(&store, StatusCode::OK, move |tx| {
+        documents::unarchive_document(tx, now_millis(), &actor, &key, id)
+    })
+    .await
 }
 
 async fn list_revisions(
@@ -1247,20 +1237,18 @@ async fn restore_revision(
     Path((key, id)): Path<(String, i64)>,
     ApiJson(body): ApiJson<RestoreBody>,
 ) -> ApiResult<Response> {
-    let document = store
-        .write(move |tx| {
-            documents::restore_revision(
-                tx,
-                now_millis(),
-                &actor,
-                &key,
-                id,
-                body.revision,
-                body.base_revision,
-            )
-        })
-        .await?;
-    Ok(Json(document).into_response())
+    idem::json(&store, StatusCode::OK, move |tx| {
+        documents::restore_revision(
+            tx,
+            now_millis(),
+            &actor,
+            &key,
+            id,
+            body.revision,
+            body.base_revision,
+        )
+    })
+    .await
 }
 
 async fn add_document_link(
@@ -1274,10 +1262,10 @@ async fn add_document_link(
         (None, Some(initiative)) => DocumentTarget::Initiative(initiative),
         _ => return Err(invalid("give exactly one of issue and initiative".into())),
     };
-    let link = store
-        .write(move |tx| documents::add_link(tx, now_millis(), &actor, &key, id, target))
-        .await?;
-    Ok(created(link))
+    idem::json(&store, StatusCode::CREATED, move |tx| {
+        documents::add_link(tx, now_millis(), &actor, &key, id, target)
+    })
+    .await
 }
 
 async fn remove_document_link(
@@ -1285,10 +1273,10 @@ async fn remove_document_link(
     Extension(actor): Extension<Principal>,
     Path((key, id, link_id)): Path<(String, i64, i64)>,
 ) -> ApiResult<Response> {
-    store
-        .write(move |tx| documents::remove_link(tx, now_millis(), &actor, &key, id, link_id))
-        .await?;
-    Ok(no_content())
+    idem::empty(&store, move |tx| {
+        documents::remove_link(tx, now_millis(), &actor, &key, id, link_id)
+    })
+    .await
 }
 
 /// The server-rendered HTML of a draft body, for the editor's Preview button;
@@ -1448,14 +1436,16 @@ async fn register_consumer(
         StartAt::Beginning => Start::Beginning,
         StartAt::Latest => Start::Latest,
     };
-    let (cursor, is_new) = store
-        .write(move |tx| events::register_consumer(tx, now_millis(), &name, start))
-        .await?;
-    Ok(if is_new {
-        created(cursor)
-    } else {
-        Json(cursor).into_response()
+    idem::json_status(&store, move |tx| {
+        let (cursor, is_new) = events::register_consumer(tx, now_millis(), &name, start)?;
+        let status = if is_new {
+            StatusCode::CREATED
+        } else {
+            StatusCode::OK
+        };
+        Ok((status, cursor))
     })
+    .await
 }
 
 async fn delete_consumer(
@@ -1463,10 +1453,7 @@ async fn delete_consumer(
     Path(name): Path<String>,
 ) -> ApiResult<Response> {
     events::validate_name(&name)?;
-    store
-        .write(move |tx| events::delete_consumer(tx, &name))
-        .await?;
-    Ok(no_content())
+    idem::empty(&store, move |tx| events::delete_consumer(tx, &name)).await
 }
 
 async fn poll_consumer(
@@ -1492,8 +1479,8 @@ async fn ack_consumer(
     ApiJson(body): ApiJson<AckBody>,
 ) -> ApiResult<Response> {
     events::validate_name(&name)?;
-    let cursor = store
-        .write(move |tx| events::ack(tx, now_millis(), &name, body.up_to))
-        .await?;
-    Ok(Json(cursor).into_response())
+    idem::json(&store, StatusCode::OK, move |tx| {
+        events::ack(tx, now_millis(), &name, body.up_to)
+    })
+    .await
 }

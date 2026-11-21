@@ -77,6 +77,62 @@ with `POST /api/v1/users` stays unrestricted until it is registered.
   is clamped; the response says the `limit`, `offset` and `total` used.
   Event streams page with a cursor (`after` / consumers).
 * Every change and its event are committed in one transaction.
+* Changing requests can be made safe to repeat with a request id, see
+  Idempotency.
+
+## Idempotency
+
+A client that does not know whether a change was applied (a timeout, a lost
+connection, a crash on either side) can send the same request again without
+applying it twice.
+
+* **Header.** `Idempotency-Key: <id>` on a `POST`, `PUT`, `PATCH` or `DELETE`.
+  The id is 8 to 128 characters of `A-Z a-z 0-9 . _ : -` (`422` otherwise);
+  generate a fresh one per intended change, for example a UUID. It is optional:
+  a request without one behaves exactly as it always did. On a read the header
+  is ignored. The MCP endpoint takes the same thing as the argument
+  `request_id` of its write tools (see [mcp.md](mcp.md)); both share one log.
+* **Repeating.** The same id with the same request (method, path and query,
+  and the JSON body compared by value, so key order and spacing do not matter)
+  returns the original status and body again with the response header
+  `Idempotent-Replay: true`. Nothing is changed and no event is written; a
+  `204` stays `204`. The first response has no such header.
+* **Different request.** The same id with another method, path, query or body
+  is `422 {"error": "request id was already used for a different request"}`
+  and changes nothing.
+* **Whose id.** An id belongs to the user of the credentials: two users may use
+  the same id independently. A replay still needs valid credentials, but the
+  user's rights are not evaluated again; the stored answer is returned.
+* **Crash safety.** The id and the response are written in the same database
+  transaction as the change and its event, so after a crash either all of
+  them are there or none: a retry then applies the change once. Two requests
+  with the same id sent at the same time are applied one after the other; the
+  second one is a replay.
+* **What is remembered.** Only successful (`2xx`) results. A request that
+  failed (`4xx`, `5xx`) changed nothing and leaves no trace, so a retry after
+  fixing the request, or after a transient failure, runs again. A request
+  body is read in full before it is handled when the header is present, at
+  most 2 MiB (`413`).
+* **Retention.** An id is remembered for 7 days; a repeat after that is a new
+  request and is applied. Expired ids are deleted in batches of at most 500 at
+  start-up and then every hour, never in the path of a user's write. The period
+  can be changed with `--request-retention-days <n>` (env
+  `AURORA_REQUEST_RETENTION_DAYS`, 1 to 3650); it is not in the usage text.
+* **Large responses.** A response larger than 256 KiB is not stored. The id is
+  still remembered, and a repeat returns the original status with
+  `{"replayed": true, "note": "original response too large to replay"}` and
+  `Idempotent-Replay: true`; read the object again with a `GET`.
+* **One-time keys.** `POST /keys`, `POST /keys/{id}/rotate` and `POST /agents`
+  with `"create_key": true` return a secret that is shown once. The secret is
+  never stored, so a replay returns the same body with `"key": null`,
+  `"key_replayed": true` and a `"message"` saying that the key was shown once
+  (the listed `prefix` is omitted too; no text that looks like a key is kept).
+  If the first response was lost, rotate the key (or create another) with a new
+  id.
+* **Not covered.** `POST /setup` and `POST /auth/sign-in` (public, no id),
+  `POST /auth/sign-out` and `POST /projects/{key}/documents/preview` (nothing to
+  repeat): the header is ignored there, even a malformed one. The web pages'
+  forms use session cookies and do not take ids.
 
 ## Index
 

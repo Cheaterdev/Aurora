@@ -26,6 +26,7 @@ mod migrations;
 #[cfg_attr(not(windows), path = "platform/other.rs")]
 mod platform;
 pub mod projects;
+pub mod request_log;
 pub mod search;
 
 use std::io::Write;
@@ -67,6 +68,8 @@ pub enum StoreError {
     Closed,
     #[error("the operating system could not provide random bytes")]
     Random,
+    #[error("could not encode a response: {0}")]
+    Encoding(#[from] serde_json::Error),
     #[error("password hashing failed: {0}")]
     Hashing(String),
     /// The request was understood and refused; nothing was changed.
@@ -107,6 +110,9 @@ pub struct OpenOptions {
     pub backup_dir: Option<PathBuf>,
     /// Skip the network / synced-folder refusal (development and tests).
     pub allow_unsafe_location: bool,
+    /// How long request ids are remembered; `None` means
+    /// [`request_log::DEFAULT_RETENTION`].
+    pub request_retention: Option<Duration>,
 }
 
 /// What [`Store::open_with`] did, for logging and for later start-up steps.
@@ -160,6 +166,7 @@ struct Inner {
     schema_version: i64,
     report: OpenReport,
     marker: PathBuf,
+    request_retention: Duration,
     sender: Mutex<Option<mpsc::Sender<WriteJob>>>,
     /// The writer returns whether its final checkpoint succeeded.
     writer: Mutex<Option<JoinHandle<bool>>>,
@@ -253,7 +260,17 @@ impl Store {
             backup_dir,
             backup: None,
         };
-        let started = Store::start(path, conn, marker.clone(), report, migration_list);
+        let retention = options
+            .request_retention
+            .unwrap_or(request_log::DEFAULT_RETENTION);
+        let started = Store::start(
+            path,
+            conn,
+            marker.clone(),
+            report,
+            retention,
+            migration_list,
+        );
         if started.is_err() && !unclean_shutdown {
             let _ = std::fs::remove_file(&marker);
         }
@@ -265,6 +282,7 @@ impl Store {
         mut conn: Connection,
         marker: PathBuf,
         mut report: OpenReport,
+        request_retention: Duration,
         migration_list: &[Migration],
     ) -> Result<Store, StoreError> {
         apply_pragmas(&conn, true)?;
@@ -300,6 +318,7 @@ impl Store {
                 schema_version,
                 report,
                 marker,
+                request_retention,
                 sender: Mutex::new(Some(sender)),
                 writer: Mutex::new(Some(writer)),
             }),
@@ -317,6 +336,22 @@ impl Store {
     /// Where backups are expected (and where TRK-40's will be written).
     pub fn backup_dir(&self) -> &Path {
         &self.inner.report.backup_dir
+    }
+
+    /// How long request ids are remembered; see [`request_log`].
+    pub fn request_retention(&self) -> Duration {
+        self.inner.request_retention
+    }
+
+    /// Deletes one batch (at most [`request_log::PURGE_BATCH`]) of expired
+    /// request ids as of `now` and returns how many; call again while it
+    /// returns a full batch. Each call is its own short write.
+    pub async fn purge_request_log(&self, now: i64) -> Result<usize, StoreError> {
+        let retention = self.inner.request_retention;
+        self.write(move |tx| {
+            request_log::purge_expired(tx, now, retention, request_log::PURGE_BATCH)
+        })
+        .await
     }
 
     /// Runs `f` in a transaction on the writer thread. The transaction commits
@@ -841,6 +876,8 @@ mod tests_0010;
 #[cfg(test)]
 mod tests_0011;
 #[cfg(test)]
+mod tests_0012;
+#[cfg(test)]
 mod tests_actor;
 #[cfg(test)]
 mod tests_agents;
@@ -858,6 +895,8 @@ mod tests_initiatives;
 mod tests_issues;
 #[cfg(test)]
 mod tests_links;
+#[cfg(test)]
+mod tests_request_log;
 #[cfg(test)]
 mod tests_search;
 

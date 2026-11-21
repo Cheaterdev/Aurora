@@ -3,6 +3,7 @@
 pub mod agents;
 pub mod auth;
 pub mod config;
+pub mod idem;
 pub mod markdown;
 pub mod mcp;
 pub mod pages;
@@ -94,8 +95,12 @@ pub async fn serve(
     listener: TcpListener,
     store: Store,
     shutdown: impl Future<Output = ()> + Send + 'static,
-    hooks: ShutdownHooks,
+    mut hooks: ShutdownHooks,
 ) -> Result<()> {
+    idem::register_purge_stop(
+        &mut hooks,
+        idem::spawn_purge(store.clone(), idem::PURGE_INTERVAL),
+    );
     // Open event streams never finish on their own: they must end when
     // shutdown starts, or the drain would wait for them.
     let (live, control) = Live::start(store.clone());
@@ -153,6 +158,9 @@ async fn serve_router(
     tracing::info!("shutdown complete");
     result
 }
+
+#[cfg(test)]
+mod idem_crash_tests;
 
 #[cfg(test)]
 mod tests {
