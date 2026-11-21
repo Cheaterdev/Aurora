@@ -6,7 +6,7 @@ use anyhow::{Context, Result, bail};
 
 pub const USAGE: &str = "\
 Usage: aurora [--db <path>] [--host <ip>] [--port <port>] [--backup-dir <path>]
-              [--allow-unsafe-location]
+              [--allow-unsafe-location] [--public-url <url>]
 
   --db <path>          SQLite database file   (env AURORA_DB,   default aurora.db)
   --host <ip>          address to listen on   (env AURORA_HOST, default 127.0.0.1)
@@ -16,6 +16,9 @@ Usage: aurora [--db <path>] [--host <ip>] [--port <port>] [--backup-dir <path>]
   --allow-unsafe-location
                        use a network or cloud-synced folder anyway, development
                        only (env AURORA_ALLOW_UNSAFE_LOCATION=1)
+  --public-url <url>   the http(s) address people reach this server at, for
+                       absolute links in agent prompts (env AURORA_PUBLIC_URL,
+                       default none: links stay relative)
 
 Flags override environment variables.
 
@@ -36,6 +39,9 @@ pub struct Config {
     /// How long request ids are remembered; `None` means 7 days. Not in the
     /// usage text: `--request-retention-days <n>` / `AURORA_REQUEST_RETENTION_DAYS`.
     pub request_retention: Option<Duration>,
+    /// The base URL people reach the server at, without a trailing slash;
+    /// used for absolute links in the first message of a run.
+    pub public_url: Option<String>,
 }
 
 impl Default for Config {
@@ -47,6 +53,7 @@ impl Default for Config {
             backup_dir: None,
             allow_unsafe_location: false,
             request_retention: None,
+            public_url: None,
         }
     }
 }
@@ -126,6 +133,10 @@ impl Config {
                 Some(parse_days(&v).context("AURORA_REQUEST_RETENTION_DAYS")?);
         }
 
+        if let Some(v) = env("AURORA_PUBLIC_URL") {
+            config.public_url = Some(parse_public_url(&v).context("AURORA_PUBLIC_URL")?);
+        }
+
         while let Some(arg) = args.next() {
             let (flag, inline) = match arg.split_once('=') {
                 Some((flag, value)) => (flag.to_owned(), Some(value.to_owned())),
@@ -140,7 +151,12 @@ impl Config {
             }
             if !matches!(
                 flag.as_str(),
-                "--db" | "--host" | "--port" | "--backup-dir" | "--request-retention-days"
+                "--db"
+                    | "--host"
+                    | "--port"
+                    | "--backup-dir"
+                    | "--request-retention-days"
+                    | "--public-url"
             ) {
                 bail!("unknown argument {flag:?}\n\n{USAGE}");
             }
@@ -151,6 +167,9 @@ impl Config {
                 "--db" => config.db_path = PathBuf::from(value),
                 "--host" => config.host = parse_host(&value).context("--host")?,
                 "--backup-dir" => config.backup_dir = Some(PathBuf::from(value)),
+                "--public-url" => {
+                    config.public_url = Some(parse_public_url(&value).context("--public-url")?);
+                }
                 "--request-retention-days" => {
                     config.request_retention =
                         Some(parse_days(&value).context("--request-retention-days")?);
@@ -165,6 +184,11 @@ impl Config {
 fn parse_host(v: &str) -> Result<IpAddr> {
     v.parse()
         .with_context(|| format!("{v:?} is not an IP address"))
+}
+
+fn parse_public_url(v: &str) -> Result<String> {
+    aurora_store::normalize_public_url(v)
+        .map_err(|why| anyhow::anyhow!("{v:?} is not a usable base URL: {why}"))
 }
 
 fn parse_days(v: &str) -> Result<Duration> {
@@ -264,6 +288,25 @@ mod tests {
         assert_eq!(c.request_retention, Some(Duration::from_secs(86_400)));
         assert!(run(&["--request-retention-days", "0"], &[]).is_err());
         assert!(run(&[], &[("AURORA_REQUEST_RETENTION_DAYS", "x")]).is_err());
+    }
+
+    #[test]
+    fn public_url_is_checked_and_trimmed() {
+        assert_eq!(run(&[], &[]).unwrap().public_url, None);
+        let c = run(&["--public-url", "https://aurora.example.com/"], &[]).unwrap();
+        assert_eq!(c.public_url.as_deref(), Some("https://aurora.example.com"));
+        let c = run(&[], &[("AURORA_PUBLIC_URL", "http://10.0.0.5:8787")]).unwrap();
+        assert_eq!(c.public_url.as_deref(), Some("http://10.0.0.5:8787"));
+        let c = run(
+            &["--public-url=http://a.example"],
+            &[("AURORA_PUBLIC_URL", "http://b.example")],
+        )
+        .unwrap();
+        assert_eq!(c.public_url.as_deref(), Some("http://a.example"));
+        assert!(run(&["--public-url", "ftp://x"], &[]).is_err());
+        assert!(run(&["--public-url", "not a url"], &[]).is_err());
+        assert!(run(&["--public-url"], &[]).is_err());
+        assert!(run(&[], &[("AURORA_PUBLIC_URL", "localhost:1")]).is_err());
     }
 
     #[test]

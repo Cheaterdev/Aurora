@@ -8,6 +8,7 @@ pub mod idem;
 pub mod markdown;
 pub mod mcp;
 pub mod pages;
+pub mod prompts;
 pub mod routes;
 pub mod shutdown;
 #[cfg_attr(windows, path = "signal/windows.rs")]

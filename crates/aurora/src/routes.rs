@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::auth::Access;
-use crate::{agents, auth, idem, markdown};
+use crate::{agents, auth, idem, markdown, prompts};
 
 const DEFAULT_LABEL_COLOR: &str = "#808080";
 
@@ -116,6 +116,22 @@ fn api_tables() -> (Table, Table) {
             post(agents::disable_agent),
         )
         .route(
+            "/agents/{id}/templates",
+            &["GET", "PUT"],
+            get(prompts::list_templates).put(prompts::save_template),
+        )
+        .route(
+            "/agents/{id}/templates/{template_id}",
+            &["DELETE"],
+            delete(prompts::delete_template),
+        )
+        .route(
+            "/agents/{id}/prompt-preview",
+            &["POST"],
+            post(prompts::preview),
+        )
+        .route("/prompt/variables", &["GET"], get(prompts::variables))
+        .route(
             "/projects",
             &["GET", "POST"],
             get(list_projects).post(create_project),
@@ -123,7 +139,7 @@ fn api_tables() -> (Table, Table) {
         .route(
             "/projects/{key}",
             &["GET", "PATCH"],
-            get(get_project).patch(rename_project),
+            get(get_project).patch(update_project),
         )
         .route(
             "/projects/{key}/columns",
@@ -496,14 +512,15 @@ async fn get_project(State(store): State<Store>, Path(key): Path<String>) -> Api
     Ok(Json(project).into_response())
 }
 
-async fn rename_project(
+/// Changes the name, the rules text, or both, in one write.
+async fn update_project(
     State(store): State<Store>,
     Extension(actor): Extension<Principal>,
     Path(key): Path<String>,
-    ApiJson(body): ApiJson<NameBody>,
+    ApiJson(patch): ApiJson<projects::ProjectPatch>,
 ) -> ApiResult<Response> {
     idem::json(&store, StatusCode::OK, move |tx| {
-        projects::rename_project(tx, now_millis(), &actor, &key, &body.name)
+        projects::update_project(tx, now_millis(), &actor, &key, patch)
     })
     .await
 }

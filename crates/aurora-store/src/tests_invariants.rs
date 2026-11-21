@@ -52,7 +52,7 @@ async fn seed(store: &Store) {
                 },
             )?;
             links::add_link(tx, 30, "TRK", 1, 2, LinkKind::Blocks)?;
-            agents::create_agent(
+            let agent = agents::create_agent(
                 tx,
                 35,
                 &actor,
@@ -61,6 +61,25 @@ async fn seed(store: &Store) {
                     command: "x".into(),
                     projects: vec!["TRK".into()],
                     ..NewAgent::default()
+                },
+            )?;
+            crate::prompt::save_template(
+                tx,
+                36,
+                &actor,
+                agent.id,
+                Some("TRK"),
+                None,
+                "Work on {{issue.key}}",
+            )?;
+            projects::update_project(
+                tx,
+                37,
+                &actor,
+                "TRK",
+                projects::ProjectPatch {
+                    rules: Some(Some("be careful".into())),
+                    ..projects::ProjectPatch::default()
                 },
             )?;
             let top = comments::add_comment(
@@ -210,7 +229,7 @@ async fn a_dangling_reference_fails_the_foreign_key_check() {
 
 #[tokio::test]
 async fn a_database_behind_this_build_fails_and_skips_the_rest() {
-    let report = corrupted("DELETE FROM schema_version WHERE version = 12;").await;
+    let report = corrupted("DELETE FROM schema_version WHERE version = 13;").await;
     let details = failed(&report, "schema.version");
     assert!(details.contains("start aurora to migrate"), "{details}");
     let skipped = failed(&report, "events.state_agreement");
@@ -429,4 +448,48 @@ fn file_listing(dir: &Path) -> Vec<String> {
         .collect();
     names.sort();
     names
+}
+
+#[tokio::test]
+async fn a_template_that_no_longer_parses_fails_the_template_check() {
+    let report = corrupted("UPDATE prompt_template SET body = '{{#if issue.key}} open';").await;
+    let details = failed(&report, "prompt_templates.valid");
+    assert!(details.contains("does not parse"), "{details}");
+    // The text length no longer matches the log either.
+    failed(&report, "events.state_agreement");
+}
+
+#[tokio::test]
+async fn a_template_with_an_unknown_variable_fails_the_template_check() {
+    let report = corrupted("UPDATE prompt_template SET body = '{{no.such}}';").await;
+    let details = failed(&report, "prompt_templates.valid");
+    assert!(
+        details.contains("{{no.such}}") || details.contains("no.such"),
+        "{details}"
+    );
+}
+
+#[tokio::test]
+async fn a_template_for_an_issue_type_of_another_project_fails_the_template_check() {
+    let report = corrupted(
+        "DROP TRIGGER prompt_template_type_in_project_insert;
+         DROP TRIGGER prompt_template_type_in_project_update;
+         UPDATE prompt_template SET issue_type_id = (SELECT id FROM issue_type WHERE name = 'Item');",
+    )
+    .await;
+    let details = failed(&report, "prompt_templates.valid");
+    assert!(details.contains("another project"), "{details}");
+}
+
+#[tokio::test]
+async fn a_template_or_rules_text_changed_without_an_event_fails_the_agreement() {
+    let report =
+        corrupted("UPDATE prompt_template SET body = 'a different text of another length';").await;
+    let details = failed(&report, "events.state_agreement");
+    assert!(details.contains("prompt template"), "{details}");
+
+    let report = corrupted("UPDATE project SET rules = 'x' WHERE key = 'TRK';").await;
+    let details = failed(&report, "events.state_agreement");
+    assert!(details.contains("rules"), "{details}");
+    passes(&report, "prompt_templates.valid");
 }

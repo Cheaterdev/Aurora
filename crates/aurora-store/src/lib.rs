@@ -28,6 +28,7 @@ mod migrations;
 #[cfg_attr(not(windows), path = "platform/other.rs")]
 mod platform;
 pub mod projects;
+pub mod prompt;
 pub mod replay;
 pub mod request_log;
 pub mod search;
@@ -116,6 +117,35 @@ pub struct OpenOptions {
     /// How long request ids are remembered; `None` means
     /// [`request_log::DEFAULT_RETENTION`].
     pub request_retention: Option<Duration>,
+    /// The server's public base URL (`http://host:port`, no trailing slash),
+    /// used for absolute links in prompt messages. Validate with
+    /// [`normalize_public_url`] first; `None` means links stay relative.
+    pub public_url: Option<String>,
+}
+
+/// Checks a public base URL and returns it without trailing slashes: an
+/// `http` or `https` URL with a host, no user info, query or fragment, no
+/// whitespace or control characters, at most 200 characters.
+pub fn normalize_public_url(text: &str) -> Result<String, String> {
+    let url = text.trim().trim_end_matches('/');
+    let rest = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .ok_or("must start with http:// or https://")?;
+    let authority = rest.split('/').next().unwrap_or("");
+    if url.chars().count() > 200 {
+        return Err("must be at most 200 characters".into());
+    }
+    if authority.is_empty() || authority.starts_with(':') || authority.contains('@') {
+        return Err("needs a host and must not contain user info".into());
+    }
+    if url.contains(['?', '#']) {
+        return Err("must not contain a query or a fragment".into());
+    }
+    if url.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err("must not contain spaces or control characters".into());
+    }
+    Ok(url.to_string())
 }
 
 /// What [`Store::open_with`] did, for logging and for later start-up steps.
@@ -170,6 +200,7 @@ struct Inner {
     report: OpenReport,
     marker: PathBuf,
     request_retention: Duration,
+    public_url: Option<String>,
     sender: Mutex<Option<mpsc::Sender<WriteJob>>>,
     /// The writer returns whether its final checkpoint succeeded.
     writer: Mutex<Option<JoinHandle<bool>>>,
@@ -283,6 +314,7 @@ impl Store {
             marker.clone(),
             report,
             retention,
+            options.public_url.clone(),
             migration_list,
         );
         if started.is_err() && !unclean_shutdown {
@@ -297,6 +329,7 @@ impl Store {
         marker: PathBuf,
         mut report: OpenReport,
         request_retention: Duration,
+        public_url: Option<String>,
         migration_list: &[Migration],
     ) -> Result<Store, StoreError> {
         apply_pragmas(&conn, true)?;
@@ -333,6 +366,7 @@ impl Store {
                 report,
                 marker,
                 request_retention,
+                public_url,
                 sender: Mutex::new(Some(sender)),
                 writer: Mutex::new(Some(writer)),
             }),
@@ -355,6 +389,11 @@ impl Store {
     /// How long request ids are remembered; see [`request_log`].
     pub fn request_retention(&self) -> Duration {
         self.inner.request_retention
+    }
+
+    /// The configured public base URL, without a trailing slash.
+    pub fn public_url(&self) -> Option<&str> {
+        self.inner.public_url.as_deref()
     }
 
     /// Deletes one batch (at most [`request_log::PURGE_BATCH`]) of expired
@@ -898,6 +937,8 @@ mod tests_0011;
 #[cfg(test)]
 mod tests_0012;
 #[cfg(test)]
+mod tests_0013;
+#[cfg(test)]
 mod tests_actor;
 #[cfg(test)]
 mod tests_agents;
@@ -917,6 +958,8 @@ mod tests_invariants;
 mod tests_issues;
 #[cfg(test)]
 mod tests_links;
+#[cfg(test)]
+mod tests_prompt;
 #[cfg(test)]
 mod tests_request_log;
 #[cfg(test)]

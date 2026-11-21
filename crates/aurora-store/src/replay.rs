@@ -10,7 +10,9 @@
 //! archived), initiatives (name, status, target date), links, comments (issue,
 //! parent, author, mentions, edited, deleted; only the ones a reader sees),
 //! documents (parent, title, archived, revision, body length), document links
-//! and registered agents (name, user, triggers, limits, allowed projects).
+//! and registered agents (name, user, triggers, limits, allowed projects),
+//! the length of each project's rules text, and the prompt template overrides
+//! of each agent (project, issue type, text length).
 //!
 //! # What the events do not carry, so it is not compared
 //!
@@ -63,6 +65,11 @@ pub struct Snapshot {
     /// agent id -> agent, without the command, arguments and instructions: the
     /// log never holds them
     pub agents: BTreeMap<i64, AgentSnap>,
+    /// project id -> length of the project's rules text; only projects that have rules
+    pub rules: BTreeMap<i64, i64>,
+    /// (agent id, project key, issue type id) -> length of the prompt template
+    /// override; the text itself is never in the log
+    pub templates: BTreeMap<(i64, String, Option<i64>), i64>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -141,6 +148,16 @@ fn flag(value: &Value) -> Res<bool> {
     value
         .as_bool()
         .ok_or_else(|| format!("expected true or false, found {value}"))
+}
+
+/// Text the log keeps out of its payloads: `{"changed": true, "chars": n}`.
+fn text_length(value: &Value) -> Res<i64> {
+    if value["changed"] != Value::Bool(true) {
+        return Err(format!(
+            "expected {{\"changed\": true, \"chars\": n}}, found {value}"
+        ));
+    }
+    int(&value["chars"])
 }
 
 fn list(value: &Value) -> Res<&Vec<Value>> {
@@ -250,6 +267,32 @@ fn apply_registry(s: &mut Snapshot, e: &Event) -> Res<bool> {
         }
         "agent.deleted" => {
             s.agents.remove(&e.entity_id);
+            // The database deletes the agent's template overrides with it.
+            s.templates.retain(|(agent, _, _), _| *agent != e.entity_id);
+        }
+        "prompt_template.saved" => {
+            entry(&mut s.agents, e.entity_id, "agent")?;
+            if int(&p["agent_id"])? != e.entity_id {
+                return Err("the event names another agent than its entity".into());
+            }
+            let scope = (e.entity_id, text(&p["project"])?, p["issue_type"].as_i64());
+            let existed = s
+                .templates
+                .insert(scope, text_length(&p["body"])?)
+                .is_some();
+            if existed == flag(&p["created"])? {
+                return Err("the event's `created` does not match the log before it".into());
+            }
+        }
+        "prompt_template.deleted" => {
+            let scope = (
+                int(&p["agent_id"])?,
+                text(&p["project"])?,
+                p["issue_type"].as_i64(),
+            );
+            if s.templates.remove(&scope).is_none() || scope.0 != e.entity_id {
+                return Err("no such template override at this point of the log".into());
+            }
         }
         _ => return Ok(false),
     }
@@ -303,7 +346,18 @@ fn apply(s: &mut Snapshot, e: &Event) -> Res<()> {
                 .insert(pid, (text(&p["key"])?, text(&p["name"])?));
             s.columns.insert(pid, strings(&p["columns"])?);
         }
-        "project.updated" => entry(&mut s.projects, pid, "project")?.1 = text(&p["name"])?,
+        "project.updated" => {
+            let project = entry(&mut s.projects, pid, "project")?;
+            if let Some(name) = p.get("name") {
+                project.1 = text(name)?;
+            }
+            if let Some(rules) = p.get("rules") {
+                match text_length(rules)? {
+                    0 => s.rules.remove(&pid),
+                    chars => s.rules.insert(pid, chars),
+                };
+            }
+        }
         "column.created" => entry(&mut s.columns, pid, "project columns")?.push(text(&p["name"])?),
         "column.renamed" => {
             let names = entry(&mut s.columns, pid, "project columns")?;
@@ -713,15 +767,41 @@ pub fn table_snapshot(conn: &Connection) -> Result<Snapshot, StoreError> {
             agent.projects.push(key);
         }
     }
+
+    let mut stmt = conn.prepare("SELECT id, length(rules) FROM project WHERE rules IS NOT NULL")?;
+    for row in stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))? {
+        let (project, chars) = row?;
+        if chars > 0 {
+            s.rules.insert(project, chars);
+        }
+    }
+    let mut stmt = conn.prepare(
+        "SELECT t.agent_id, p.key, t.issue_type_id, length(t.body)
+         FROM prompt_template t JOIN project p ON p.id = t.project_id",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok((
+            (
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<i64>>(2)?,
+            ),
+            r.get::<_, i64>(3)?,
+        ))
+    })?;
+    for row in rows {
+        let (scope, chars) = row?;
+        s.templates.insert(scope, chars);
+    }
     Ok(s)
 }
 
 const MAX_DIFFS_PER_KIND: usize = 5;
 
-fn diff_map<V: Debug + PartialEq>(
+fn diff_map<K: Debug + Ord, V: Debug + PartialEq>(
     kind: &str,
-    from_log: &BTreeMap<i64, V>,
-    from_tables: &BTreeMap<i64, V>,
+    from_log: &BTreeMap<K, V>,
+    from_tables: &BTreeMap<K, V>,
     out: &mut Vec<String>,
 ) {
     let mut found = 0;
@@ -733,15 +813,17 @@ fn diff_map<V: Debug + PartialEq>(
     };
     for (id, expected) in from_log {
         match from_tables.get(id) {
-            None => note(format!("{kind} {id}: the log has it, the tables do not")),
+            None => note(format!("{kind} {id:?}: the log has it, the tables do not")),
             Some(actual) if actual != expected => note(format!(
-                "{kind} {id}: the log says {expected:?}, the tables say {actual:?}"
+                "{kind} {id:?}: the log says {expected:?}, the tables say {actual:?}"
             )),
             Some(_) => {}
         }
     }
     for id in from_tables.keys().filter(|id| !from_log.contains_key(id)) {
-        note(format!("{kind} {id}: the tables have it, the log does not"));
+        note(format!(
+            "{kind} {id:?}: the tables have it, the log does not"
+        ));
     }
     if found > MAX_DIFFS_PER_KIND {
         out.push(format!(
@@ -791,5 +873,17 @@ pub fn diff(from_log: &Snapshot, from_tables: &Snapshot) -> Vec<String> {
         &mut out,
     );
     diff_map("agent", &from_log.agents, &from_tables.agents, &mut out);
+    diff_map(
+        "rules length of project",
+        &from_log.rules,
+        &from_tables.rules,
+        &mut out,
+    );
+    diff_map(
+        "prompt template (agent, project, issue type)",
+        &from_log.templates,
+        &from_tables.templates,
+        &mut out,
+    );
     out
 }

@@ -31,7 +31,7 @@ async fn populated_version_ten_database_gets_an_empty_registry() {
 
     let store = Store::open(&path).unwrap();
     assert_eq!(store.schema_version(), crate::latest_version());
-    assert_eq!(store.schema_version(), 12);
+    assert_eq!(store.schema_version(), crate::latest_version());
     let backup = store.open_report().backup.clone().expect("backup taken");
     assert!(backup.starts_with(default_backup_dir(&path)));
 

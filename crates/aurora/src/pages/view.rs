@@ -17,6 +17,7 @@ use aurora_store::initiatives::{Health, Initiative, InitiativeStatus, Initiative
 use aurora_store::issues::{Issue, Priority};
 use aurora_store::links::{Blocker, IssueLinks, LinkedIssue};
 use aurora_store::projects::{Column, IssueType, Label, Project};
+use aurora_store::prompt::{TemplateSource, VariableInfo};
 use aurora_store::search::{Hit, Kind, Segment};
 use maud::{DOCTYPE, Markup, html};
 use serde_json::Value;
@@ -24,7 +25,7 @@ use serde_json::Value;
 use super::assets;
 use super::data::{
     ActivityData, AgentData, AgentsData, BoardData, CommentsData, DocumentData, DocumentsData,
-    HistoryData, HomeData, InitiativeData, InitiativesData, IssueData, RevisionData,
+    HistoryData, HomeData, InitiativeData, InitiativesData, IssueData, PromptData, RevisionData,
     SEARCH_PAGE_SIZE, SearchData, SearchOutcome,
 };
 use super::time::{utc_iso, utc_text};
@@ -1250,7 +1251,8 @@ fn agent_fields(agent: Option<&Agent>, projects: &[Project]) -> Markup {
         }
         div.field {
             label for="a-instructions" { "Instructions" }
-            textarea #a-instructions name="instructions" rows="6" maxlength="20000" {
+            textarea #a-instructions name="instructions" rows="6" maxlength="20000"
+                data-prompt-field {
                 "\n" (private.map_or("", |p| p.instructions.as_str()))
             }
         }
@@ -1350,6 +1352,186 @@ pub fn agents_page(data: &AgentsData) -> Markup {
     )
 }
 
+fn source_label(source: TemplateSource) -> &'static str {
+    match source {
+        TemplateSource::Builtin => "the built-in default",
+        TemplateSource::Agent => "the instructions of this agent",
+        TemplateSource::Project => "an override for the project",
+        TemplateSource::ProjectType => "an override for the project and issue type",
+        TemplateSource::Inline => "the text you typed",
+    }
+}
+
+/// What a click on a variable inserts: the variable, or for a list a loop.
+fn variable_snippet(variable: &VariableInfo) -> String {
+    match (variable.kind, variable.item) {
+        ("list", Some("text")) => {
+            format!("{{{{#each {}}}}}{{{{this}}}} {{{{/each}}}}", variable.name)
+        }
+        ("list", _) => format!("{{{{#each {}}}}}\n\n{{{{/each}}}}", variable.name),
+        _ => format!("{{{{{}}}}}", variable.name),
+    }
+}
+
+/// The "Prompt" section of the agent page. Owner only: the caller does not
+/// build it for anyone else, because template text is as private as the
+/// agent's instructions.
+fn prompt_section(projects: &[Project], prompt: &PromptData) -> Markup {
+    html! {
+        section.prompt #prompt {
+            h2 { "Prompt" }
+            p {
+                "The first message of a run is written from "
+                strong { (source_label(prompt.default_source)) }
+                " unless an override below applies."
+            }
+            p.hint {
+                "The most specific text wins: an override for a project and issue type, then "
+                "one for the project, then the Instructions field above (when it is not empty), "
+                "then the built-in default. Use the variables below to put the issue, the "
+                "comments and the trigger into the message."
+            }
+
+            h3 { "Overrides" }
+            @if prompt.templates.is_empty() {
+                p.empty { "No overrides." }
+            } @else {
+                ul.template-list {
+                    @for template in &prompt.templates {
+                        li {
+                            span.template-scope {
+                                (template.project)
+                                @if let Some(name) = &template.issue_type {
+                                    ", " (name)
+                                } @else {
+                                    ", any issue type"
+                                }
+                            }
+                            " "
+                            span.meta { (template.body.chars().count()) " characters" }
+                            " "
+                            button type="button" data-action="edit-template"
+                                data-project=(template.project)
+                                data-type-id=(template.issue_type_id.map(|id| id.to_string()).unwrap_or_default())
+                                data-body=(template.body) { "Edit" }
+                            button type="button" data-action="delete-template"
+                                data-template-id=(template.id) { "Delete" }
+                        }
+                    }
+                }
+            }
+            form.prompt-form data-form="save-template" {
+                div.field {
+                    label for="t-project" { "Project" }
+                    select #t-project name="project" required {
+                        @for project in projects {
+                            option value=(project.key) { (project.key) " \u{2013} " (project.name) }
+                        }
+                    }
+                }
+                div.field {
+                    label for="t-type" { "Issue type" }
+                    select #t-type name="issue_type_id" {
+                        option value="" { "Any issue type" }
+                        @for (key, types) in &prompt.issue_types {
+                            @for kind in types {
+                                option value=(kind.id) data-project=(key) { (key) ": " (kind.name) }
+                            }
+                        }
+                    }
+                }
+                div.field {
+                    label for="t-body" { "Override text" }
+                    textarea #t-body name="body" rows="10" maxlength="20000" required
+                        spellcheck="false" data-prompt-field { "\n" }
+                }
+                div.row {
+                    button.primary type="submit" { "Save override" }
+                    button type="button" data-action="preview-prompt" data-source="#t-body" {
+                        "Preview this text"
+                    }
+                    button type="button" data-action="clear-template-form" { "Clear" }
+                }
+                p.field-msg role="alert" {}
+            }
+
+            h3 { "Preview" }
+            p.hint {
+                "Shows the exact message a run would start with, for one issue. Nothing is "
+                "started or saved. The working copy and the run id are empty in a preview."
+            }
+            div.prompt-preview {
+                div.field {
+                    label for="pv-project" { "Project" }
+                    select #pv-project {
+                        @for project in projects {
+                            option value=(project.key) { (project.key) }
+                        }
+                    }
+                }
+                div.field {
+                    label for="pv-number" { "Issue number" }
+                    input #pv-number type="number" min="1" value="1" inputmode="numeric";
+                }
+                div.field {
+                    label for="pv-trigger" { "Started because" }
+                    select #pv-trigger {
+                        option value="manual" { "a person started it" }
+                        option value="assigned" { "the issue was assigned" }
+                        option value="mentioned" { "the agent was mentioned" }
+                        option value="schedule" { "a schedule" }
+                    }
+                }
+                div.row {
+                    button type="button" data-action="preview-prompt" data-source="stored" {
+                        "Preview as saved"
+                    }
+                    button type="button" data-action="preview-prompt" data-source="#a-instructions" {
+                        "Preview the Instructions text"
+                    }
+                }
+                p.field-msg #pv-msg role="alert" {}
+                p.meta #pv-meta {}
+                pre.prompt-text #pv-text hidden {}
+            }
+
+            h3 { "Variables" }
+            p.hint {
+                "Click a variable to insert it at the cursor of the text field you used last. "
+                "Write {{#if name}}...{{else}}...{{/if}} for a condition and "
+                "{{#each list}}...{{/each}} for a list; a value is never read as template text."
+            }
+            ul.var-list {
+                @for variable in &prompt.variables {
+                    li {
+                        button.var type="button" data-action="insert-variable"
+                            data-text=(variable_snippet(variable)) title=(variable.description) {
+                            code { (variable.name) }
+                        }
+                        " "
+                        span.meta { (variable.kind) ": " (variable.description) }
+                        @if variable.kind != "list" {
+                            " "
+                            button.var type="button" data-action="insert-variable"
+                                data-text=(format!("{{{{#if {}}}}}\n\n{{{{/if}}}}", variable.name)) {
+                                "if"
+                            }
+                        }
+                        @for field in &variable.fields {
+                            " "
+                            button.var type="button" data-action="insert-variable"
+                                data-text=(format!("{{{{this.{}}}}}", field.name))
+                                title=(field.description) {
+                                code { "this." (field.name) }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 pub fn agent_page(data: &AgentData) -> Markup {
     let agent = &data.agent;
     let mut frame = Frame::new(&agent.name, "agent");
@@ -1381,6 +1563,9 @@ pub fn agent_page(data: &AgentData) -> Markup {
                         (agent_fields(Some(agent), &data.projects))
                         div.row { button.primary type="submit" { "Save" } }
                         p.field-msg role="alert" {}
+                    }
+                    @if let Some(prompt) = &data.prompt {
+                        (prompt_section(&data.projects, prompt))
                     }
                     h2 { "Keys" }
                     @if data.keys.is_empty() {

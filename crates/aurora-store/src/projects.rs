@@ -12,6 +12,7 @@ use serde_json::{Value, json};
 
 use crate::StoreError;
 use crate::auth::Principal;
+use crate::issues::present;
 
 /// Why a request was refused. Nothing was changed.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -106,6 +107,21 @@ pub struct Project {
     pub key: String,
     pub name: String,
     pub created: i64,
+    /// The project's rules text, shown to agents; empty when there are none.
+    pub rules: String,
+}
+
+/// The longest rules text of a project.
+pub const MAX_RULES_CHARS: usize = 10_000;
+
+/// Only the fields that are present change.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectPatch {
+    pub name: Option<String>,
+    /// `null` or blank text clears the rules.
+    #[serde(default, deserialize_with = "present")]
+    pub rules: Option<Option<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -169,8 +185,11 @@ fn project_row(row: &Row<'_>) -> rusqlite::Result<Project> {
         key: row.get(1)?,
         name: row.get(2)?,
         created: row.get(3)?,
+        rules: row.get(4)?,
     })
 }
+
+const PROJECT_SELECT: &str = "SELECT id, key, name, created, COALESCE(rules, '') FROM project";
 
 fn column_row(row: &Row<'_>) -> rusqlite::Result<Column> {
     Ok(Column {
@@ -290,7 +309,7 @@ pub(crate) fn emit_as(
 
 pub fn get_project(conn: &Connection, key: &str) -> Result<Project, StoreError> {
     conn.query_row(
-        "SELECT id, key, name, created FROM project WHERE key = ?1",
+        &format!("{PROJECT_SELECT} WHERE key = ?1"),
         [key],
         project_row,
     )
@@ -299,7 +318,7 @@ pub fn get_project(conn: &Connection, key: &str) -> Result<Project, StoreError> 
 }
 
 pub fn list_projects(conn: &Connection) -> Result<Vec<Project>, StoreError> {
-    let mut stmt = conn.prepare("SELECT id, key, name, created FROM project ORDER BY id")?;
+    let mut stmt = conn.prepare(&format!("{PROJECT_SELECT} ORDER BY id"))?;
     let rows = stmt.query_map([], project_row)?;
     Ok(rows.collect::<Result<_, _>>()?)
 }
@@ -363,13 +382,70 @@ pub fn rename_project(
     key: &str,
     name: &str,
 ) -> Result<Project, StoreError> {
-    let name = clean_name("project", name)?;
+    let patch = ProjectPatch {
+        name: Some(name.to_string()),
+        rules: None,
+    };
+    update_project(tx, now, actor, key, patch)
+}
+
+/// `None` for blank text: a project without rules stores NULL.
+fn clean_rules(rules: Option<&str>) -> Result<Option<String>, StoreError> {
+    let Some(rules) = rules.filter(|text| !text.trim().is_empty()) else {
+        return Ok(None);
+    };
+    if rules.chars().count() > MAX_RULES_CHARS || rules.contains('\0') {
+        return Err(invalid(format!(
+            "rules must be at most {MAX_RULES_CHARS} characters without NUL"
+        )));
+    }
+    Ok(Some(rules.to_string()))
+}
+
+/// Changes the name and/or the rules. One `project.updated` event, with
+/// `{name, previous_name}` when the name changed and `{rules: {changed: true,
+/// chars}}` when the rules changed (the text itself is never logged). Nothing
+/// is written, and no event, when nothing differs.
+pub fn update_project(
+    tx: &Transaction<'_>,
+    now: i64,
+    actor: &Principal,
+    key: &str,
+    patch: ProjectPatch,
+) -> Result<Project, StoreError> {
+    if patch.name.is_none() && patch.rules.is_none() {
+        return Err(invalid("give a name, rules or both"));
+    }
+    let name = patch
+        .name
+        .as_deref()
+        .map(|name| clean_name("project", name))
+        .transpose()?;
+    let rules = match &patch.rules {
+        Some(rules) => Some(clean_rules(rules.as_deref())?),
+        None => None,
+    };
     let mut project = get_project(tx, key)?;
-    if project.name != name {
+    let mut payload = serde_json::Map::new();
+    if let Some(name) = name.filter(|name| *name != project.name) {
         tx.execute(
             "UPDATE project SET name = ?1 WHERE id = ?2",
             params![name, project.id],
         )?;
+        payload.insert("name".into(), json!(name));
+        payload.insert("previous_name".into(), json!(project.name));
+        project.name = name;
+    }
+    if let Some(rules) = rules.filter(|rules| rules.as_deref().unwrap_or("") != project.rules) {
+        tx.execute(
+            "UPDATE project SET rules = ?1 WHERE id = ?2",
+            params![rules, project.id],
+        )?;
+        let chars = rules.as_deref().map_or(0, |text| text.chars().count());
+        payload.insert("rules".into(), json!({ "changed": true, "chars": chars }));
+        project.rules = rules.unwrap_or_default();
+    }
+    if !payload.is_empty() {
         emit(
             tx,
             now,
@@ -378,9 +454,8 @@ pub fn rename_project(
             "project",
             project.id,
             "project.updated",
-            &json!({ "name": name, "previous_name": project.name }),
+            &Value::Object(payload),
         )?;
-        project.name = name;
     }
     Ok(project)
 }
@@ -680,6 +755,7 @@ pub fn delete_issue_type(
             issue_type.name
         )));
     }
+    crate::prompt::templates::ensure_type_unused(tx, id)?;
     tx.execute("DELETE FROM issue_type WHERE id = ?1", [id])
         .map_err(|err| {
             refusal(err, || {

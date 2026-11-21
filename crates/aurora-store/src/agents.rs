@@ -46,7 +46,12 @@
 //!   `on_mention`, `enabled`, `max_concurrent`, `timeout_seconds` and
 //!   `projects`; `{"changed": true}` for `description`, `command`, `args`,
 //!   `model`, `instructions` and `work_dir`
-//! * `agent.deleted` `{name, user_id}`; the user and its keys stay
+//! * `agent.deleted` `{name, user_id}`; the user and its keys stay, the agent's
+//!   prompt template overrides go with it
+//!
+//! The `instructions` are the agent's default prompt template (see
+//! [`crate::prompt`]) and must pass its validation: plain text is always valid,
+//! unknown `{{variables}}` and unbalanced blocks are refused.
 
 use rusqlite::types::Type;
 use rusqlite::{Connection, OptionalExtension, Row, Transaction, params};
@@ -210,6 +215,8 @@ fn clean_instructions(text: &str) -> Result<String, StoreError> {
             "instructions must be at most {MAX_INSTRUCTIONS_CHARS} characters without NUL"
         )));
     }
+    // The instructions are the agent's default prompt template.
+    crate::prompt::check_template("instructions", text)?;
     Ok(text.to_string())
 }
 

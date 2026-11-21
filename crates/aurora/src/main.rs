@@ -43,6 +43,7 @@ async fn run(config: Config) -> Result<()> {
         backup_dir: config.backup_dir.clone(),
         allow_unsafe_location: config.allow_unsafe_location,
         request_retention: config.request_retention,
+        public_url: config.public_url.clone(),
     };
     let store = Store::open_with(&config.db_path, &options)?;
     let report = store.open_report();

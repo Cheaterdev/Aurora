@@ -62,6 +62,9 @@ Any other client needs the same two things: the URL and the header
   `list_projects` and `search` show only allowed projects. If the agent is
   disabled every request is `403` "agent is disabled". Humans and agent users
   without a registry entry are not restricted.
+* Prompt templates (the first message of a run) and the preview are REST only;
+  no MCP tool reads or changes them, so an agent cannot rewrite its own
+  instructions. See "Prompt templates" in `docs/api.md`.
 
 ## Errors
 

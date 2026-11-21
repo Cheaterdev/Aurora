@@ -72,6 +72,11 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         name: "request_log",
         sql: include_str!("../migrations/0012_request_log.sql"),
     },
+    Migration {
+        version: 13,
+        name: "prompt_templates",
+        sql: include_str!("../migrations/0013_prompt_templates.sql"),
+    },
 ];
 
 /// The schema version this binary produces and understands.

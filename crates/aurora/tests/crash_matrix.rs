@@ -660,8 +660,6 @@ fn backup_version(backup: &Path) -> i64 {
 
 #[test]
 fn a_crash_mid_migration_of_a_database_with_data_is_finished_by_the_restart() {
-    use aurora_store::auth::{Principal, Role, Scope};
-
     let dir = tempfile::tempdir().expect("temp dir");
     let db = dir.path().join("aurora.db");
     let older = aurora_store::latest_version() - 1;
@@ -673,22 +671,24 @@ fn a_crash_mid_migration_of_a_database_with_data_is_finished_by_the_restart() {
         let key = common::owner_key(&store).await;
         store
             .write(|tx| {
-                let owner = Principal {
-                    user_id: 1,
-                    role: Role::Owner,
-                    scope: Scope::Write,
-                };
-                aurora_store::projects::create_project(tx, 1, &owner, "TRK", "Tracker", None)?;
-                aurora_store::projects::create_issue_type(tx, 1, &owner, "TRK", "Task")?;
-                aurora_store::issues::create_issue(
-                    tx,
-                    2,
-                    &owner,
-                    "TRK",
-                    aurora_store::issues::NewIssue {
-                        title: "from the old release".into(),
-                        ..Default::default()
-                    },
+                // Written as the old release did, in SQL: the current project
+                // reader asks for columns the old schema does not have.
+                tx.execute_batch(
+                    "INSERT INTO project (id, key, name, created, next_issue_number) VALUES (1, 'TRK', 'Tracker', 1, 2);
+                     INSERT INTO \"column\" (project_id, name, state_type, position)
+                         VALUES (1, 'Todo', 'unstarted', 0), (1, 'Done', 'completed', 1);
+                     INSERT INTO event (time, actor_id, project_id, entity_kind, entity_id, kind, payload_json)
+                         VALUES (1, 1, 1, 'project', 1, 'project.created',
+                                 '{\"key\":\"TRK\",\"name\":\"Tracker\",\"columns\":[\"Todo\",\"Done\"]}');
+                     INSERT INTO issue_type (id, project_id, name) VALUES (1, 1, 'Task');
+                     INSERT INTO event (time, actor_id, project_id, entity_kind, entity_id, kind, payload_json)
+                         VALUES (1, 1, 1, 'issue_type', 1, 'issue_type.created', '{\"name\":\"Task\"}');
+                     INSERT INTO issue (id, project_id, number, type_id, column_id, title, position, created, updated)
+                         VALUES (1, 1, 1, 1, (SELECT id FROM \"column\" WHERE name = 'Todo'),
+                                 'from the old release', 1.0, 2, 2);
+                     INSERT INTO event (time, actor_id, project_id, entity_kind, entity_id, kind, payload_json)
+                         VALUES (2, 1, 1, 'issue', 1, 'issue.created',
+                                 '{\"number\":1,\"identifier\":\"TRK-1\",\"title\":\"from the old release\",\"type_id\":1,\"column_id\":1,\"parent\":null,\"assignee_id\":null,\"initiative\":null,\"priority\":null,\"labels\":[]}');",
                 )?;
                 Ok(())
             })

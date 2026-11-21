@@ -11,6 +11,7 @@ use aurora_store::initiatives::{self, Initiative, InitiativeDetail, InitiativeVi
 use aurora_store::issues::{self, Issue, IssueDetail, IssueFilter};
 use aurora_store::links::{self, Blocker};
 use aurora_store::projects::{self, Column, IssueType, Label, Project};
+use aurora_store::prompt::{self, PromptTemplate, TemplateSource, VariableInfo};
 use aurora_store::rusqlite::Connection;
 use aurora_store::search::{self, Kind, SearchQuery, SearchResults};
 use aurora_store::{Rejection, StoreError, now_millis};
@@ -221,6 +222,17 @@ pub struct AgentData {
     pub projects: Vec<Project>,
     /// Only the owner may list another user's keys.
     pub keys: Vec<ApiKey>,
+    /// Template text is owner-only, so these stay empty for everyone else.
+    pub prompt: Option<PromptData>,
+}
+
+/// What the "Prompt" section of the agent page shows.
+pub struct PromptData {
+    pub default_source: TemplateSource,
+    pub templates: Vec<PromptTemplate>,
+    /// Issue types per project key, for the override form.
+    pub issue_types: Vec<(String, Vec<IssueType>)>,
+    pub variables: Vec<VariableInfo>,
 }
 
 pub fn load_agents(conn: &Connection, reader: &Principal) -> Result<AgentsData, StoreError> {
@@ -239,12 +251,31 @@ pub fn load_agent(conn: &Connection, reader: &Principal, id: i64) -> Result<Agen
     } else {
         Vec::new()
     };
+    let all_projects = projects::list_projects(conn)?;
+    let prompt = if reader.is_owner() {
+        let mut issue_types = Vec::new();
+        for project in &all_projects {
+            issue_types.push((
+                project.key.clone(),
+                projects::list_issue_types(conn, &project.key)?,
+            ));
+        }
+        Some(PromptData {
+            default_source: prompt::agent_default_source(conn, id)?,
+            templates: prompt::list_templates(conn, reader, id)?,
+            issue_types,
+            variables: prompt::variable_catalogue(),
+        })
+    } else {
+        None
+    };
     Ok(AgentData {
         user: auth::get_user(conn, reader.user_id)?,
         owner: reader.is_owner(),
         agent,
-        projects: projects::list_projects(conn)?,
+        projects: all_projects,
         keys,
+        prompt,
     })
 }
 

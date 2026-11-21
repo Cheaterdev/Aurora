@@ -130,8 +130,9 @@ applying it twice.
   If the first response was lost, rotate the key (or create another) with a new
   id.
 * **Not covered.** `POST /setup` and `POST /auth/sign-in` (public, no id),
-  `POST /auth/sign-out` and `POST /projects/{key}/documents/preview` (nothing to
-  repeat): the header is ignored there, even a malformed one. The web pages'
+  `POST /auth/sign-out`, `POST /projects/{key}/documents/preview` and
+  `POST /agents/{id}/prompt-preview` (nothing to repeat): the header is ignored
+  there, even a malformed one. The web pages'
   forms use session cookies and do not take ids.
 
 ## Index
@@ -198,7 +199,8 @@ through its keys). `201` with the user. `409` if the name is taken.
 
 ## Projects
 
-A project is `{id, key, name, created}`.
+A project is `{id, key, name, created, rules}`. `rules` is the project's own
+rules text for agents (empty when there is none; see Prompt templates).
 
 ### `GET /api/v1/projects`
 
@@ -218,7 +220,13 @@ The project.
 
 ### `PATCH /api/v1/projects/{key}`
 
-Body `{"name"}`. `200` with the project.
+Body: `name` and/or `rules`; only the fields present change, and at least one
+is required (`422` otherwise). `rules` is free text of at most 10000
+characters that the default prompt template shows to agents under "Project
+rules"; `null` or blank clears it. A request that changes nothing writes no
+event. The key cannot be changed. `200` with the project, `404`, `422`.
+The `project.updated` event carries the new name, and for the rules only
+`{"rules": {"changed": true, "chars": n}}`, never the text.
 
 ### `GET /api/v1/projects/{key}/columns`
 
@@ -537,7 +545,8 @@ patch that changes nothing writes nothing and emits no event.
 ### `DELETE /api/v1/agents/{id}`
 
 Owner only. Removes the registry entry only: the agent user and its keys stay,
-and the user is no longer restricted (see Authentication). `204`.
+and the user is no longer restricted (see Authentication). The agent's prompt
+template overrides go with it. `204`.
 
 ### `POST /api/v1/agents/{id}/enable`
 
@@ -548,6 +557,176 @@ Owner only. `200` with the agent; repeating it changes nothing.
 Owner only. `200` with the agent. The agent's keys then get `403` "agent is
 disabled" on everything except `GET /api/v1/auth/me`, and no run is started
 for it. Repeating it changes nothing.
+
+## Prompt templates
+
+The first message of a run is rendered from a template, so an agent starts
+with the issue, why it was started, the recent comments, the open blockers and
+the project's rules, and a person can change what it says. The pieces that do
+not need a run exist now: the template language, storage, resolution, the
+preview and the variable catalogue. Starting a run with the rendered text is
+the runner's job (TRK-15); it calls one function,
+`aurora_store::prompt::render_prompt`, and stores what it returns.
+
+**Which template applies**, most specific first:
+
+1. the agent's override for the issue's project and issue type,
+2. the agent's override for the issue's project,
+3. the agent's own `instructions`, unless blank,
+4. the built-in default (`default_template` of `GET /prompt/variables`).
+
+An override always names a project, because an issue type belongs to a project;
+the agent-wide default is the `instructions` field of the agent. There is one
+override per (agent, project) and one per (agent, project, issue type).
+Overrides and instructions are owner-only text: members and agent keys cannot
+read or change them (`403`), and events carry only their length, never the
+text. Deleting an issue type that an override points at is refused with `409`.
+
+**The language.** Plain text with tags in double braces:
+
+| Tag | Meaning |
+|---|---|
+| `{{name}}` | Inserts a variable (see the table below). Numbers and booleans are written as `12`, `true`. |
+| `{{#if name}}...{{else}}...{{/if}}` | Renders the first part when the value is true: a non-empty text or list, `true`, or a number other than 0. `{{else}}` is optional. |
+| `{{#each list}}...{{/each}}` | Repeats the body for each item. Inside, `{{this}}` is the item of a text list, `{{this.field}}` a field of a record item, `{{@index}}` the position from 0. `this` is always the innermost loop. |
+| `{{!-- note --}}` | A comment; dropped. |
+| `\{{` | A literal `{{`. |
+
+A block tag or comment alone on its line removes the whole line, so templates
+can be laid out readably. There are no expressions, comparisons or includes,
+and nothing is executed. The output is plain text and is not escaped.
+**A value is inserted as it is and is never scanned again**: an issue
+description that contains `{{issue.title}}` stays that text, so nobody can
+inject tags through an issue or a comment.
+
+**Validation** is strict and names the problem with its line and column in the
+`422` message, for example "unknown variable `issue.titel`; see the list of
+available variables (line 2, column 4)". It catches unknown variables or
+fields, a list printed as text, `this` or `@index` outside a loop, an unclosed
+or unmatched block, more than one `{{else}}`, and tags that are not tags.
+Instructions are validated the same way when an agent is created or updated,
+and a saved template is always valid (the `prompt_templates.valid` check of
+`aurora check` proves it).
+
+**Limits.** A template has at most 20000 characters and blocks nest at most 4
+deep. The rendered message has at most 200000 characters. The context is
+bounded too: the last 30 comments that are not deleted (each cut at 4000
+characters, with `comments.omitted` counting the older ones) and at most 100
+items in any other list. When the message would be longer than the limit it is
+not refused but shortened, largest first: the longest text among all values is
+repeatedly halved (never below 200 characters) and ends with `… [truncated]`
+until the message fits; only a template that is too long by itself (a loop
+over a loop) has its output cut at the limit with the same marker. `truncated`
+in the result says that anything was cut or left out, including comments and
+list items beyond the bounds.
+
+**Variables.** Names are flat, with dots (`issue.title`, `trigger.comment`).
+`GET /prompt/variables` serves this table from the code that validates
+templates, and a test checks that every name is listed here.
+
+| Variable | Type | Meaning |
+|---|---|---|
+| `issue.key` | text | The issue key, e.g. `TRK-12`. |
+| `issue.number` | number | The issue number within its project. |
+| `issue.title` | text | The issue title. |
+| `issue.description` | text | The description (may be empty). |
+| `issue.type` | text | The issue type's name. |
+| `issue.column` | text | The name of the issue's column. |
+| `issue.state_type` | text | `backlog`, `unstarted`, `started`, `completed` or `canceled`. |
+| `issue.priority` | text | `urgent`, `high`, `medium`, `low`; empty when none. |
+| `issue.assignee` | text | The assignee's name; empty when unassigned. |
+| `issue.labels` | list of text | The label names (`{{this}}`). |
+| `issue.parent` | text | The parent's key; empty for a top-level issue. |
+| `issue.children` | list | Sub-issues not archived; items have `key`, `title`, `state_type`. |
+| `issue.url` | text | The issue's page: absolute with a public URL, otherwise `/p/KEY/N`. |
+| `project.key` | text | The project key. |
+| `project.name` | text | The project name. |
+| `project.rules` | text | The project's rules text (may be empty). |
+| `initiative.name` | text | The issue's initiative; empty when none. |
+| `comments` | list | The last 30 comments not deleted, oldest first; items have `author`, `kind` (`human` or `agent`), `created` (ISO-8601 UTC), `body`, `is_trigger`. |
+| `comments.omitted` | number | How many older comments are not in `comments`. |
+| `links.blocks` | list | Issues this issue blocks; items as `issue.children`. |
+| `links.blocked_by` | list | Issues that block this one, finished or not. |
+| `links.related` | list | Related issues. |
+| `blockers` | list | Only the blockers still open (not completed, canceled or archived). |
+| `documents` | list | Documents linked to the issue, not archived; items have `title`, `id`. |
+| `trigger` | text | Why the run started: `assigned`, `mentioned`, `schedule` or `manual`. |
+| `trigger.assigned` | boolean | True for an assignment. |
+| `trigger.mentioned` | boolean | True for a mention. |
+| `trigger.schedule` | boolean | True for a schedule. |
+| `trigger.manual` | boolean | True when a person started the run. |
+| `trigger.comment` | text | The comment that mentioned the agent; empty otherwise. |
+| `trigger.actor` | text | Who caused the run; empty when unknown. |
+| `agent.name` | text | The agent's name. |
+| `workdir` | text | The run's working copy; empty until one is provided. |
+| `run.id` | text | The run's id; empty in a preview. |
+| `server.url` | text | The MCP endpoint: absolute with a public URL, otherwise `/mcp`. |
+| `now` | text | The current time, ISO-8601 UTC. |
+
+Links are absolute only when the server is started with `--public-url <url>`
+(or `AURORA_PUBLIC_URL`), an `http` or `https` address without user info, query
+or fragment; a trailing slash is dropped. Otherwise they stay relative.
+
+**What the runner supplies (TRK-15, TRK-17).** `render_prompt(conn, now,
+&PromptRequest)` takes the agent, the issue (`project` key and `number`), the
+trigger (`TriggerCtx`: kind, optional mentioning comment, optional actor),
+`workdir`, `run_id`, `public_url` and, when a person edited the message by
+hand, `override_template`. It is read-only, runs a fixed number of queries and
+returns `{text, chars, template_source, template_id, truncated,
+variables_used}`; the run stores exactly that text and `template_source` /
+`template_id`, so a later edit of the template never changes what a past run
+was told. It fails with `404` (unknown agent, project or issue) or `422` (the
+comment is not on the issue, or the stored template no longer validates).
+No run table exists yet: storing the text, showing it on the run and a
+"start with an edited message" input belong to those tasks.
+
+### `GET /api/v1/agents/{id}/templates`
+
+Owner only (`403`). `{"default_source": "builtin" | "agent", "templates": [...]}`
+where `default_source` says what applies when no override matches, and each
+template is `{id, agent_id, project, issue_type_id, issue_type, body, created,
+updated}` ordered by project key, the project-wide override before the
+per-type ones. `404` for an unknown agent.
+
+### `PUT /api/v1/agents/{id}/templates`
+
+Owner only. Body `{"project": "KEY", "issue_type_id"?: n, "body": "..."}`
+creates the override for that scope (`201`) or replaces its text (`200`), with
+the template as the body. Saving the text that is already stored writes
+nothing. Takes a request id (see Idempotency). `403`, `404` for an unknown
+agent, `422` for an unknown project or issue type, an issue type of another
+project, an empty text, more than 20000 characters or a template that does not
+validate (the message has the line and column). One `prompt_template.saved`
+event with `{agent_id, project, issue_type, created, body: {changed, chars}}`.
+
+### `DELETE /api/v1/agents/{id}/templates/{template_id}`
+
+Owner only. `204`; `404` when the template does not exist or is another
+agent's. One `prompt_template.deleted` event. Takes a request id.
+
+### `POST /api/v1/agents/{id}/prompt-preview`
+
+The exact message a run of this agent would get for an issue, without
+starting anything. Owners and members may ask; an agent's key gets `403`.
+Body `{"project": "KEY", "number": n, "trigger"?: "assigned" | "mentioned" |
+"schedule" | "manual" (default "manual"), "comment_id"?: n, "template"?:
+"..."}`; `template` renders that text instead of the stored one (an unsaved
+edit). `200` with `{text, chars, template_source, template_id, truncated,
+variables_used}` where `template_source` is `builtin`, `agent`, `project`,
+`project_type` or `inline`. `404` for an unknown agent, project or issue,
+`422` for a template that does not validate (with line and column), an unknown
+trigger, or a `comment_id` that is not a comment of the issue. It changes
+nothing, writes no event and ignores a request id. `workdir` and `run.id` are
+empty in a preview. It is a `POST`, so a key with read scope cannot use it.
+
+### `GET /api/v1/prompt/variables`
+
+Any signed-in user. `{"variables": [...], "limits": {...},
+"default_template": "..."}`: each variable is `{name, type, description,
+example}` with `type` one of `text`, `number`, `boolean`, `list`; a list also
+has `item` (`text` or `record`) and, for records, `fields: [{name, type,
+description}]`. `limits` has `max_template_chars`, `max_depth`,
+`max_output_chars`, `max_comments` and `max_comment_chars`.
 
 ## Search
 

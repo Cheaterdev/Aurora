@@ -43,6 +43,7 @@ command exits with 2 and says so; check a copy then.
 | `consumers.cursors` | no consumer cursor is beyond the newest event |
 | `request_log.rows` | every remembered request id belongs to an existing user and a `2xx` response |
 | `search.index` | the full-text index holds exactly the issues, comments and documents that should be in it |
+| `prompt_templates.valid` | every stored prompt template parses and uses only known variables, and its issue type belongs to its project, so a run can never start from a template that fails validation |
 | `runs.no_orphans` | **vacuous today**: there is no run table until TRK-15; the slot exists so the runner tasks fill it in |
 
 About `events.ids`: `AUTOINCREMENT` guarantees ids only grow and are never
@@ -57,11 +58,14 @@ labels, issues (project, number, title, type, column, assignee, parent,
 initiative, priority, labels, archived), initiatives (name, status, target
 date), links, comments (issue, parent, author, mentions, edited, deleted),
 documents (parent, title, archived, revision, body length), document links and
-agents (name, user, triggers, limits, allowed projects). An event kind the
+agents (name, user, triggers, limits, allowed projects), the length of each
+project's rules text and each agent's prompt template overrides (project,
+issue type, text length). An event kind the
 replay does not know is a failure on purpose: a new kind must be taught to
 `aurora_store::replay`. **Not covered**, because events do not carry it:
 descriptions, comment and document body text (only the revision chain is
-checked), the order of columns and of issues within a column, timestamps, the
+checked), the text of prompt templates and project rules (only their length),
+the order of columns and of issues within a column, timestamps, the
 agent's command and instructions, users, API keys, sessions. The backups
 folder is not inspected.
 

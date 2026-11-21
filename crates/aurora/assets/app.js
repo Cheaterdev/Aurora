@@ -308,6 +308,19 @@
       removeDocumentLink(button);
     } else if (action === 'restore-revision') {
       restoreRevision(button);
+    } else if (action === 'edit-template') {
+      editTemplate(button);
+    } else if (action === 'delete-template') {
+      if (!window.confirm('Delete this override? The agent falls back to the next template.')) { return; }
+      agentAction(button, function () {
+        return api('DELETE', agentPath() + '/templates/' + button.dataset.templateId);
+      }, function () { location.reload(); });
+    } else if (action === 'clear-template-form') {
+      clearTemplateForm(button.closest('form'));
+    } else if (action === 'insert-variable') {
+      insertVariable(button.dataset.text);
+    } else if (action === 'preview-prompt') {
+      previewPrompt(button);
     } else if (action === 'reload-page') {
       location.reload();
     }
@@ -396,7 +409,106 @@
     });
   }
 
+  // ---- prompt section of the agent page ----
+
+  var lastPromptField = null;
+
+  document.addEventListener('focusin', function (event) {
+    if (event.target.matches && event.target.matches('[data-prompt-field]')) { lastPromptField = event.target; }
+  });
+
+  // Only the issue types of the chosen project can be picked.
+  function filterTypes() {
+    var chosen = $('#t-project');
+    var types = $('#t-type');
+    if (!chosen || !types) { return; }
+    $$('option[data-project]', types).forEach(function (option) {
+      var match = option.dataset.project === chosen.value;
+      option.hidden = !match;
+      option.disabled = !match;
+    });
+    var selected = types.options[types.selectedIndex];
+    if (selected && selected.disabled) { types.value = ''; }
+  }
+
+  document.addEventListener('change', function (event) {
+    if (event.target.id === 't-project') { filterTypes(); }
+  });
+
+  function editTemplate(button) {
+    var form = $('form[data-form="save-template"]');
+    if (!form) { return; }
+    form.elements.project.value = button.dataset.project;
+    filterTypes();
+    form.elements.issue_type_id.value = button.dataset.typeId || '';
+    form.elements.body.value = button.dataset.body;
+    message($('.field-msg', form), '');
+    form.elements.body.focus();
+    lastPromptField = form.elements.body;
+  }
+
+  function clearTemplateForm(form) {
+    form.elements.body.value = '';
+    form.elements.issue_type_id.value = '';
+    message($('.field-msg', form), '');
+  }
+
+  function insertVariable(text) {
+    var field = lastPromptField && document.contains(lastPromptField) ? lastPromptField : $('#t-body');
+    if (!field || !text) { return; }
+    var start = field.selectionStart === undefined ? field.value.length : field.selectionStart;
+    var end = field.selectionEnd === undefined ? start : field.selectionEnd;
+    field.value = field.value.slice(0, start) + text + field.value.slice(end);
+    var caret = start + text.length;
+    field.focus();
+    field.setSelectionRange(caret, caret);
+    lastPromptField = field;
+  }
+
+  function previewPrompt(button) {
+    var out = $('#pv-msg');
+    var meta = $('#pv-meta');
+    var shown = $('#pv-text');
+    var payload = {
+      project: $('#pv-project').value,
+      number: Number($('#pv-number').value),
+      trigger: $('#pv-trigger').value
+    };
+    var source = button.dataset.source;
+    if (!payload.project || !payload.number) {
+      message(out, 'Choose a project and an issue number.', 'error');
+      return;
+    }
+    if (source !== 'stored') {
+      payload.template = $(source).value;
+      if (payload.template.trim() === '') {
+        message(out, 'That text is empty. "Preview as saved" shows what applies now.', 'error');
+        return;
+      }
+    }
+    button.disabled = true;
+    message(out, '');
+    api('POST', agentPath() + '/prompt-preview', payload).then(function (made) {
+      // textContent: the message holds issue and comment text and is never markup.
+      shown.textContent = made.text;
+      shown.hidden = false;
+      meta.textContent = made.chars + ' characters, written from ' + made.template_source.replace('_', ' ') +
+        (made.truncated ? '. Parts were shortened to fit the limits.' : '.');
+      button.disabled = false;
+    }, function (err) {
+      shown.hidden = true;
+      meta.textContent = '';
+      message(out, err.message, 'error');
+      button.disabled = false;
+    });
+  }
+
   var formHandlers = {
+    'save-template': function (form) {
+      var payload = { project: form.elements.project.value, body: form.elements.body.value };
+      if (form.elements.issue_type_id.value) { payload.issue_type_id = Number(form.elements.issue_type_id.value); }
+      return api('PUT', agentPath() + '/templates', payload).then(function () { location.reload(); });
+    },
     'new-agent': function (form) {
       var payload = agentPayload(form, true);
       payload.name = form.elements.name.value.trim();

@@ -235,6 +235,7 @@ struct World {
     agent_delete: i64,
     agent_off: i64,
     agent_on: i64,
+    template_delete: i64,
     key_rotate: i64,
     key_revoke: i64,
 }
@@ -400,6 +401,13 @@ async fn build_world(s: &Server) -> World {
             .await;
         agents.push(id(&made));
     }
+    let template = s
+        .ok(
+            "PUT",
+            &format!("/api/v1/agents/{}/templates", agents[0]),
+            Some(json!({"project": "TRK", "body": "Work on {{issue.key}}"})),
+        )
+        .await;
     let mut keys = Vec::new();
     for name in ["rotate me", "revoke me"] {
         let made = s
@@ -428,6 +436,7 @@ async fn build_world(s: &Server) -> World {
         agent_delete: agents[1],
         agent_off: agents[2],
         agent_on: agents[3],
+        template_delete: id(&template),
         key_rotate: keys[0],
         key_revoke: keys[1],
     }
@@ -531,6 +540,22 @@ fn samples(w: &World) -> Vec<Sample> {
             "/agents/{id}/disable",
             &format!("/agents/{}/disable", w.agent_on),
             200,
+        ),
+        sample(
+            "PUT",
+            "/agents/{id}/templates",
+            &format!("/agents/{}/templates", w.agent_patch),
+            201,
+        )
+        .body(
+            json!({"project": "TRK", "issue_type_id": w.task, "body": "Typed {{issue.title}}"}),
+            json!({"project": "TRK", "issue_type_id": w.task, "body": "Typed again"}),
+        ),
+        sample(
+            "DELETE",
+            "/agents/{id}/templates/{template_id}",
+            &format!("/agents/{}/templates/{}", w.agent_patch, w.template_delete),
+            204,
         ),
         sample("POST", "/projects", "/projects", 201).body(
             json!({"key": "NEW", "name": "New"}),
@@ -1027,6 +1052,20 @@ async fn the_excluded_writes_ignore_the_header() {
                 .await;
             assert_eq!(preview.status, 200, "{}", preview.body);
             assert!(!preview.replayed());
+            let prompt = s
+                .call(
+                    "POST",
+                    &format!("/api/v1/agents/{}/prompt-preview", 1),
+                    Some(&json!({"project": "TRK", "number": 1, "template": "{{issue.key}}"})),
+                    Some(id),
+                )
+                .await;
+            assert!(
+                prompt.status == 200 || prompt.status == 404,
+                "{}",
+                prompt.body
+            );
+            assert!(!prompt.replayed());
             let out = s
                 .call("POST", "/api/v1/auth/sign-out", None, Some(id))
                 .await;

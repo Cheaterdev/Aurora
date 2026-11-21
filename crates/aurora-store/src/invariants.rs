@@ -170,6 +170,12 @@ pub const INVARIANTS: &[Invariant] = &[
         run: search_index,
     },
     Invariant {
+        name: "prompt_templates.valid",
+        proves: "every stored prompt template parses and uses only known variables, and its issue type belongs to its project",
+        needs_current_schema: true,
+        run: prompt_templates_valid,
+    },
+    Invariant {
         name: "runs.no_orphans",
         proves: "no run is left active without a process that owns it (VACUOUS until the runner exists, TRK-15)",
         needs_current_schema: true,
@@ -528,6 +534,34 @@ fn consumer_cursors(conn: &Connection) -> Result<Finding, StoreError> {
     )?;
     let consumers = count(conn, "SELECT COUNT(*) FROM consumer_cursor")?;
     Finding::of(format!("{consumers} consumers"), violations)
+}
+
+fn prompt_templates_valid(conn: &Connection) -> Result<Finding, StoreError> {
+    let mut violations = lines(
+        conn,
+        "SELECT 'template ' || t.id || ' of agent ' || t.agent_id || ' uses issue type ' || t.issue_type_id ||
+                ', which belongs to another project'
+         FROM prompt_template t JOIN issue_type ty ON ty.id = t.issue_type_id
+         WHERE ty.project_id <> t.project_id",
+        |r| r.get(0),
+    )?;
+    let mut stmt = conn.prepare("SELECT id, body FROM prompt_template ORDER BY id")?;
+    let rows = stmt
+        .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?
+        .collect::<Result<Vec<_>, _>>()?;
+    for (id, body) in &rows {
+        match crate::prompt::parse(body) {
+            Err(err) => violations.push(format!("template {id} does not parse: {err}")),
+            Ok(template) => {
+                for name in template.variables_used() {
+                    if crate::prompt::catalogue::find(&name).is_none() {
+                        violations.push(format!("template {id} uses the unknown variable {name}"));
+                    }
+                }
+            }
+        }
+    }
+    Finding::of(format!("{} templates", rows.len()), violations)
 }
 
 fn request_log_rows(conn: &Connection) -> Result<Finding, StoreError> {

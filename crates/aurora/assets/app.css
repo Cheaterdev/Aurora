@@ -333,6 +333,63 @@ label {
   font-size: 0.85rem;
 }
 
+.template-list,
+.var-list {
+  list-style: none;
+  margin: 0 0 var(--gap);
+  padding: 0;
+}
+
+.template-list li,
+.var-list li {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  min-height: var(--target);
+}
+
+.prompt-form,
+.prompt-preview {
+  display: grid;
+  gap: var(--gap);
+  max-width: 720px;
+  margin-bottom: var(--gap);
+}
+
+.prompt-form select,
+.prompt-form textarea,
+.prompt-preview select,
+.prompt-preview input {
+  width: 100%;
+  min-height: var(--target);
+}
+
+.prompt-form textarea {
+  font-family: var(--font-mono);
+}
+
+.prompt-text {
+  font-family: var(--font-mono);
+  background: var(--surface-alt);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 12px 16px;
+  margin: 0;
+  max-height: 60vh;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.prompt-text[hidden] {
+  display: none;
+}
+
+.var-list .var {
+  font-family: var(--font-mono);
+}
+
 .key-box {
   background: var(--danger-bg);
   border: 2px solid var(--danger);

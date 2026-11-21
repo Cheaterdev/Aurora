@@ -55,8 +55,8 @@ tokio::task_local! {
     static CONTEXT: Context;
 }
 
-/// Writes that never take an id: `POST /auth/sign-out` and the Markdown preview
-/// have no effect to repeat. `path` is the request path, with or without `/api/v1`.
+/// Writes that never take an id: `POST /auth/sign-out`, the Markdown preview
+/// and the prompt preview have no effect to repeat. `path` is the request path, with or without `/api/v1`.
 pub fn excluded(method: &Method, path: &str) -> bool {
     if method != Method::POST {
         return false;
@@ -65,7 +65,9 @@ pub fn excluded(method: &Method, path: &str) -> bool {
     let segments: Vec<&str> = path.trim_matches('/').split('/').collect();
     matches!(
         segments.as_slice(),
-        ["auth", "sign-out"] | ["projects", _, "documents", "preview"]
+        ["auth", "sign-out"]
+            | ["projects", _, "documents", "preview"]
+            | ["agents", _, "prompt-preview"]
     )
 }
 
@@ -312,11 +314,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn exclusions_are_exactly_sign_out_and_preview() {
+    fn exclusions_are_exactly_sign_out_and_the_previews() {
         let post = Method::POST;
         assert!(excluded(&post, "/api/v1/auth/sign-out"));
         assert!(excluded(&post, "/auth/sign-out"));
         assert!(excluded(&post, "/api/v1/projects/TRK/documents/preview"));
+        assert!(excluded(&post, "/api/v1/agents/3/prompt-preview"));
+        assert!(excluded(&post, "/agents/3/prompt-preview"));
+        assert!(!excluded(&post, "/api/v1/agents/3/templates"));
+        assert!(!excluded(&Method::PUT, "/api/v1/agents/3/templates"));
+        assert!(!excluded(&Method::DELETE, "/api/v1/agents/3/templates/4"));
+        assert!(!excluded(&post, "/api/v1/agents/3/enable"));
         assert!(!excluded(&Method::GET, "/api/v1/auth/sign-out"));
         assert!(!excluded(&post, "/api/v1/projects/TRK/documents"));
         assert!(!excluded(&post, "/api/v1/projects/TRK/documents/3/archive"));
