@@ -6,6 +6,7 @@ use std::collections::BTreeMap;
 use rusqlite::Transaction;
 use serde_json::Value;
 
+use crate::agents::{self, AgentPatch, NewAgent};
 use crate::auth::{Principal, Role, Scope};
 use crate::comments::{self, NewComment};
 use crate::events::{self, Event, EventFilter, Start};
@@ -569,6 +570,21 @@ struct Snapshot {
     docs: BTreeMap<i64, DocSnap>,
     /// document link id -> (document id, "issue" or "initiative", issue number or initiative id)
     doc_links: BTreeMap<i64, (i64, String, i64)>,
+    /// agent id -> agent, without the command, arguments and instructions: the
+    /// log never holds them
+    agents: BTreeMap<i64, AgentSnap>,
+}
+
+#[derive(Debug, PartialEq)]
+struct AgentSnap {
+    name: String,
+    user_id: i64,
+    on_assign: bool,
+    on_mention: bool,
+    enabled: bool,
+    max_concurrent: i64,
+    timeout_seconds: i64,
+    projects: Vec<String>,
 }
 
 /// What the log can say about a document: where it is, its title, its
@@ -672,11 +688,64 @@ fn ids(value: &Value) -> Vec<i64> {
         .collect()
 }
 
+/// The events that have no project: users and the agent registry. `true` when
+/// `e` was one of them.
+fn replay_registry(s: &mut Snapshot, e: &Event) -> bool {
+    let p = &e.payload;
+    match e.kind.as_str() {
+        // Users are not modelled here.
+        "user.created" => {}
+        "agent.created" => {
+            s.agents.insert(
+                e.entity_id,
+                AgentSnap {
+                    name: text(&p["name"]),
+                    user_id: p["user_id"].as_i64().unwrap(),
+                    on_assign: p["on_assign"].as_bool().unwrap(),
+                    on_mention: p["on_mention"].as_bool().unwrap(),
+                    enabled: p["enabled"].as_bool().unwrap(),
+                    max_concurrent: p["max_concurrent"].as_i64().unwrap(),
+                    timeout_seconds: p["timeout_seconds"].as_i64().unwrap(),
+                    projects: strings(&p["projects"]),
+                },
+            );
+        }
+        "agent.updated" => {
+            let agent = s.agents.get_mut(&e.entity_id).unwrap();
+            for (field, change) in p["changes"].as_object().unwrap() {
+                let to = &change["to"];
+                match field.as_str() {
+                    "on_assign" => agent.on_assign = to.as_bool().unwrap(),
+                    "on_mention" => agent.on_mention = to.as_bool().unwrap(),
+                    "enabled" => agent.enabled = to.as_bool().unwrap(),
+                    "max_concurrent" => agent.max_concurrent = to.as_i64().unwrap(),
+                    "timeout_seconds" => agent.timeout_seconds = to.as_i64().unwrap(),
+                    "projects" => agent.projects = strings(to),
+                    // Text that may hold a secret: the log only says it changed.
+                    "description" | "command" | "args" | "model" | "instructions" | "work_dir" => {
+                        assert_eq!(change, &serde_json::json!({ "changed": true }));
+                    }
+                    other => panic!("unknown agent field {other}"),
+                }
+            }
+        }
+        "agent.deleted" => {
+            s.agents.remove(&e.entity_id);
+        }
+        _ => return false,
+    }
+    assert_eq!(e.project_id, None, "{} has no project", e.kind);
+    true
+}
+
 /// Rebuilds state from the events alone. Panics on a kind it does not know, so
 /// a new event kind cannot be added without teaching the replay about it.
 fn replay(log: &[Event]) -> Snapshot {
     let mut s = Snapshot::default();
     for e in log {
+        if replay_registry(&mut s, e) {
+            continue;
+        }
         let pid = e.project_id.unwrap();
         let p = &e.payload;
         match e.kind.as_str() {
@@ -894,6 +963,26 @@ async fn read_state(store: &Store) -> Snapshot {
     store
         .read(|c| {
             let mut s = Snapshot::default();
+            let reader = Principal {
+                user_id: crate::tests_support::TEST_USER_ID,
+                role: Role::Owner,
+                scope: Scope::Write,
+            };
+            for a in agents::list_agents(c, &reader)? {
+                s.agents.insert(
+                    a.id,
+                    AgentSnap {
+                        name: a.name,
+                        user_id: a.user_id,
+                        on_assign: a.on_assign,
+                        on_mention: a.on_mention,
+                        enabled: a.enabled,
+                        max_concurrent: a.max_concurrent,
+                        timeout_seconds: a.timeout_seconds,
+                        projects: a.projects,
+                    },
+                );
+            }
             for project in projects::list_projects(c)? {
                 s.projects
                     .insert(project.id, (project.key.clone(), project.name.clone()));
@@ -1617,12 +1706,87 @@ async fn replaying_the_log_rebuilds_the_state() {
     })
     .await;
 
+    // The agent registry: created with a user, edited, switched, deleted.
+    let runner = run(s, |tx| {
+        let actor = crate::tests_support::test_actor(tx);
+        agents::create_agent(
+            tx,
+            110,
+            &actor,
+            NewAgent {
+                name: Some("runner".into()),
+                command: "sk-sentinel-command".into(),
+                args: vec!["--key=sk-sentinel-arg".into()],
+                instructions: Some("sk-sentinel-instructions".into()),
+                projects: vec!["TRK".into()],
+                ..NewAgent::default()
+            },
+        )
+    })
+    .await;
+    run(s, move |tx| {
+        let actor = crate::tests_support::test_actor(tx);
+        agents::update_agent(
+            tx,
+            111,
+            &actor,
+            runner.id,
+            AgentPatch {
+                command: Some("sk-sentinel-other".into()),
+                on_mention: Some(false),
+                max_concurrent: Some(3),
+                projects: Some(vec!["OTH".into(), "TRK".into()]),
+                ..AgentPatch::default()
+            },
+        )
+    })
+    .await;
+    run(s, move |tx| {
+        let actor = crate::tests_support::test_actor(tx);
+        agents::set_enabled(tx, 112, &actor, runner.id, false)
+    })
+    .await;
+    let temp_agent = run(s, |tx| {
+        let actor = crate::tests_support::test_actor(tx);
+        agents::create_agent(
+            tx,
+            113,
+            &actor,
+            NewAgent {
+                name: Some("temp-runner".into()),
+                command: "x".into(),
+                ..NewAgent::default()
+            },
+        )
+    })
+    .await;
+    run(s, move |tx| {
+        let actor = crate::tests_support::test_actor(tx);
+        agents::delete_agent(tx, 114, &actor, temp_agent.id)
+    })
+    .await;
+
     let log = all_events(s).await;
     assert!(log.len() > 30, "{} events", log.len());
     let replayed = replay(&log);
     let actual = read_state(s).await;
     assert_eq!(replayed, actual);
     assert_eq!(actual.links.len(), 3);
+    assert_eq!(actual.agents.len(), 1, "temp-runner is gone");
+    let agent = &actual.agents[&runner.id];
+    assert_eq!(
+        (agent.on_assign, agent.on_mention, agent.enabled),
+        (true, false, false)
+    );
+    assert_eq!(
+        (agent.max_concurrent, agent.projects.as_slice()),
+        (3, ["OTH".to_string(), "TRK".to_string()].as_slice())
+    );
+    assert!(
+        log.iter()
+            .all(|e| !e.payload.to_string().contains("sentinel")),
+        "no typed-in text in any event"
+    );
 
     assert_eq!(actual.docs.len(), 4);
     assert_eq!(actual.docs[&page].title, "Page", "restored from revision 2");

@@ -42,11 +42,11 @@
 //!
 //! # Visibility
 //!
-//! Version 1 has no per-project permissions: a signed-in user sees every
-//! project, so [`search`] looks at all of them. When permissions arrive, this
-//! function is the one place that must restrict the projects searched (the
-//! `project_id` condition built in `Plan::new`); the API route and the page
-//! only call it.
+//! Version 1 has no per-project permissions for humans: a signed-in user sees
+//! every project, so [`search`] looks at all of them. A registered agent is
+//! limited to its allowed projects: the HTTP layer calls [`search_in`] with
+//! that list, and `Plan::new` is the one place that applies it (the
+//! `project_id` conditions); the API route, the tool and the page only call it.
 
 use rusqlite::types::Value;
 use rusqlite::{Connection, OptionalExtension, Transaction, params_from_iter};
@@ -330,13 +330,41 @@ fn check_range(what: &str, value: i64, min: i64, max: i64) -> Result<i64, StoreE
 }
 
 impl Plan {
-    fn new(conn: &Connection, query: &SearchQuery) -> Result<Plan, StoreError> {
+    fn new(
+        conn: &Connection,
+        query: &SearchQuery,
+        allowed: Option<&[String]>,
+    ) -> Result<Plan, StoreError> {
         let parsed = parse_query(&query.q)?;
         let limit = check_range("limit", query.limit.unwrap_or(DEFAULT_LIMIT), 1, MAX_LIMIT)?;
         let offset = check_range("offset", query.offset.unwrap_or(0), 0, i64::from(u32::MAX))?;
-        // Per-project visibility is enforced here when it exists.
+        // Project visibility is enforced here: only an agent's allow-list
+        // restricts it today, humans see every project.
+        if let (Some(allowed), Some(key)) = (allowed, &query.project)
+            && !allowed.contains(key)
+        {
+            return Err(crate::projects::Rejection::Forbidden(format!(
+                "this agent may not access project {key}"
+            ))
+            .into());
+        }
         let project_id = match &query.project {
             Some(key) => Some(get_project(conn, key)?.id),
+            None => None,
+        };
+        let visible_ids: Option<Vec<i64>> = match allowed {
+            Some(keys) => {
+                let mut ids = Vec::new();
+                for key in keys {
+                    let id: Option<i64> = conn
+                        .query_row("SELECT id FROM project WHERE key = ?1", [key], |row| {
+                            row.get(0)
+                        })
+                        .optional()?;
+                    ids.extend(id);
+                }
+                Some(ids)
+            }
             None => None,
         };
         let kinds = match &query.kinds {
@@ -347,9 +375,14 @@ impl Plan {
             None => vec![Kind::Issue, Kind::Comment, Kind::Document],
         };
         let exact = match parsed.identifier {
-            Some((key, number)) if kinds.contains(&Kind::Issue) => {
-                find_exact(conn, &key, number, project_id, query.include_archived)?
-            }
+            Some((key, number)) if kinds.contains(&Kind::Issue) => find_exact(
+                conn,
+                &key,
+                number,
+                project_id,
+                visible_ids.as_deref(),
+                query.include_archived,
+            )?,
             _ => None,
         };
 
@@ -358,6 +391,15 @@ impl Plan {
         if let Some(id) = project_id {
             params.push(Value::Integer(id));
             conds.push_str(&format!(" AND project_id = ?{}", params.len()));
+        }
+        if let Some(ids) = &visible_ids {
+            // Ids come from our own table; an empty list matches nothing.
+            let list = ids
+                .iter()
+                .map(i64::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            conds.push_str(&format!(" AND project_id IN ({list})"));
         }
         if kinds.len() < 3 {
             let list = [Kind::Issue, Kind::Comment, Kind::Document]
@@ -419,6 +461,7 @@ fn find_exact(
     key: &str,
     number: i64,
     project_id: Option<i64>,
+    visible: Option<&[i64]>,
     include_archived: bool,
 ) -> Result<Option<ExactIssue>, StoreError> {
     let found = conn
@@ -445,6 +488,7 @@ fn find_exact(
     Ok(found
         .filter(|(project, issue)| {
             project_id.is_none_or(|wanted| wanted == *project)
+                && visible.is_none_or(|ids| ids.contains(project))
                 && (include_archived || !issue.archived)
         })
         .map(|(_, issue)| issue))
@@ -545,6 +589,18 @@ fn row_hit(row: &rusqlite::Row<'_>) -> rusqlite::Result<Option<Hit>> {
 /// Runs a search. See the module docs for the rules; errors are `Invalid`
 /// (bad text or parameters) and `NotFound` (unknown project).
 pub fn search(conn: &Connection, query: &SearchQuery) -> Result<SearchResults, StoreError> {
+    search_in(conn, query, None)
+}
+
+/// [`search`] limited to the projects whose keys are in `allowed` (`None`: no
+/// limit). Without `query.project` it searches only the allowed projects (an
+/// empty list finds nothing); a `query.project` outside the list is
+/// `Forbidden`, whether or not it exists.
+pub fn search_in(
+    conn: &Connection,
+    query: &SearchQuery,
+    allowed: Option<&[String]>,
+) -> Result<SearchResults, StoreError> {
     let Plan {
         count_sql,
         main_sql,
@@ -552,7 +608,7 @@ pub fn search(conn: &Connection, query: &SearchQuery) -> Result<SearchResults, S
         limit,
         offset,
         exact,
-    } = Plan::new(conn, query)?;
+    } = Plan::new(conn, query, allowed)?;
     let extra = i64::from(exact.is_some());
 
     let counted: i64 = conn
@@ -606,7 +662,7 @@ fn fts_error(err: rusqlite::Error) -> StoreError {
 /// base tables are not scanned.
 #[cfg(test)]
 pub(crate) fn explain(conn: &Connection, query: &SearchQuery) -> Result<Vec<String>, StoreError> {
-    let plan = Plan::new(conn, query)?;
+    let plan = Plan::new(conn, query, None)?;
     let mut params = plan.params;
     params.push(Value::Integer(plan.limit));
     params.push(Value::Integer(plan.offset));

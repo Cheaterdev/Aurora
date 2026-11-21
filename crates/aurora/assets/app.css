@@ -267,6 +267,97 @@ label {
   color: var(--text);
 }
 
+.main-nav a {
+  display: inline-flex;
+  align-items: center;
+  min-height: var(--target);
+  text-decoration: none;
+}
+
+.agent-list,
+.key-list {
+  list-style: none;
+  margin: 0 0 var(--gap);
+  padding: 0;
+}
+
+.agent-list li,
+.key-list li {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  min-height: var(--target);
+}
+
+.agent-list a {
+  display: inline-flex;
+  align-items: center;
+  min-height: var(--target);
+}
+
+.agent-form {
+  display: grid;
+  gap: var(--gap);
+  max-width: 560px;
+}
+
+.agent-form input:not([type="checkbox"]),
+.agent-form textarea {
+  width: 100%;
+  min-height: var(--target);
+}
+
+.checks {
+  border: 0;
+  padding: 0;
+  margin: 0;
+}
+
+.check {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: var(--target);
+}
+
+.check input {
+  width: 20px;
+  height: 20px;
+}
+
+.chip {
+  background: var(--chip-bg);
+  border-radius: var(--radius-small);
+  padding: 2px 8px;
+  font-size: 0.85rem;
+}
+
+.key-box {
+  background: var(--danger-bg);
+  border: 2px solid var(--danger);
+  border-radius: var(--radius);
+  padding: 12px 16px;
+  margin-bottom: var(--gap);
+  overflow-wrap: anywhere;
+}
+
+.key-box[hidden] {
+  display: none;
+}
+
+.key-box code {
+  font-family: var(--font-mono);
+}
+
+.facts dt {
+  font-weight: 600;
+}
+
+.facts dd {
+  margin: 0 0 var(--gap);
+}
+
 .project-nav {
   display: flex;
   gap: 16px;

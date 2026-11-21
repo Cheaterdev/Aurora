@@ -26,11 +26,31 @@ present only it is considered.
 Missing, malformed, unknown, revoked or expired credentials: `401` with
 `WWW-Authenticate: Bearer`.
 
-Permissions are those of the key's user. Version 1 has no per-project
+Permissions are those of the key's user. Humans have no per-project
 permissions: any user who may write may change any project, comment, link or
 document. What is restricted: listing and creating users and managing other
 users' keys are owner only; editing or deleting a comment is for its author
 and the owner. Every change records the key's user as the actor of its event.
+A key can only act as its own user; there is no way to act as another one.
+
+**Registered agents are restricted.** An agent user that has an entry in the
+agent registry (`/api/v1/agents`) may only use the projects on its allow-list:
+
+* Any route under `/api/v1/projects/{key}` for another project (or an unknown
+  one: the answer is the same) is `403 {"error": "this agent may not access
+  project KEY"}`.
+* `GET /api/v1/projects` and `GET /api/v1/search` list only allowed projects;
+  `GET /api/v1/events` only their events (events without a project are not
+  shown); naming another project in `project` is the `403` above.
+* `POST /api/v1/projects`, the consumers endpoints and the live stream
+  `/events/stream` are `403` for it. The web pages are `403` for its key.
+* If the agent is disabled, every call is `403 {"error": "agent is disabled"}`
+  except `GET /api/v1/auth/me`.
+
+Humans, and agent users without a registry entry, are not restricted by any
+of this. Deleting the entry lifts the restriction, and an agent user created
+with `POST /api/v1/users` stays unrestricted until it is registered.
+`GET /api/v1/auth/me` has `"agent": null` or `{id, enabled, projects}`.
 
 ## Conventions
 
@@ -84,7 +104,9 @@ Ends the cookie session if there is one and clears the cookie. `204`.
 
 ### `GET /api/v1/auth/me`
 
-`{"user": {...}, "scope": "read"|"write", "via": "key"|"session"}`.
+`{"user": {...}, "scope": "read"|"write", "via": "key"|"session", "agent":
+null | {"id", "enabled", "projects"}}`. `agent` is set for a registered agent
+user; this is the one call a disabled agent may make.
 
 ## Keys and users
 
@@ -406,6 +428,71 @@ Body: exactly one of `{"issue": number}` or `{"initiative": id}`. `201` with
 
 `204`.
 
+## Agents
+
+The agent registry describes how an agent runs and what it may reach. It
+holds no secrets: an agent's credentials are its keys, which stay in the keys
+endpoints. An agent is `{id, user_id, name, description, on_assign,
+on_mention, enabled, max_concurrent, timeout_seconds, projects, created,
+updated}` plus, for the owner only, `{command, args, model, instructions,
+work_dir}`. Everyone else gets the first set (the command, arguments,
+instructions and working directory are redacted). `projects` is the sorted
+list of allowed project keys.
+
+**An agent with no allowed project can access no project at all.** The empty
+list is not "all projects". See Authentication for the effect on the agent's
+key.
+
+Limits: `command` 1-500 characters, at most 50 `args` of at most 2000
+characters, `instructions` at most 20000, `work_dir` (absolute path) at most
+1000, `description` at most 1000, `model` at most 200, `max_concurrent` 1-16
+(default 1), `timeout_seconds` 60-86400 (default 3600). `on_assign` and
+`on_mention` default to true, `enabled` to true.
+
+### `GET /api/v1/agents`
+
+Array of agents by id, redacted unless you are the owner. A registered agent
+sees only its allowed projects in each `projects` list.
+
+### `POST /api/v1/agents`
+
+Owner only (`403` otherwise). Body: `name` (creates the agent user in the same
+transaction) or `user_id` (registers an existing agent user, once), `command`,
+and optionally `description`, `args`, `model`, `instructions`, `work_dir`,
+`max_concurrent`, `timeout_seconds`, `on_assign`, `on_mention`, `enabled`,
+`projects`, and `create_key`. `201` with the agent. With `"create_key": true`
+the response is `{"agent": {...}, "key": "aur_...", "key_info": {...}}`: a
+`write`-scope key named "agent key", shown once, created in the same
+transaction (`Cache-Control: no-store`). `409` for a taken name or an already
+registered user, `404` for an unknown `user_id`, `422` for an invalid field,
+an unknown project key in `projects`, or a user that is not an agent.
+
+### `GET /api/v1/agents/{id}`
+
+One agent, redacted unless you are the owner. `404`.
+
+### `PATCH /api/v1/agents/{id}`
+
+Owner only. Any of the create fields except `name`, `user_id` and
+`create_key`; only the fields present change. `model` and `work_dir` accept
+`null` to clear. `projects` replaces the whole set. `200` with the agent. A
+patch that changes nothing writes nothing and emits no event.
+
+### `DELETE /api/v1/agents/{id}`
+
+Owner only. Removes the registry entry only: the agent user and its keys stay,
+and the user is no longer restricted (see Authentication). `204`.
+
+### `POST /api/v1/agents/{id}/enable`
+
+Owner only. `200` with the agent; repeating it changes nothing.
+
+### `POST /api/v1/agents/{id}/disable`
+
+Owner only. `200` with the agent. The agent's keys then get `403` "agent is
+disabled" on everything except `GET /api/v1/auth/me`, and no run is started
+for it. Repeating it changes nothing.
+
 ## Search
 
 ### `GET /api/v1/search`
@@ -425,7 +512,9 @@ entity_id, actor, payload, created}`; `actor` is the user id of the key or
 session that made the change. Kinds: `project.*`, `column.*`, `issue_type.*`,
 `label.*`, `issue.created|updated|moved|archived|unarchived`,
 `link.added|removed`, `comment.created|edited|deleted`, `mention.created`,
-`initiative.*`, `document.*`, `key.*`, `user.created`. Delivery to consumers
+`initiative.*`, `document.*`, `key.*`, `user.created`,
+`agent.created|updated|deleted` (no project; the payload never carries the
+command, arguments, instructions or working directory). Delivery to consumers
 is at least once: tolerate repeats.
 
 ### `GET /api/v1/events`

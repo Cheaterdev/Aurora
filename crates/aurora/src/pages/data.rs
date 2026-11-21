@@ -2,7 +2,8 @@
 
 use std::collections::HashMap;
 
-use aurora_store::auth::{self, User};
+use aurora_store::agents::{self, Agent};
+use aurora_store::auth::{self, ApiKey, Principal, User};
 use aurora_store::comments::{self, Comment};
 use aurora_store::documents::{self, DocumentDetail, DocumentSummary, Revision, RevisionSummary};
 use aurora_store::events::{self, Event};
@@ -203,6 +204,47 @@ pub fn load_home(conn: &Connection, user_id: i64) -> Result<HomeData, StoreError
     Ok(HomeData {
         user: auth::get_user(conn, user_id)?,
         projects: projects::list_projects(conn)?,
+    })
+}
+
+pub struct AgentsData {
+    pub user: User,
+    pub owner: bool,
+    pub agents: Vec<Agent>,
+    pub projects: Vec<Project>,
+}
+
+pub struct AgentData {
+    pub user: User,
+    pub owner: bool,
+    pub agent: Agent,
+    pub projects: Vec<Project>,
+    /// Only the owner may list another user's keys.
+    pub keys: Vec<ApiKey>,
+}
+
+pub fn load_agents(conn: &Connection, reader: &Principal) -> Result<AgentsData, StoreError> {
+    Ok(AgentsData {
+        user: auth::get_user(conn, reader.user_id)?,
+        owner: reader.is_owner(),
+        agents: agents::list_agents(conn, reader)?,
+        projects: projects::list_projects(conn)?,
+    })
+}
+
+pub fn load_agent(conn: &Connection, reader: &Principal, id: i64) -> Result<AgentData, StoreError> {
+    let agent = agents::get_agent(conn, reader, id)?;
+    let keys = if reader.is_owner() {
+        auth::list_keys(conn, reader, agent.user_id)?
+    } else {
+        Vec::new()
+    };
+    Ok(AgentData {
+        user: auth::get_user(conn, reader.user_id)?,
+        owner: reader.is_owner(),
+        agent,
+        projects: projects::list_projects(conn)?,
+        keys,
     })
 }
 

@@ -10,6 +10,7 @@ macro_rules! open_blocker {
     };
 }
 
+pub mod agents;
 pub mod auth;
 mod backup;
 pub mod comments;
@@ -838,7 +839,11 @@ mod tests_0009;
 #[cfg(test)]
 mod tests_0010;
 #[cfg(test)]
+mod tests_0011;
+#[cfg(test)]
 mod tests_actor;
+#[cfg(test)]
+mod tests_agents;
 #[cfg(test)]
 mod tests_auth;
 #[cfg(test)]

@@ -19,11 +19,32 @@
 //!   approves (it sends no CORS headers). The cookie is also `SameSite=Lax`.
 //!   Bearer requests are exempt: nothing attaches a key automatically.
 //! * Safe methods never change state in this API, so GET needs no header.
+//!
+//! # Registered agents ([`Access`])
+//!
+//! A key acts as exactly one user. When that user is an agent registered in
+//! the agent registry (`aurora_store::agents`) the request is also limited:
+//!
+//! * a **disabled** agent gets `403 {"error": "agent is disabled"}` on every
+//!   call except `GET /api/v1/auth/me`;
+//! * an enabled agent may only address the projects on its allow-list (empty:
+//!   none). Every route under `/projects/{key}` is checked here, in the layer,
+//!   by the key in the path: another project is
+//!   `403 {"error": "this agent may not access project KEY"}`, whether or not
+//!   it exists. The handlers that take a project in another way (`project`
+//!   parameters, search, events, the project list) apply the same
+//!   [`Access`]. `/consumers` and `/events/stream` are not available to a
+//!   restricted agent, nor is creating a project.
+//!
+//! Humans (owner, member) and agent users without a registry entry are not
+//! restricted: version 1 has no per-project permissions for them.
 
-use aurora_store::auth::{self, ApiKey, Principal, Scope, User};
-use aurora_store::{Rejection, Store, StoreError, now_millis};
+use std::sync::Arc;
+
+use aurora_store::auth::{self, ApiKey, Principal, Role, Scope, User};
+use aurora_store::{Rejection, Store, StoreError, agents, now_millis};
 use axum::Json;
-use axum::extract::{Extension, Path, Request, State};
+use axum::extract::{Extension, OriginalUri, Path, Request, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
@@ -98,11 +119,145 @@ fn forbidden(message: &str) -> ApiError {
     StoreError::from(Rejection::Forbidden(message.into())).into()
 }
 
+/// Which projects a request may address; see the module docs. Put in the
+/// request extensions next to the [`Principal`].
+#[derive(Debug, Clone)]
+pub enum Access {
+    /// Humans and agent users that are not in the registry.
+    Open,
+    /// A registered agent: exactly these project keys, none when empty.
+    Agent(Arc<[String]>),
+    /// A registered agent that is switched off.
+    Disabled,
+}
+
+impl Access {
+    pub fn allows(&self, key: &str) -> bool {
+        match self {
+            Access::Open => true,
+            Access::Agent(keys) => keys.iter().any(|allowed| allowed == key),
+            Access::Disabled => false,
+        }
+    }
+
+    /// `403` unless the project is allowed. The same answer for a project that
+    /// does not exist, so the key list is not probed.
+    pub fn check_project(&self, key: &str) -> Result<(), ApiError> {
+        if self.allows(key) {
+            Ok(())
+        } else {
+            Err(forbidden(&format!(
+                "this agent may not access project {key}"
+            )))
+        }
+    }
+
+    /// The allow-list of a restricted agent, `None` for everybody else.
+    pub fn allowed(&self) -> Option<&[String]> {
+        match self {
+            Access::Agent(keys) => Some(keys),
+            Access::Open | Access::Disabled => None,
+        }
+    }
+
+    pub fn is_open(&self) -> bool {
+        matches!(self, Access::Open)
+    }
+}
+
+async fn access_of(store: &Store, principal: &Principal) -> Result<Access, StoreError> {
+    if principal.role != Role::Agent {
+        return Ok(Access::Open);
+    }
+    let user_id = principal.user_id;
+    let found = store
+        .read(move |c| agents::agent_access(c, user_id))
+        .await?;
+    Ok(match found {
+        None => Access::Open,
+        Some(agent) if !agent.enabled => Access::Disabled,
+        Some(agent) => Access::Agent(agent.projects.into()),
+    })
+}
+
+/// What a path under `/api/v1` (or `/events/stream`) addresses.
+#[derive(Debug, PartialEq, Eq)]
+enum Target {
+    Project(String),
+    /// Not available to a restricted agent at all.
+    Withheld(&'static str),
+    Other,
+}
+
+/// Decodes `%XX` like the router does for `Path<String>`.
+fn percent_decode(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut at = 0;
+    while at < bytes.len() {
+        let hex = |byte: u8| char::from(byte).to_digit(16);
+        let decoded = match (bytes[at], bytes.get(at + 1), bytes.get(at + 2)) {
+            (b'%', Some(&hi), Some(&lo)) => hex(hi)
+                .zip(hex(lo))
+                .and_then(|(hi, lo)| u8::try_from(hi * 16 + lo).ok()),
+            _ => None,
+        };
+        match decoded {
+            Some(byte) => {
+                out.push(byte);
+                at += 3;
+            }
+            None => {
+                out.push(bytes[at]);
+                at += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn target_of(path: &str) -> Target {
+    let mut segments = path.split('/').skip(1).map(percent_decode);
+    let mut first = segments.next().unwrap_or_default();
+    let mut second = segments.next();
+    // The layer may see the path with or without the `/api/v1` prefix.
+    if first == "api" && second.as_deref() == Some("v1") {
+        first = segments.next().unwrap_or_default();
+        second = segments.next();
+    }
+    match (first.as_str(), second) {
+        ("projects", Some(key)) => Target::Project(key),
+        ("consumers", _) => Target::Withheld("consumers"),
+        ("events", Some(next)) if next == "stream" => Target::Withheld("the live event stream"),
+        _ => Target::Other,
+    }
+}
+
+fn is_me(path: &str) -> bool {
+    let path = path.trim_end_matches('/');
+    path == "/api/v1/auth/me" || path == "/auth/me"
+}
+
+fn check_access(access: &Access, method: &Method, path: &str) -> Result<(), ApiError> {
+    match access {
+        Access::Open => Ok(()),
+        Access::Disabled if *method == Method::GET && is_me(path) => Ok(()),
+        Access::Disabled => Err(forbidden("agent is disabled")),
+        Access::Agent(_) => match target_of(path) {
+            Target::Project(key) => access.check_project(&key),
+            Target::Withheld(what) => Err(forbidden(&format!(
+                "this agent may not use {what}; it is limited to its allowed projects"
+            ))),
+            Target::Other => Ok(()),
+        },
+    }
+}
+
 pub(crate) async fn authenticate(
     store: &Store,
     method: &Method,
     headers: &HeaderMap,
-) -> Result<(Principal, Via), ApiError> {
+) -> Result<(Principal, Via, Access), ApiError> {
     let presented = presented(headers)?;
     let now = now_millis();
     let (found, via) = match presented {
@@ -147,7 +302,8 @@ pub(crate) async fn authenticate(
             tracing::warn!(error = %err, "could not record that a credential was used");
         }
     }
-    Ok((principal, via))
+    let access = access_of(store, &principal).await?;
+    Ok((principal, via, access))
 }
 
 /// The layer on every protected route.
@@ -155,10 +311,19 @@ pub async fn require_auth(State(store): State<Store>, mut req: Request, next: Ne
     // A request body is not Sync, so nothing borrowed from `req` may be held across an await.
     let method = req.method().clone();
     let headers = req.headers().clone();
+    let path = req
+        .extensions()
+        .get::<OriginalUri>()
+        .map_or_else(|| req.uri().path(), |original| original.0.path())
+        .to_string();
     match authenticate(&store, &method, &headers).await {
-        Ok((principal, via)) => {
+        Ok((principal, via, access)) => {
+            if let Err(err) = check_access(&access, &method, &path) {
+                return err.into_response();
+            }
             req.extensions_mut().insert(principal);
             req.extensions_mut().insert(via);
+            req.extensions_mut().insert(access);
             next.run(req).await
         }
         Err(err) => err.into_response(),
@@ -193,7 +358,7 @@ fn with_cookie(status: StatusCode, cookie: HeaderValue, body: Response) -> Respo
 }
 
 /// Responses that carry a secret must not be cached.
-fn no_store(mut response: Response) -> Response {
+pub(crate) fn no_store(mut response: Response) -> Response {
     response
         .headers_mut()
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
@@ -305,13 +470,21 @@ pub async fn me(
     Extension(principal): Extension<Principal>,
     Extension(via): Extension<Via>,
 ) -> ApiResult<Response> {
-    let user: User = store
-        .read(move |c| auth::get_user(c, principal.user_id))
+    let (user, agent): (User, Option<agents::AgentAccess>) = store
+        .read(move |c| {
+            Ok((
+                auth::get_user(c, principal.user_id)?,
+                agents::agent_access(c, principal.user_id)?,
+            ))
+        })
         .await?;
-    Ok(
-        Json(json!({ "user": user, "scope": principal.scope, "via": via.as_str() }))
-            .into_response(),
-    )
+    // `agent` is null for everybody who is not a registered agent.
+    let agent =
+        agent.map(|a| json!({ "id": a.agent_id, "enabled": a.enabled, "projects": a.projects }));
+    Ok(Json(json!({
+        "user": user, "scope": principal.scope, "via": via.as_str(), "agent": agent,
+    }))
+    .into_response())
 }
 
 // ---- users ----

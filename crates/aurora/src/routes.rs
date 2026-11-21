@@ -26,7 +26,8 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::{auth, markdown};
+use crate::auth::Access;
+use crate::{agents, auth, markdown};
 
 const DEFAULT_LABEL_COLOR: &str = "#808080";
 
@@ -95,6 +96,24 @@ fn api_tables() -> (Table, Table) {
             "/users",
             &["GET", "POST"],
             get(auth::list_users).post(auth::create_user),
+        )
+        .route(
+            "/agents",
+            &["GET", "POST"],
+            get(agents::list_agents).post(agents::create_agent),
+        )
+        .route(
+            "/agents/{id}",
+            &["GET", "PATCH", "DELETE"],
+            get(agents::get_agent)
+                .patch(agents::update_agent)
+                .delete(agents::delete_agent),
+        )
+        .route("/agents/{id}/enable", &["POST"], post(agents::enable_agent))
+        .route(
+            "/agents/{id}/disable",
+            &["POST"],
+            post(agents::disable_agent),
         )
         .route(
             "/projects",
@@ -435,16 +454,28 @@ struct NameBody {
     name: String,
 }
 
-async fn list_projects(State(store): State<Store>) -> ApiResult<Response> {
-    let projects = store.read(projects::list_projects).await?;
+/// A restricted agent sees only the projects on its allow-list.
+async fn list_projects(
+    State(store): State<Store>,
+    Extension(access): Extension<Access>,
+) -> ApiResult<Response> {
+    let mut projects = store.read(projects::list_projects).await?;
+    projects.retain(|project| access.allows(&project.key));
     Ok(Json(projects).into_response())
 }
 
 async fn create_project(
     State(store): State<Store>,
     Extension(actor): Extension<Principal>,
+    Extension(access): Extension<Access>,
     ApiJson(body): ApiJson<NewProject>,
 ) -> ApiResult<Response> {
+    if !access.is_open() {
+        return Err(StoreError::from(Rejection::Forbidden(
+            "this agent may not create projects; it is limited to its allowed projects".into(),
+        ))
+        .into());
+    }
     let project = store
         .write(move |tx| {
             projects::create_project(
@@ -1332,11 +1363,24 @@ fn event_filter(
 
 async fn list_events(
     State(store): State<Store>,
+    Extension(access): Extension<Access>,
     ApiQuery(query): ApiQuery<EventQuery>,
 ) -> ApiResult<Response> {
+    if let Some(key) = &query.project {
+        access.check_project(key)?;
+    }
+    let allowed: Option<Vec<String>> = access.allowed().map(<[String]>::to_vec);
     let filter = event_filter(query.project, query.entity_kind, query.kind_prefix);
     let list = store
-        .read(move |c| events::read_events(c, query.after.unwrap_or(0), query.limit, &filter))
+        .read(move |c| {
+            events::read_events_in(
+                c,
+                query.after.unwrap_or(0),
+                query.limit,
+                &filter,
+                allowed.as_deref(),
+            )
+        })
         .await?;
     Ok(Json(json!({ "events": list })).into_response())
 }
@@ -1357,8 +1401,13 @@ struct SearchParams {
 
 async fn search_all(
     State(store): State<Store>,
+    Extension(access): Extension<Access>,
     ApiQuery(params): ApiQuery<SearchParams>,
 ) -> ApiResult<Response> {
+    if let Some(key) = &params.project {
+        access.check_project(key)?;
+    }
+    let allowed: Option<Vec<String>> = access.allowed().map(<[String]>::to_vec);
     let kinds = params.kind.as_deref().map(Kind::parse_list).transpose()?;
     let query = SearchQuery {
         q: params.q.unwrap_or_default(),
@@ -1371,7 +1420,9 @@ async fn search_all(
     let echo = query.q.clone();
     let limit = query.limit.unwrap_or(search::DEFAULT_LIMIT);
     let offset = query.offset.unwrap_or(0);
-    let results = store.read(move |c| search::search(c, &query)).await?;
+    let results = store
+        .read(move |c| search::search_in(c, &query, allowed.as_deref()))
+        .await?;
     Ok(Json(json!({
         "query": echo,
         "total": results.total,

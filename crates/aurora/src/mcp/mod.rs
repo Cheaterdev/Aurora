@@ -8,6 +8,8 @@
 //! * Authentication is the REST API's key check (`crate::auth::authenticate`),
 //!   `Authorization: Bearer` only: a session cookie is not accepted here.
 //!   A `read` key may list and read; the tools that change data refuse it.
+//!   A registered agent's key is limited to the agent's allowed projects
+//!   (`crate::auth::Access`); a disabled agent's key gets `403`.
 //! * A browser `Origin` that is neither the request's `Host` nor a localhost
 //!   name is refused (the spec's DNS-rebinding rule).
 //!
@@ -25,7 +27,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use serde_json::{Value, json};
 
-use crate::auth::authenticate;
+use crate::auth::{Access, authenticate};
 use crate::routes::ApiError;
 
 const MAX_BODY_BYTES: usize = 1024 * 1024;
@@ -106,7 +108,7 @@ fn origin_allowed(headers: &HeaderMap) -> bool {
     same_host || matches!(hostname(authority), "localhost" | "127.0.0.1" | "[::1]")
 }
 
-async fn principal_of(store: &Store, headers: &HeaderMap) -> Result<Principal, ApiError> {
+async fn principal_of(store: &Store, headers: &HeaderMap) -> Result<(Principal, Access), ApiError> {
     if !headers.contains_key(header::AUTHORIZATION) {
         let err = StoreError::from(Rejection::Unauthorized(
             "send Authorization: Bearer <api key>; /mcp does not accept session cookies".into(),
@@ -115,14 +117,19 @@ async fn principal_of(store: &Store, headers: &HeaderMap) -> Result<Principal, A
     }
     // Every MCP call is a POST, including reads, so the method rule that keeps
     // read keys to GET must not apply here; the tools check the scope instead.
-    authenticate(store, &Method::GET, headers)
-        .await
-        .map(|(principal, _)| principal)
+    let (principal, _, access) = authenticate(store, &Method::GET, headers).await?;
+    if matches!(access, Access::Disabled) {
+        let err = StoreError::from(Rejection::Forbidden("agent is disabled".into()));
+        return Err(ApiError::from(err));
+    }
+    Ok((principal, access))
 }
 
 struct Session<'a> {
     store: &'a Store,
     principal: Principal,
+    /// A registered agent's project allow-list; the tools apply it.
+    access: Access,
 }
 
 enum Handled {
@@ -140,8 +147,8 @@ async fn post_mcp(State(store): State<Store>, headers: HeaderMap, body: Body) ->
             "the Origin of this request is not this server",
         );
     }
-    let principal = match principal_of(&store, &headers).await {
-        Ok(principal) => principal,
+    let (principal, access) = match principal_of(&store, &headers).await {
+        Ok(found) => found,
         Err(err) => return err.into_response(),
     };
     if let Some(version) = headers.get(PROTOCOL_HEADER) {
@@ -182,6 +189,7 @@ async fn post_mcp(State(store): State<Store>, headers: HeaderMap, body: Body) ->
     let session = Session {
         store: &store,
         principal,
+        access,
     };
     match message {
         Value::Array(items) => {
@@ -302,7 +310,15 @@ async fn call_tool(session: &Session<'_>, params: Value, id: Value) -> Value {
             return rpc_error(id, INVALID_PARAMS, "params.arguments must be an object");
         }
     };
-    match tools::call(session.store, &session.principal, name, arguments).await {
+    match tools::call(
+        session.store,
+        &session.principal,
+        &session.access,
+        name,
+        arguments,
+    )
+    .await
+    {
         Some(result) => rpc_result(id, result),
         None => rpc_error(id, INVALID_PARAMS, format!("Unknown tool: {name}")),
     }

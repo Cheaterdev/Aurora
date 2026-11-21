@@ -8,6 +8,7 @@
 
 use std::collections::HashMap;
 
+use aurora_store::agents::Agent;
 use aurora_store::auth::{Role, User};
 use aurora_store::comments::{Comment, mention_ranges};
 use aurora_store::documents::{DocumentDetail, DocumentLinks, DocumentSummary, LinkedDocument};
@@ -22,9 +23,9 @@ use serde_json::Value;
 
 use super::assets;
 use super::data::{
-    ActivityData, BoardData, CommentsData, DocumentData, DocumentsData, HistoryData, HomeData,
-    InitiativeData, InitiativesData, IssueData, RevisionData, SEARCH_PAGE_SIZE, SearchData,
-    SearchOutcome,
+    ActivityData, AgentData, AgentsData, BoardData, CommentsData, DocumentData, DocumentsData,
+    HistoryData, HomeData, InitiativeData, InitiativesData, IssueData, RevisionData,
+    SEARCH_PAGE_SIZE, SearchData, SearchOutcome,
 };
 use super::time::{utc_iso, utc_text};
 use crate::markdown;
@@ -100,6 +101,11 @@ fn layout(frame: &Frame<'_>, content: Markup) -> Markup {
                 a.skip href="#main" { "Skip to content" }
                 header.topbar {
                     a.brand href="/" { "Aurora" }
+                    @if frame.user.is_some() {
+                        nav.main-nav aria-label="Main" {
+                            a href="/agents" { "Agents" }
+                        }
+                    }
                     @if let Some(project) = frame.project {
                         nav.project-nav aria-label="Project" {
                             a.project-link href={ "/p/" (project.key) } {
@@ -1195,6 +1201,235 @@ pub fn document_page(data: &DocumentData) -> Markup {
             section.page.doc-page {
                 (document_crumbs(&data.project, &data.detail))
                 (document_fragment(data))
+            }
+        },
+    )
+}
+
+// ---- agents ----
+
+/// The fields of the create and edit forms. `agent` is `None` on the create form.
+fn agent_fields(agent: Option<&Agent>, projects: &[Project]) -> Markup {
+    let private = agent.and_then(|a| a.private.as_ref());
+    let args = private.map(|p| p.args.join("\n")).unwrap_or_default();
+    let max_concurrent = agent.map_or(1, |a| a.max_concurrent);
+    let timeout = agent.map_or(3600, |a| a.timeout_seconds);
+    let on_assign = agent.is_none_or(|a| a.on_assign);
+    let on_mention = agent.is_none_or(|a| a.on_mention);
+    html! {
+        @if agent.is_none() {
+            div.field {
+                label for="a-name" { "Name" }
+                input #a-name name="name" required maxlength="100" autocomplete="off"
+                    placeholder="claude-code";
+            }
+        }
+        div.field {
+            label for="a-description" { "Description" }
+            input #a-description name="description" maxlength="1000" autocomplete="off"
+                value=[agent.map(|a| a.description.as_str())];
+        }
+        div.field {
+            label for="a-command" { "Command" }
+            input #a-command name="command" required maxlength="500" autocomplete="off"
+                placeholder="claude" value=[private.map(|p| p.command.as_str())];
+        }
+        div.field {
+            label for="a-args" { "Arguments, one per line" }
+            textarea #a-args name="args" rows="3" spellcheck="false" { "\n" (args) }
+        }
+        div.field {
+            label for="a-model" { "Model (optional)" }
+            input #a-model name="model" maxlength="200" autocomplete="off"
+                value=[private.and_then(|p| p.model.as_deref())];
+        }
+        div.field {
+            label for="a-work-dir" { "Working directory (optional, absolute path)" }
+            input #a-work-dir name="work_dir" maxlength="1000" autocomplete="off"
+                value=[private.and_then(|p| p.work_dir.as_deref())];
+        }
+        div.field {
+            label for="a-instructions" { "Instructions" }
+            textarea #a-instructions name="instructions" rows="6" maxlength="20000" {
+                "\n" (private.map_or("", |p| p.instructions.as_str()))
+            }
+        }
+        fieldset.field.checks {
+            legend { "Start a run when" }
+            label.check {
+                input type="checkbox" name="on_assign" checked[on_assign];
+                " an issue is assigned to this agent"
+            }
+            label.check {
+                input type="checkbox" name="on_mention" checked[on_mention];
+                " this agent is mentioned in a comment"
+            }
+        }
+        div.field {
+            label for="a-max" { "Max concurrent runs (1-16)" }
+            input #a-max name="max_concurrent" type="number" min="1" max="16" value=(max_concurrent);
+        }
+        div.field {
+            label for="a-timeout" { "Timeout in seconds (60-86400)" }
+            input #a-timeout name="timeout_seconds" type="number" min="60" max="86400"
+                value=(timeout);
+        }
+        fieldset.field.checks {
+            legend { "Allowed projects" }
+            p.hint {
+                "An agent with no project ticked can access no project at all."
+            }
+            @if projects.is_empty() {
+                p.empty { "There are no projects yet." }
+            }
+            @for project in projects {
+                label.check {
+                    input type="checkbox" name="project" value=(project.key)
+                        checked[agent.is_some_and(|a| a.projects.contains(&project.key))];
+                    " "
+                    span.key { (project.key) }
+                    " "
+                    (project.name)
+                }
+            }
+        }
+    }
+}
+
+pub fn agents_page(data: &AgentsData) -> Markup {
+    let mut frame = Frame::new("Agents", "agents");
+    frame.user = Some(&data.user);
+    layout(
+        &frame,
+        html! {
+            section.page {
+                h1 { "Agents" }
+                div #key-box.key-box hidden role="status" {
+                    p { strong { "Copy this key now. It is shown once and cannot be shown again." } }
+                    p { code #key-value {} }
+                    p.hint { "Add it to Claude Code with:" }
+                    p { code #key-command {} }
+                    button type="button" data-action="copy-key" { "Copy key" }
+                }
+                @if data.agents.is_empty() {
+                    p.empty { "No agents yet." }
+                } @else {
+                    ul.agent-list {
+                        @for agent in &data.agents {
+                            li {
+                                a href={ "/agents/" (agent.id) } { (agent.name) }
+                                @if !agent.enabled { " " span.chip { "disabled" } }
+                                " "
+                                span.hint {
+                                    @if agent.projects.is_empty() {
+                                        "no projects"
+                                    } @else {
+                                        (agent.projects.join(", "))
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                @if data.owner {
+                    h2 { "New agent" }
+                    form.agent-form data-form="new-agent" {
+                        (agent_fields(None, &data.projects))
+                        label.check {
+                            input type="checkbox" name="create_key" checked;
+                            " Create a key for this agent"
+                        }
+                        div.row { button.primary type="submit" { "Create agent" } }
+                        p.field-msg role="alert" {}
+                    }
+                } @else {
+                    p.hint { "Only the owner can create or edit agents." }
+                }
+            }
+        },
+    )
+}
+
+pub fn agent_page(data: &AgentData) -> Markup {
+    let agent = &data.agent;
+    let mut frame = Frame::new(&agent.name, "agent");
+    frame.user = Some(&data.user);
+    layout(
+        &frame,
+        html! {
+            article.page data-agent-id=(agent.id) {
+                nav.crumbs aria-label="Breadcrumb" {
+                    a href="/agents" { "Agents" }
+                    " / "
+                    span { (agent.name) }
+                }
+                div.issue-head {
+                    h1 { (agent.name) }
+                    @if !agent.enabled { span.chip { "disabled" } }
+                }
+                p.field-msg #page-msg role="alert" {}
+                @if data.owner {
+                    div.row {
+                        @if agent.enabled {
+                            button type="button" data-action="disable-agent" { "Disable" }
+                        } @else {
+                            button type="button" data-action="enable-agent" { "Enable" }
+                        }
+                        button type="button" data-action="delete-agent" { "Delete" }
+                    }
+                    form.agent-form data-form="edit-agent" {
+                        (agent_fields(Some(agent), &data.projects))
+                        div.row { button.primary type="submit" { "Save" } }
+                        p.field-msg role="alert" {}
+                    }
+                    h2 { "Keys" }
+                    @if data.keys.is_empty() {
+                        p.empty { "This agent has no keys." }
+                    } @else {
+                        ul.key-list {
+                            @for key in &data.keys {
+                                li {
+                                    span { (key.name) }
+                                    " "
+                                    code { (key.prefix) "\u{2026}" }
+                                    @if key.revoked.is_some() {
+                                        " " span.chip { "revoked" }
+                                    } @else {
+                                        " "
+                                        button type="button" data-action="revoke-key"
+                                            data-key-id=(key.id) { "Revoke" }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    div #key-box.key-box hidden role="status" {
+                        p { strong { "Copy this key now. It is shown once and cannot be shown again." } }
+                        p { code #key-value {} }
+                        p.hint { "Add it to Claude Code with:" }
+                        p { code #key-command {} }
+                        button type="button" data-action="copy-key" { "Copy key" }
+                    }
+                    button type="button" data-action="new-key"
+                        data-user-id=(agent.user_id) { "Create a new key" }
+                } @else {
+                    dl.facts {
+                        dt { "Description" } dd { (agent.description) }
+                        dt { "Runs when" }
+                        dd {
+                            @if agent.on_assign { "assigned " }
+                            @if agent.on_mention { "mentioned" }
+                            @if !agent.on_assign && !agent.on_mention { "never" }
+                        }
+                        dt { "Max concurrent runs" } dd { (agent.max_concurrent) }
+                        dt { "Timeout" } dd { (agent.timeout_seconds) " seconds" }
+                        dt { "Allowed projects" }
+                        dd {
+                            @if agent.projects.is_empty() { "none" } @else { (agent.projects.join(", ")) }
+                        }
+                    }
+                    p.hint { "Only the owner can edit agents." }
+                }
             }
         },
     )

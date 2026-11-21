@@ -1,5 +1,6 @@
 //! The Aurora server: configuration and the HTTP surface.
 
+pub mod agents;
 pub mod auth;
 pub mod config;
 pub mod markdown;

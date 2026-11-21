@@ -12,6 +12,7 @@
 
 use std::sync::OnceLock;
 
+use aurora_store::agents;
 use aurora_store::auth::{self, Principal};
 use aurora_store::comments::{self, NewComment};
 use aurora_store::documents::{self, DocumentPatch, NewDocument};
@@ -25,6 +26,7 @@ use aurora_store::{Rejection, Store, StoreError, now_millis};
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 
+use crate::auth::Access;
 use crate::routes::LinkTarget;
 
 /// What a successful tool returns: a short sentence and the data.
@@ -587,6 +589,11 @@ fn build_specs() -> Vec<Spec> {
             "Who you are: the user of the API key, its role and the key's scope.",
             object(vec![], &[]),
         ),
+        read_spec(
+            "list_agents",
+            "List the registered agents with their name, description, triggers (on_assign, on_mention), enabled flag, limits and allowed projects. Never their command line. Assign an issue to an agent's user or mention it with @name to wake it.",
+            object(vec![], &[]),
+        ),
     ]
 }
 
@@ -971,10 +978,29 @@ fn page_args(args: &mut Args) -> Result<(Option<i64>, Option<i64>), String> {
 
 // ---- dispatch ----
 
+/// Every project a restricted agent addresses must be on its list. Tools name
+/// a project only through `project` and `issue` (`KEY-n`); the arguments that
+/// point at other issues (`parent`, `to`, ...) must name the same project, which
+/// the tools check themselves.
+fn guard(access: &Access, arguments: &Value) -> Result<(), String> {
+    if access.is_open() {
+        return Ok(());
+    }
+    let named = |field: &str| arguments.get(field).and_then(Value::as_str);
+    let from_issue = named("issue").and_then(|text| text.trim().rsplit_once('-').map(|p| p.0));
+    for key in named("project").into_iter().chain(from_issue) {
+        access
+            .check_project(key)
+            .map_err(|err| err.message().to_string())?;
+    }
+    Ok(())
+}
+
 /// Runs a tool. `None` means there is no such tool (a protocol error).
 pub async fn call(
     store: &Store,
     principal: &Principal,
+    access: &Access,
     name: &str,
     arguments: Value,
 ) -> Option<Value> {
@@ -984,16 +1010,20 @@ pub async fn call(
             "this key is read-only, so {name} is not available; use a key with write scope"
         )));
     }
+    if let Err(message) = guard(access, &arguments) {
+        return Some(error_result(&message));
+    }
     let outcome = match Args::new(arguments) {
-        Ok(args) => run(store, *principal, name, args).await,
+        Ok(args) => run(store, *principal, access, name, args).await,
         Err(message) => Err(message),
     };
     Some(render(outcome))
 }
 
-async fn run(store: &Store, p: Principal, name: &str, args: Args) -> Outcome {
+async fn run(store: &Store, p: Principal, access: &Access, name: &str, args: Args) -> Outcome {
     match name {
-        "list_projects" => list_projects(store, args).await,
+        "list_projects" => list_projects(store, access, args).await,
+        "list_agents" => list_agents(store, p, access, args).await,
         "get_project" => get_project(store, args).await,
         "list_issues" => list_issues(store, args).await,
         "get_issue" => get_issue(store, args).await,
@@ -1008,7 +1038,7 @@ async fn run(store: &Store, p: Principal, name: &str, args: Args) -> Outcome {
         "delete_comment" => delete_comment(store, p, args).await,
         "link_issues" => link_issues(store, p, args).await,
         "unlink_issues" => unlink_issues(store, p, args).await,
-        "search" => search_tool(store, args).await,
+        "search" => search_tool(store, access, args).await,
         "list_documents" => list_documents(store, args).await,
         "get_document" => get_document(store, args).await,
         "create_document" => create_document(store, p, args).await,
@@ -1021,12 +1051,37 @@ async fn run(store: &Store, p: Principal, name: &str, args: Args) -> Outcome {
 
 // ---- projects ----
 
-async fn list_projects(store: &Store, args: Args) -> Outcome {
+async fn list_agents(store: &Store, p: Principal, access: &Access, args: Args) -> Outcome {
     args.finish()?;
-    let list = store
+    let mut list = store
+        .read(move |c| agents::list_agents(c, &p))
+        .await
+        .map_err(describe)?;
+    for agent in &mut list {
+        // Even the owner's key gets no command line over MCP: model output
+        // would carry it into a transcript.
+        agent.private = None;
+        if let Some(allowed) = access.allowed() {
+            agent.projects.retain(|key| allowed.contains(key));
+        }
+    }
+    let names: Vec<String> = list
+        .iter()
+        .map(|a| format!("{}{}", a.name, if a.enabled { "" } else { " (disabled)" }))
+        .collect();
+    done(
+        format!("{} agent(s): {}", list.len(), names.join(", ")),
+        json!({ "agents": list.iter().map(js).collect::<Vec<_>>() }),
+    )
+}
+
+async fn list_projects(store: &Store, access: &Access, args: Args) -> Outcome {
+    args.finish()?;
+    let mut list = store
         .read(projects::list_projects)
         .await
         .map_err(describe)?;
+    list.retain(|project| access.allows(&project.key));
     let names: Vec<String> = list
         .iter()
         .map(|p| format!("{} ({})", p.key, p.name))
@@ -1610,7 +1665,7 @@ async fn unlink_issues(store: &Store, p: Principal, mut args: Args) -> Outcome {
 
 // ---- search ----
 
-async fn search_tool(store: &Store, mut args: Args) -> Outcome {
+async fn search_tool(store: &Store, access: &Access, mut args: Args) -> Outcome {
     let q = args.req_str("q")?;
     let project = args.opt_str("project")?;
     let kinds = match args.take("kinds") {
@@ -1641,8 +1696,9 @@ async fn search_tool(store: &Store, mut args: Args) -> Outcome {
         limit: Some(limit),
         offset,
     };
+    let allowed: Option<Vec<String>> = access.allowed().map(<[String]>::to_vec);
     let results = store
-        .read(move |c| search::search(c, &query))
+        .read(move |c| search::search_in(c, &query, allowed.as_deref()))
         .await
         .map_err(describe)?;
     let hits: Vec<Value> = results

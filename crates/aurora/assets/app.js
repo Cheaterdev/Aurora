@@ -276,6 +276,26 @@
       deleteComment(button);
     } else if (action === 'delete-initiative') {
       deleteInitiative(button);
+    } else if (action === 'copy-key') {
+      copyKey(button);
+    } else if (action === 'enable-agent' || action === 'disable-agent') {
+      agentAction(button, function () {
+        return api('POST', agentPath() + '/' + (action === 'enable-agent' ? 'enable' : 'disable'));
+      }, function () { location.reload(); });
+    } else if (action === 'delete-agent') {
+      if (!window.confirm('Delete this agent? Its user and keys stay; the registry entry goes.')) { return; }
+      agentAction(button, function () { return api('DELETE', agentPath()); },
+        function () { location.href = '/agents'; });
+    } else if (action === 'new-key') {
+      agentAction(button, function () {
+        return api('POST', '/keys', { name: 'agent key', user_id: Number(button.dataset.userId) });
+      }, function (made) {
+        button.disabled = false;
+        showKey(made.key);
+      });
+    } else if (action === 'revoke-key') {
+      agentAction(button, function () { return api('DELETE', '/keys/' + button.dataset.keyId); },
+        function () { location.reload(); });
     } else if (action === 'edit-document') {
       editDocument(true);
     } else if (action === 'cancel-edit') {
@@ -326,7 +346,77 @@
     });
   }
 
+  // ---- agents ----
+
+  function agentPayload(form, creating) {
+    var e = form.elements;
+    var payload = {
+      description: e.description.value.trim(),
+      command: e.command.value.trim(),
+      args: e.args.value.split(/\r?\n/).filter(function (line) { return line !== ''; }),
+      instructions: e.instructions.value,
+      max_concurrent: Number(e.max_concurrent.value),
+      timeout_seconds: Number(e.timeout_seconds.value),
+      on_assign: e.on_assign.checked,
+      on_mention: e.on_mention.checked,
+      projects: $$('input[name="project"]:checked', form).map(function (box) { return box.value; })
+    };
+    ['model', 'work_dir'].forEach(function (name) {
+      var text = e[name].value.trim();
+      if (text !== '') { payload[name] = text; } else if (!creating) { payload[name] = null; }
+    });
+    return payload;
+  }
+
+  // The key goes into the page only here, as text, and is never put in a URL.
+  function showKey(secret) {
+    var box = $('#key-box');
+    if (!box) { return; }
+    $('#key-value', box).textContent = secret;
+    $('#key-command', box).textContent = 'claude mcp add --transport http aurora ' + location.origin +
+      '/mcp --header "Authorization: Bearer ' + secret + '"';
+    box.hidden = false;
+    box.scrollIntoView({ block: 'center' });
+  }
+
+  function copyKey(button) {
+    var secret = $('#key-value').textContent;
+    if (!navigator.clipboard) { toast('Select the key and copy it by hand.', 'error'); return; }
+    navigator.clipboard.writeText(secret).then(function () { button.textContent = 'Copied'; },
+      function () { toast('Select the key and copy it by hand.', 'error'); });
+  }
+
+  function agentPath() { return '/agents/' + $('[data-agent-id]').dataset.agentId; }
+
+  function agentAction(button, run, done) {
+    button.disabled = true;
+    run().then(done, function (err) {
+      button.disabled = false;
+      message($('#page-msg'), err.message, 'error');
+    });
+  }
+
   var formHandlers = {
+    'new-agent': function (form) {
+      var payload = agentPayload(form, true);
+      payload.name = form.elements.name.value.trim();
+      payload.create_key = form.elements.create_key.checked;
+      return api('POST', '/agents', payload).then(function (made) {
+        if (!made.key) { location.href = '/agents/' + made.id; return; }
+        form.reset();
+        showKey(made.key);
+        $('.field-msg', form).textContent = 'Created. The agent is ';
+        var link = document.createElement('a');
+        link.href = '/agents/' + made.agent.id;
+        link.textContent = made.agent.name;
+        $('.field-msg', form).appendChild(link);
+      });
+    },
+    'edit-agent': function (form) {
+      return api('PATCH', agentPath(), agentPayload(form, false)).then(function () {
+        message($('.field-msg', form), 'Saved', 'saved');
+      });
+    },
     'add-issue': function (form) {
       var payload = { title: form.elements.title.value.trim(), column_id: Number(form.dataset.columnId) };
       if (form.elements.type_id) { payload.type_id = Number(form.elements.type_id.value); }

@@ -21,7 +21,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::StoreError;
-use crate::projects::{get_project, invalid, not_found};
+use crate::projects::{Rejection, get_project, invalid, not_found};
 
 pub const DEFAULT_LIMIT: i64 = 100;
 pub const MAX_LIMIT: i64 = 500;
@@ -109,12 +109,44 @@ pub fn read_events(
     limit: Option<i64>,
     filter: &EventFilter,
 ) -> Result<Vec<Event>, StoreError> {
+    read_events_in(conn, after_id, limit, filter, None)
+}
+
+/// [`read_events`] limited to the events of the projects whose keys are in
+/// `allowed` (`None`: no limit). Events without a project are left out of a
+/// limited read, an empty list shows nothing, and a `filter.project` outside
+/// the list is `Forbidden`.
+pub fn read_events_in(
+    conn: &Connection,
+    after_id: i64,
+    limit: Option<i64>,
+    filter: &EventFilter,
+    allowed: Option<&[String]>,
+) -> Result<Vec<Event>, StoreError> {
     if after_id < 0 {
         return Err(invalid("after must not be negative"));
     }
     let limit = limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
     let mut conditions = vec!["e.id > ?".to_string()];
     let mut values = vec![rusqlite::types::Value::Integer(after_id)];
+    if let Some(allowed) = allowed {
+        if let Some(key) = &filter.project
+            && !allowed.contains(key)
+        {
+            return Err(
+                Rejection::Forbidden(format!("this agent may not access project {key}")).into(),
+            );
+        }
+        let marks = vec!["?"; allowed.len()].join(", ");
+        conditions.push(format!(
+            "e.project_id IN (SELECT id FROM project WHERE key IN ({marks}))"
+        ));
+        values.extend(
+            allowed
+                .iter()
+                .map(|key| rusqlite::types::Value::Text(key.clone())),
+        );
+    }
     if let Some(key) = &filter.project {
         let project = get_project(conn, key)?;
         conditions.push("e.project_id = ?".into());

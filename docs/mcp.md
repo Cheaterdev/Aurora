@@ -56,6 +56,12 @@ Any other client needs the same two things: the URL and the header
   other tool returns an error result saying "this key is read-only".
 * Owner-only operations (creating users, managing other users' keys, creating
   projects) are not exposed over MCP; use the REST API.
+* A key of a registered agent (see `list_agents`) is limited to the agent's
+  allowed projects, an empty list meaning none. A tool call that names another
+  project returns an error result `this agent may not access project KEY`;
+  `list_projects` and `search` show only allowed projects. If the agent is
+  disabled every request is `403` "agent is disabled". Humans and agent users
+  without a registry entry are not restricted.
 
 ## Errors
 
@@ -234,6 +240,12 @@ overwriting a newer edit.
 ### `list_initiatives`
 
 `project`; optional `status`. Initiatives with progress and health.
+
+### `list_agents`
+
+No arguments. Read only. The registered agents with their trigger switches,
+limits and allowed projects (a registered agent sees only the allowed ones
+among them); the command, arguments and instructions are never included.
 
 ### `get_current_user`
 

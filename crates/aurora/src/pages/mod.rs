@@ -46,6 +46,8 @@ pub fn router(store: Store, live: Live) -> Router<Store> {
     let pages = Router::new()
         .route("/", get(home))
         .route("/search", get(search_page))
+        .route("/agents", get(agents_page))
+        .route("/agents/{id}", get(agent_page))
         .route("/p/{key}", get(board_page))
         .route("/p/{key}/board", get(board_fragment))
         .route("/p/{key}/initiatives", get(initiatives_page))
@@ -198,7 +200,17 @@ async fn require_page_auth(State(store): State<Store>, mut req: Request, next: N
     let headers = req.headers().clone();
     let uri = req.uri().clone();
     match auth::authenticate(&store, &method, &headers).await {
-        Ok((principal, via)) => {
+        // The pages are the people's UI; a registered agent's key is limited
+        // to its projects and cannot be checked page by page.
+        Ok((_, _, access)) if !access.is_open() => html_response(
+            StatusCode::FORBIDDEN,
+            view::message(
+                "Not allowed",
+                "A registered agent's key cannot be used for the web pages.",
+                None,
+            ),
+        ),
+        Ok((principal, via, _)) => {
             req.extensions_mut().insert(principal);
             req.extensions_mut().insert(via);
             next.run(req).await
@@ -339,6 +351,35 @@ async fn home(
         return Ok(Redirect::to(&format!("/p/{}", only.key)).into_response());
     }
     Ok(ok(view::home(&page)))
+}
+
+/// Pages that show a key once must not be cached or stored.
+fn no_store(mut response: Response) -> Response {
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
+
+async fn agents_page(
+    State(store): State<Store>,
+    Extension(principal): Extension<Principal>,
+) -> PageResult {
+    let data = store
+        .read(move |c| data::load_agents(c, &principal))
+        .await?;
+    Ok(no_store(ok(view::agents_page(&data))))
+}
+
+async fn agent_page(
+    State(store): State<Store>,
+    Extension(principal): Extension<Principal>,
+    Path(id): Path<i64>,
+) -> PageResult {
+    let data = store
+        .read(move |c| data::load_agent(c, &principal, id))
+        .await?;
+    Ok(no_store(ok(view::agent_page(&data))))
 }
 
 #[derive(Deserialize)]
