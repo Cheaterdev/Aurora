@@ -11,6 +11,10 @@
 //! | `mid_migration`                | inside a migration's transaction, SQL run, version row not recorded       | old schema intact; the next start migrates once, backup exists  |
 //! | `mid_ack`                      | consumer ack transaction, cursor updated, `COMMIT` not yet issued         | the cursor where it was; the events are delivered again         |
 //!
+//! | `run_after_create`             | runner, run row committed as `starting`, process not spawned              | the run is `interrupted`, key revoked, no second run for the event |
+//! | `run_after_spawn`              | runner, process spawned, run not yet marked `running`                     | same; the stray process is for TRK-45 to reap                   |
+//! | `run_before_finish`            | runner, process exited, the finish not yet committed                      | same                                                            |
+//!
 //! `before_commit` and `after_commit` are in [`crate::Store::write`], so they
 //! cover every write of the server except the start-up and hourly purge of old
 //! request ids (maintenance, deliberately left out so that a hit count counts
@@ -40,16 +44,22 @@ pub enum Point {
     BeforeEventDelivery,
     MidMigration,
     MidAck,
+    RunAfterCreate,
+    RunAfterSpawn,
+    RunBeforeFinish,
 }
 
 impl Point {
-    pub const ALL: [Point; 6] = [
+    pub const ALL: [Point; 9] = [
         Point::BeforeCommit,
         Point::AfterCommit,
         Point::AfterCommitBeforeResponse,
         Point::BeforeEventDelivery,
         Point::MidMigration,
         Point::MidAck,
+        Point::RunAfterCreate,
+        Point::RunAfterSpawn,
+        Point::RunBeforeFinish,
     ];
 
     pub fn name(self) -> &'static str {
@@ -60,6 +70,9 @@ impl Point {
             Point::BeforeEventDelivery => "before_event_delivery",
             Point::MidMigration => "mid_migration",
             Point::MidAck => "mid_ack",
+            Point::RunAfterCreate => "run_after_create",
+            Point::RunAfterSpawn => "run_after_spawn",
+            Point::RunBeforeFinish => "run_before_finish",
         }
     }
 

@@ -66,7 +66,10 @@ pub fn router(store: Store, live: Live) -> Router<Store> {
             "/p/{key}/documents/{id}/history/{number}",
             get(revision_page),
         )
+        .route("/p/{key}/runs/{id}", get(run_page))
+        .route("/p/{key}/runs/{id}/live", get(run_fragment))
         .route("/p/{key}/{number}", get(issue_page))
+        .route("/p/{key}/{number}/runs", get(runs_fragment))
         .route("/p/{key}/{number}/activity", get(activity_fragment))
         .route("/p/{key}/{number}/comments", get(comments_fragment))
         .layer(middleware::from_fn_with_state(
@@ -598,6 +601,45 @@ async fn issue_page(
         .read(move |c| data::load_issue(c, principal.user_id, &key, number))
         .await?;
     Ok(ok(view::issue_page(&issue)))
+}
+
+async fn runs_fragment(
+    State(store): State<Store>,
+    Path((key, number)): Path<(String, i64)>,
+) -> PageResult {
+    let data = store
+        .read(move |c| data::load_issue_runs(c, &key, number))
+        .await?;
+    Ok(ok(view::runs_fragment(&data)))
+}
+
+async fn load_run(
+    store: &Store,
+    principal: Principal,
+    key: String,
+    id: i64,
+) -> Result<data::RunPageData, PageError> {
+    Ok(store
+        .read(move |c| data::load_run(c, principal.user_id, &key, id))
+        .await?)
+}
+
+async fn run_page(
+    State(store): State<Store>,
+    Extension(principal): Extension<Principal>,
+    Path((key, id)): Path<(String, i64)>,
+) -> PageResult {
+    let data = load_run(&store, principal, key, id).await?;
+    Ok(no_store(ok(view::run_page(&data))))
+}
+
+async fn run_fragment(
+    State(store): State<Store>,
+    Extension(principal): Extension<Principal>,
+    Path((key, id)): Path<(String, i64)>,
+) -> PageResult {
+    let data = load_run(&store, principal, key, id).await?;
+    Ok(no_store(ok(view::run_fragment(&data))))
 }
 
 async fn activity_fragment(

@@ -1246,6 +1246,56 @@ mark {
   gap: 12px;
 }
 
+.run-list {
+  list-style: none;
+  padding: 0;
+  margin: 0 0 16px;
+  display: grid;
+  gap: 4px;
+}
+
+.run-list li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 8px;
+  min-height: var(--target);
+}
+
+.run-link {
+  display: inline-flex;
+  align-items: center;
+  min-height: var(--target);
+}
+
+.chip-run[data-status="succeeded"] {
+  color: var(--success);
+}
+
+.chip-run[data-status="failed"],
+.chip-run[data-status="interrupted"] {
+  background: var(--danger-bg);
+  color: var(--danger);
+}
+
+.run-text {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 10px 14px;
+  margin: 0 0 16px;
+  max-height: 32rem;
+  overflow: auto;
+  font-family: var(--font-mono);
+  font-size: 0.85rem;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.run-now textarea {
+  font-family: var(--font-mono);
+}
+
 @media (prefers-reduced-motion: no-preference) {
   .card,
   .column {

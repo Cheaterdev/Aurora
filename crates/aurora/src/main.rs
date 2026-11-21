@@ -67,10 +67,24 @@ async fn run(config: Config) -> Result<()> {
     };
     tracing::info!(addr = %listener.local_addr()?, "listening");
 
-    // TRK-45 registers the "mark active runs interrupted" hook here.
+    // Reconciles runs a crash left active, then starts the dispatcher; its
+    // shutdown (kill children, mark runs interrupted) is a hook of `serve_with`.
+    // TRK-45 hardens this (stray processes, moving cards).
+    let runner_config = aurora::runner::RunnerConfig::for_server(
+        &store,
+        listener.local_addr()?,
+        aurora::runner::RunnerOptions::default(),
+    );
+    let runner = match aurora::Runner::start(store.clone(), runner_config).await {
+        Ok(runner) => runner,
+        Err(err) => {
+            store.close().await;
+            return Err(err).context("starting the runner");
+        }
+    };
     let hooks = aurora::ShutdownHooks::new();
 
-    aurora::serve(
+    aurora::serve_with(
         listener,
         store,
         async move {
@@ -78,6 +92,7 @@ async fn run(config: Config) -> Result<()> {
             tracing::info!(signal = name, "shutdown signal received");
         },
         hooks,
+        Some(runner),
     )
     .await
 }

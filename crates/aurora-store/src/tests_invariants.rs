@@ -229,7 +229,7 @@ async fn a_dangling_reference_fails_the_foreign_key_check() {
 
 #[tokio::test]
 async fn a_database_behind_this_build_fails_and_skips_the_rest() {
-    let report = corrupted("DELETE FROM schema_version WHERE version = 13;").await;
+    let report = corrupted("DELETE FROM schema_version WHERE version = 14;").await;
     let details = failed(&report, "schema.version");
     assert!(details.contains("start aurora to migrate"), "{details}");
     let skipped = failed(&report, "events.state_agreement");
@@ -386,12 +386,12 @@ async fn a_stale_search_index_fails_the_search_check() {
 }
 
 #[tokio::test]
-async fn the_runs_slot_is_vacuous_and_says_so() {
+async fn the_runs_check_is_real_and_counts_runs() {
     let (_dir, path) = seeded().await;
     let report = invariants::check_file(&path).unwrap();
     let runs = report.get("runs.no_orphans").unwrap();
     assert!(runs.ok);
-    assert!(runs.details.starts_with("vacuous"), "{}", runs.details);
+    assert!(runs.details.starts_with("0 runs"), "{}", runs.details);
 }
 
 #[tokio::test]

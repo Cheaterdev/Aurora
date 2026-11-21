@@ -700,6 +700,14 @@ pub fn delete_agent(
 ) -> Result<(), StoreError> {
     require_owner(actor)?;
     let agent = agent_config(tx, id)?;
+    let runs: i64 = tx.query_row("SELECT COUNT(*) FROM run WHERE agent_id = ?1", [id], |r| {
+        r.get(0)
+    })?;
+    if runs > 0 {
+        return Err(conflict(format!(
+            "the agent has {runs} run(s) on record; disable it instead of deleting it"
+        )));
+    }
     tx.execute("DELETE FROM agent WHERE id = ?1", [id])?;
     emit_as(
         tx,

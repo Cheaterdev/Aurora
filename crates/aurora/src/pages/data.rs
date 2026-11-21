@@ -12,6 +12,7 @@ use aurora_store::issues::{self, Issue, IssueDetail, IssueFilter};
 use aurora_store::links::{self, Blocker};
 use aurora_store::projects::{self, Column, IssueType, Label, Project};
 use aurora_store::prompt::{self, PromptTemplate, TemplateSource, VariableInfo};
+use aurora_store::runs::{self, Run, RunDetail, RunFilter};
 use aurora_store::rusqlite::Connection;
 use aurora_store::search::{self, Kind, SearchQuery, SearchResults};
 use aurora_store::{Rejection, StoreError, now_millis};
@@ -52,7 +53,62 @@ pub struct IssueData {
     pub initiatives: Vec<Initiative>,
     pub activity: Vec<Event>,
     pub comments: Vec<Comment>,
+    pub runs: Vec<Run>,
     pub last_event: i64,
+}
+
+/// How many runs the issue page lists.
+const ISSUE_RUNS: i64 = 10;
+
+pub struct RunsData {
+    pub project: String,
+    pub runs: Vec<Run>,
+}
+
+pub fn load_issue_runs(conn: &Connection, key: &str, number: i64) -> Result<RunsData, StoreError> {
+    issues::get_issue(conn, key, number)?;
+    Ok(RunsData {
+        project: key.to_string(),
+        runs: issue_runs(conn, key, number)?,
+    })
+}
+
+fn issue_runs(conn: &Connection, key: &str, number: i64) -> Result<Vec<Run>, StoreError> {
+    runs::list_runs(
+        conn,
+        &RunFilter {
+            issue: Some((key.to_string(), number)),
+            limit: Some(ISSUE_RUNS),
+            ..RunFilter::default()
+        },
+    )
+}
+
+pub struct RunPageData {
+    pub user: User,
+    pub project: Project,
+    pub detail: RunDetail,
+    pub last_event: i64,
+}
+
+/// A run is shown under its own project only.
+pub fn load_run(
+    conn: &Connection,
+    user_id: i64,
+    key: &str,
+    id: i64,
+) -> Result<RunPageData, StoreError> {
+    let last_event = events::latest_event_id(conn)?;
+    let detail = runs::get_run(conn, id)?;
+    if detail.run.project != key {
+        return Err(StoreError::Rejected(Rejection::NotFound("run".into())));
+    }
+    Ok(RunPageData {
+        user: auth::get_user(conn, user_id)?,
+        project: projects::get_project(conn, key)?,
+        detail,
+        last_event,
+    })
 }
 
 pub struct InitiativesData {
@@ -375,6 +431,7 @@ pub fn load_issue(
         initiatives: project_initiatives(conn, key)?,
         activity,
         comments: comments::list_comments(conn, key, number)?,
+        runs: issue_runs(conn, key, number)?,
         last_event,
     })
 }

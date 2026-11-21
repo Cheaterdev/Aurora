@@ -323,6 +323,10 @@
       previewPrompt(button);
     } else if (action === 'reload-page') {
       location.reload();
+    } else if (action === 'preview-run') {
+      previewRun(button);
+    } else if (action === 'cancel-run') {
+      cancelRun(button);
     }
   });
 
@@ -503,7 +507,75 @@
     });
   }
 
+  // ---- runs ----
+
+  function previewRun(button) {
+    var form = button.closest('form');
+    var area = form.elements.message;
+    var out = $('.field-msg', form);
+    var payload = { project: form.elements.project.value, number: Number(form.elements.number.value) };
+    if (!payload.project || !payload.number) {
+      message(out, 'Choose a project and an issue number.', 'error');
+      return;
+    }
+    button.disabled = true;
+    message(out, '');
+    api('POST', agentPath() + '/prompt-preview', payload).then(function (made) {
+      // The text is put in a textarea value, never parsed as markup.
+      area.value = made.text;
+      area.dataset.rendered = made.text;
+      message(out, made.chars + ' characters, written from ' + made.template_source.replace('_', ' ') + '.', 'saved');
+      button.disabled = false;
+    }, function (err) {
+      message(out, err.message, 'error');
+      button.disabled = false;
+    });
+  }
+
+  function refreshRun() {
+    return fetchFragment('/p/' + encodeURIComponent(project) + '/runs/' + body.dataset.runId + '/live').then(function (html) {
+      var current = $('#run-live');
+      if (!html || !current) { return; }
+      var fresh = parseFragment(html);
+      if (!fresh) { return; }
+      current.replaceWith(fresh);
+      localizeTimes(fresh);
+    });
+  }
+
+  function refreshRuns() {
+    return fetchFragment('/p/' + encodeURIComponent(project) + '/' + body.dataset.issueNumber + '/runs').then(function (html) {
+      var current = $('#runs');
+      if (!html || !current) { return; }
+      var fresh = parseFragment(html);
+      if (!fresh) { return; }
+      current.replaceWith(fresh);
+      localizeTimes(fresh);
+    });
+  }
+
+  function cancelRun(button) {
+    if (!window.confirm('Stop this run? The process is ended.')) { return; }
+    button.disabled = true;
+    api('POST', '/runs/' + button.dataset.runId + '/cancel').then(function () {
+      // What the process printed is recorded a moment after the cancel.
+      refreshRun();
+      setTimeout(refreshRun, 2500);
+    }, function (err) {
+      button.disabled = false;
+      message($('#page-msg'), err.message, 'error');
+    });
+  }
+
   var formHandlers = {
+    'start-run': function (form) {
+      var area = form.elements.message;
+      var payload = { issue: form.elements.project.value + '-' + Number(form.elements.number.value) };
+      if (area.value.trim() !== '' && area.value !== area.dataset.rendered) { payload.message = area.value; }
+      return api('POST', agentPath() + '/runs', payload).then(function (made) {
+        location.href = '/p/' + encodeURIComponent(made.project) + '/runs/' + made.id;
+      });
+    },
     'save-template': function (form) {
       var payload = { project: form.elements.project.value, body: form.elements.body.value };
       if (form.elements.issue_type_id.value) { payload.issue_type_id = Number(form.elements.issue_type_id.value); }
@@ -956,6 +1028,10 @@
     if (typeof data.id === 'number') { lastEvent = Math.max(lastEvent, data.id); }
     if (page === 'board') {
       scheduleBoardRefresh();
+    } else if (page === 'run') {
+      if (data.entity_kind === 'run' && String(data.entity_id) === body.dataset.runId) { refreshRun(); }
+    } else if (page === 'issue' && data.entity_kind === 'run') {
+      refreshRuns();
     } else if (page === 'issue' && data.entity_kind === 'issue' && String(data.entity_id) === body.dataset.issueId) {
       refreshActivity();
       if (typeof data.kind === 'string' && data.kind.indexOf('comment.') === 0) { scheduleCommentsRefresh(); }
@@ -978,7 +1054,7 @@
   }
 
   function connect() {
-    var live = page === 'board' || page === 'issue' || page === 'initiatives' || page === 'initiative' ||
+    var live = page === 'board' || page === 'issue' || page === 'run' || page === 'initiatives' || page === 'initiative' ||
       page === 'documents' || page === 'document';
     if (!window.EventSource || !project || !live) { return; }
     var url = '/events/stream?after=' + lastEvent + '&project=' + encodeURIComponent(project);

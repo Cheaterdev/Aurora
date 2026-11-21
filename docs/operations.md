@@ -44,7 +44,7 @@ command exits with 2 and says so; check a copy then.
 | `request_log.rows` | every remembered request id belongs to an existing user and a `2xx` response |
 | `search.index` | the full-text index holds exactly the issues, comments and documents that should be in it |
 | `prompt_templates.valid` | every stored prompt template parses and uses only known variables, and its issue type belongs to its project, so a run can never start from a template that fails validation |
-| `runs.no_orphans` | **vacuous today**: there is no run table until TRK-15; the slot exists so the runner tasks fill it in |
+| `runs.no_orphans` | an active run (`starting`/`running`) has a live key of its agent's user, no finish time, and a pid once `running`; a finished run has a finish time and no live key. (Foreign keys and a unique index cover missing rows and two active runs on one issue.) Offline (`aurora check`) an active run is allowed, because nobody can say whether its process lives; the server's own check right after start-up also demands that every active run belongs to the current boot |
 
 About `events.ids`: `AUTOINCREMENT` guarantees ids only grow and are never
 reused, not that they are contiguous. SQLite updates its counter inside the
@@ -73,9 +73,9 @@ folder is not inspected.
 
 Append an `Invariant` to `INVARIANTS` in `crates/aurora-store/src/invariants.rs`
 with a stable name and a test in `tests_invariants.rs` that corrupts a copy of a
-database and proves the check notices. TRK-15 turns `runs.no_orphans` into a real
-query (a run recorded as active whose owning process is gone), and TRK-18 and
-TRK-45 extend it for the supervisor and the interrupted-on-shutdown state.
+database and proves the check notices. TRK-15 made `runs.no_orphans` real (see
+the table), and TRK-18 and TRK-45 extend it for the supervisor and for processes
+that outlive the server.
 
 ## Failpoints (development and tests only)
 
@@ -91,6 +91,9 @@ named place in the write path. They are listed in one place,
 | `before_event_delivery` | live stream or consumer poll: events read, none sent | events still in the log; a consumer that did not acknowledge gets them again (at least once) |
 | `mid_migration` | inside a migration's transaction, SQL run, version not recorded | old schema intact; the next start backs up and migrates once |
 | `mid_ack` | consumer ack transaction, cursor updated, not committed | the cursor where it was; the events are delivered again |
+| `run_after_create` | runner, run row committed as `starting`, process not spawned | the run is `interrupted` ("server restarted"), its key revoked, no second run for the event |
+| `run_after_spawn` | runner, process spawned, run not yet marked `running` | same; the stray process is for TRK-45 to reap |
+| `run_before_finish` | runner, process exited, the finish not yet committed | same |
 
 Arm one with `AURORA_TEST_FAILPOINT=<name>` (first hit) or `<name>:<n>` (the n-th
 hit of that point in this process). `before_commit` and `after_commit` cover
@@ -107,7 +110,63 @@ cargo build --release
 Select-String -Path target\release\aurora.exe -Pattern AURORA_TEST_FAILPOINT -Quiet   # False
 ```
 
+## The runner (runs)
+
+The server starts one run when an issue is assigned to a registered agent's user
+or a comment mentions it (and the agent is enabled, allowed on the project and
+has that trigger switched on), or when a person starts one (`POST
+/api/v1/agents/{id}/runs`, or "Run on an issue now" on the agent page). The
+rules are in `docs/api.md` (Runs); this is what runs where.
+
+- **Dispatcher.** An event consumer named `runner`, registered at the newest
+  event the first time (history is never replayed into runs), polled twice a
+  second and acknowledged after each batch. Delivery is at least once:
+  `UNIQUE(trigger_event_id, agent_id)` makes a repeat harmless, and the partial
+  unique index `run_one_active_per_issue` allows one `starting`/`running` run per
+  issue. A trigger for an issue that already has an active run is dropped (logged
+  at info); queueing is TRK-18.
+- **A run's life.** `starting` (row, message, key and `run.created` event in one
+  transaction) then `running` (`run.started`, with the pid) then one of
+  `succeeded`, `failed` (exit code other than 0, timeout, command not found, bad
+  working folder), `canceled` (a person) or `interrupted` (the server stopped or
+  was killed). The end, the revocation of the run's key and `run.finished` are one
+  transaction. A start-up pass marks every run left active by a previous boot
+  `interrupted` ("server restarted") and revokes its key; a clean shutdown stops
+  the children, waits up to 7 seconds and marks what is left `interrupted`
+  ("server stopped").
+- **The process.** The agent's command, as registered, is launched as a plain
+  child process: no shell, so quoting in `args` is not interpreted. The first
+  message goes to standard input, or into every `{prompt}` argument. `{issue}`,
+  `{run_id}` and `{mcp_config}` are substituted too. The environment adds
+  `AURORA_URL`, `AURORA_MCP_URL`, `AURORA_API_KEY` (a write key created for this
+  run), `AURORA_RUN_ID`, `AURORA_ISSUE`, `AURORA_PROJECT` and `AURORA_TRIGGER`.
+  The working folder is the agent's `work_dir` (it must exist) or, when none is
+  set, a fresh `runs/<id>/work/` next to the database. `runs/<id>/` also holds
+  `mcp.json` for a command named `claude` (or when `{mcp_config}` is used); it
+  is written to a temporary name, flushed and renamed, and holds the key, so it
+  is as private as the data folder. Standard output and error, merged, are the
+  transcript: the last 64 KiB are stored.
+- **Windows.** The command is looked up on `PATH` with `PATHEXT` and may be an
+  `.exe`, `.cmd` or `.bat`. A `.cmd`/`.bat` shim is run through the command
+  interpreter with the arguments quoted for it, and an argument holding `{prompt}`
+  is refused for a shim (a prompt cannot be quoted safely for `cmd.exe`: use
+  standard input). No console window is opened. Stopping a run (cancel, timeout,
+  shutdown) ends the whole process tree with `taskkill /T /F`; on other systems
+  the child leads its own process group and the group gets the signal.
+  Nothing besides the aurora binary and the agent's command is needed.
+- **Not yet.** A process is not tied to the server: if the server is killed the
+  agent keeps running until it ends by itself, and its key is already revoked at
+  the next start. Job objects / process groups that die with the server, and
+  reaping strays, are TRK-45. The transcript appears when the run ends (live
+  output is TRK-17).
+
 ## The crash tests
+
+`crates/aurora/tests/runner_crash.rs` kills the real binary at each `run_*`
+failpoint while the fake agent (`crates/aurora/examples/fake_agent.rs`) is being
+launched, restarts it and checks that the run is `interrupted` exactly once, its
+key is revoked, redelivery of the assignment makes no second run and `aurora
+check` passes. The rest of this section is about the write-path matrix.
 
 `crates/aurora/tests/crash_matrix.rs` runs the real binary built by `cargo test`.
 For every failpoint above and several hit counts (1, 2, 5, 17 where there are

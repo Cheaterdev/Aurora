@@ -10,6 +10,8 @@ pub mod mcp;
 pub mod pages;
 pub mod prompts;
 pub mod routes;
+pub mod runner;
+pub mod runs;
 pub mod shutdown;
 #[cfg_attr(windows, path = "signal/windows.rs")]
 #[cfg_attr(not(windows), path = "signal/other.rs")]
@@ -33,6 +35,7 @@ use tokio::sync::oneshot;
 use tower_http::catch_panic::CatchPanicLayer;
 
 use pages::Live;
+pub use runner::Runner;
 pub use shutdown::ShutdownHooks;
 pub use signal::shutdown_signal;
 pub use supervise::spawn_supervised;
@@ -59,15 +62,18 @@ async fn health(State(store): State<Store>) -> Json<Health> {
 fn app_routes(store: Store) -> Router<Store> {
     // Nothing stops these streams; only `serve` can end them at shutdown.
     let (live, _control) = Live::start(store.clone());
-    app_routes_with(store, live)
+    app_routes_with(store, live, None)
 }
 
-fn app_routes_with(store: Store, live: Live) -> Router<Store> {
+/// `runner` is `None` for a server without one (most tests): the routes that
+/// start or cancel a run then answer 503.
+fn app_routes_with(store: Store, live: Live, runner: Option<Runner>) -> Router<Store> {
     Router::new()
         .route("/health", get(health))
         .nest("/api/v1", routes::api_router(store.clone()))
         .merge(mcp::router())
         .merge(pages::router(store, live))
+        .layer(axum::Extension(runner))
 }
 
 fn panic_response(payload: Box<dyn Any + Send + 'static>) -> Response {
@@ -97,16 +103,34 @@ pub async fn serve(
     listener: TcpListener,
     store: Store,
     shutdown: impl Future<Output = ()> + Send + 'static,
+    hooks: ShutdownHooks,
+) -> Result<()> {
+    serve_with(listener, store, shutdown, hooks, None).await
+}
+
+/// [`serve`] with a [`Runner`] (see `Runner::start`): its shutdown runs as a
+/// hook, after the HTTP drain and before the store closes.
+pub async fn serve_with(
+    listener: TcpListener,
+    store: Store,
+    shutdown: impl Future<Output = ()> + Send + 'static,
     mut hooks: ShutdownHooks,
+    runner: Option<Runner>,
 ) -> Result<()> {
     idem::register_purge_stop(
         &mut hooks,
         idem::spawn_purge(store.clone(), idem::PURGE_INTERVAL),
     );
+    if let Some(runner) = runner.clone() {
+        hooks.register("runner", move || async move {
+            runner.shutdown().await;
+            Ok(())
+        });
+    }
     // Open event streams never finish on their own: they must end when
     // shutdown starts, or the drain would wait for them.
     let (live, control) = Live::start(store.clone());
-    let app = with_layers(app_routes_with(store.clone(), live).with_state(store.clone()));
+    let app = with_layers(app_routes_with(store.clone(), live, runner).with_state(store.clone()));
     let shutdown = async move {
         shutdown.await;
         control.stop();

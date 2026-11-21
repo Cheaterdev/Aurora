@@ -36,6 +36,7 @@ impl Resp {
 struct Server {
     addr: std::net::SocketAddr,
     store: Store,
+    runner: aurora::Runner,
     key: String,
     other_key: String,
     _dir: tempfile::TempDir,
@@ -50,16 +51,24 @@ impl Server {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let (stop, stopped) = oneshot::channel::<()>();
-        tokio::spawn(aurora::serve(
+        let config = aurora::runner::RunnerConfig::for_server(
+            &store,
+            addr,
+            aurora::runner::RunnerOptions::default(),
+        );
+        let runner = aurora::Runner::start(store.clone(), config).await.unwrap();
+        tokio::spawn(aurora::serve_with(
             listener,
             store.clone(),
             async {
                 let _ = stopped.await;
             },
             aurora::ShutdownHooks::new(),
+            Some(runner.clone()),
         ));
         let mut server = Server {
             addr,
+            runner,
             store,
             key,
             other_key: String::new(),
@@ -159,7 +168,13 @@ impl Server {
                     Ok(())
                 };
                 for table in tables {
-                    dump_query(format!("SELECT * FROM \"{table}\""))?;
+                    // The runner's own cursor moves in the background.
+                    let filter = if table == "consumer_cursor" {
+                        " WHERE name <> 'runner'"
+                    } else {
+                        ""
+                    };
+                    dump_query(format!("SELECT * FROM \"{table}\"{filter}"))?;
                 }
                 dump_query(
                     "SELECT id, user_id, name, prefix, key_hash, scope, created, revoked
@@ -170,6 +185,31 @@ impl Server {
             })
             .await
             .unwrap()
+    }
+
+    /// Waits until no launched process is still changing its run, so that
+    /// database dumps taken around it are comparable. The held run of the
+    /// cancel sample has no process and is not counted.
+    async fn settle_runs(&self, held: i64) {
+        for _ in 0..400 {
+            let active: i64 = self
+                .store
+                .read(move |c| {
+                    Ok(c.query_row(
+                        "SELECT COUNT(*) FROM run
+                         WHERE status IN ('starting', 'running') AND id <> ?1",
+                        [held],
+                        |r| r.get(0),
+                    )?)
+                })
+                .await
+                .unwrap();
+            if active == 0 {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        panic!("a run did not finish");
     }
 
     async fn request_log_rows(&self) -> i64 {
@@ -238,6 +278,9 @@ struct World {
     template_delete: i64,
     key_rotate: i64,
     key_revoke: i64,
+    agent_runs: i64,
+    /// An active run with no process behind it, for the cancel sample.
+    run_cancel: i64,
 }
 
 async fn build_world(s: &Server) -> World {
@@ -415,7 +458,47 @@ async fn build_world(s: &Server) -> World {
             .await;
         keys.push(id(&made));
     }
+    // Triggers are off so that no sample starts a run by accident.
+    let runs_agent = s
+        .ok(
+            "POST",
+            "/api/v1/agents",
+            Some(
+                json!({"name": "bot-runs", "command": "echo", "projects": ["TRK"],
+                        "on_assign": false, "on_mention": false}),
+            ),
+        )
+        .await;
+    let agent_runs = id(&runs_agent);
+    let boot = s.runner.boot_id().to_string();
+    let run_cancel = s
+        .store
+        .write(move |tx| {
+            let made = aurora_store::runs::create_run(
+                tx,
+                aurora_store::now_millis(),
+                None,
+                aurora_store::runs::NewRun {
+                    agent_id: agent_runs,
+                    project: "TRK".into(),
+                    number: 10,
+                    reason: aurora_store::runs::RunReason::Manual,
+                    trigger_event_id: None,
+                    message: Some("held".into()),
+                    template_source: None,
+                    template_id: None,
+                    edited: false,
+                    boot_id: boot,
+                    failed: None,
+                },
+            )?;
+            Ok(made.run.id)
+        })
+        .await
+        .unwrap();
     World {
+        agent_runs,
+        run_cancel,
         cols,
         col_order,
         col_temp: id(&temp),
@@ -556,6 +639,19 @@ fn samples(w: &World) -> Vec<Sample> {
             "/agents/{id}/templates/{template_id}",
             &format!("/agents/{}/templates/{}", w.agent_patch, w.template_delete),
             204,
+        ),
+        sample(
+            "POST",
+            "/agents/{id}/runs",
+            &format!("/agents/{}/runs", w.agent_runs),
+            201,
+        )
+        .body(json!({"issue": "TRK-6"}), json!({"issue": "TRK-7"})),
+        sample(
+            "POST",
+            "/runs/{id}/cancel",
+            &format!("/runs/{}/cancel", w.run_cancel),
+            200,
         ),
         sample("POST", "/projects", "/projects", 201).body(
             json!({"key": "NEW", "name": "New"}),
@@ -866,6 +962,7 @@ async fn every_mutating_endpoint_applies_a_repeated_request_id_once() {
         let first = s.call(x.method, &x.path, x.body.as_ref(), Some(&id)).await;
         assert_eq!(first.status, x.status, "{what}: {}", first.body);
         assert!(!first.replayed(), "{what}: the first call is not a replay");
+        s.settle_runs(w.run_cancel).await;
         let applied = s.dump().await;
         assert_ne!(applied, before, "{what}: the sample changes something");
 
@@ -911,6 +1008,7 @@ async fn every_mutating_endpoint_applies_a_repeated_request_id_once() {
             .send(&s.other_key, x.method, &x.path, x.body.as_ref(), Some(&id))
             .await;
         assert!(!other.replayed(), "{what}: ids are per user");
+        s.settle_runs(w.run_cancel).await;
         assert_ne!(
             other.json_or_null()["error"],
             MISMATCH,
@@ -925,8 +1023,9 @@ async fn every_mutating_endpoint_applies_a_repeated_request_id_once() {
         .read(|c| {
             Ok(c.query_row(
                 "SELECT COUNT(*) FROM request_log
-                 WHERE response_body LIKE '%aur_%' OR fingerprint LIKE '%aur_%'
-                    OR request_id LIKE '%aur_%'",
+                 WHERE response_body LIKE '%aur\\_%' ESCAPE '\\'
+                    OR fingerprint LIKE '%aur\\_%' ESCAPE '\\'
+                    OR request_id LIKE '%aur\\_%' ESCAPE '\\'",
                 [],
                 |r| r.get(0),
             )?)

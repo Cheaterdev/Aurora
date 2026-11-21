@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::auth::Access;
-use crate::{agents, auth, idem, markdown, prompts};
+use crate::{agents, auth, idem, markdown, prompts, runs};
 
 const DEFAULT_LABEL_COLOR: &str = "#808080";
 
@@ -130,6 +130,10 @@ fn api_tables() -> (Table, Table) {
             &["POST"],
             post(prompts::preview),
         )
+        .route("/agents/{id}/runs", &["POST"], post(runs::start_run))
+        .route("/runs", &["GET"], get(runs::list_runs))
+        .route("/runs/{id}", &["GET"], get(runs::get_run))
+        .route("/runs/{id}/cancel", &["POST"], post(runs::cancel_run))
         .route("/prompt/variables", &["GET"], get(prompts::variables))
         .route(
             "/projects",
@@ -344,6 +348,13 @@ pub struct ApiError {
 }
 
 impl ApiError {
+    pub(crate) fn new(status: StatusCode, message: impl Into<String>) -> Self {
+        ApiError {
+            status,
+            message: message.into(),
+        }
+    }
+
     pub(crate) fn status(&self) -> StatusCode {
         self.status
     }

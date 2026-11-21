@@ -18,6 +18,7 @@ use aurora_store::issues::{Issue, Priority};
 use aurora_store::links::{Blocker, IssueLinks, LinkedIssue};
 use aurora_store::projects::{Column, IssueType, Label, Project};
 use aurora_store::prompt::{TemplateSource, VariableInfo};
+use aurora_store::runs::Run;
 use aurora_store::search::{Hit, Kind, Segment};
 use maud::{DOCTYPE, Markup, html};
 use serde_json::Value;
@@ -26,7 +27,7 @@ use super::assets;
 use super::data::{
     ActivityData, AgentData, AgentsData, BoardData, CommentsData, DocumentData, DocumentsData,
     HistoryData, HomeData, InitiativeData, InitiativesData, IssueData, PromptData, RevisionData,
-    SEARCH_PAGE_SIZE, SearchData, SearchOutcome,
+    RunPageData, RunsData, SEARCH_PAGE_SIZE, SearchData, SearchOutcome,
 };
 use super::time::{utc_iso, utc_text};
 use crate::markdown;
@@ -48,7 +49,7 @@ const STATUSES: [InitiativeStatus; 5] = [
 
 pub struct Frame<'a> {
     pub title: &'a str,
-    /// `board`, `issue`, `initiatives`, `initiative`, `documents`, `document`, `history`,
+    /// `board`, `issue`, `run`, `initiatives`, `initiative`, `documents`, `document`, `history`,
     /// `revision`, `home`, `sign-in` or `setup`; the script picks its behaviour from it.
     pub page: &'static str,
     pub user: Option<&'a User>,
@@ -58,6 +59,7 @@ pub struct Frame<'a> {
     pub issue_number: Option<i64>,
     pub initiative_id: Option<i64>,
     pub document_id: Option<i64>,
+    pub run_id: Option<i64>,
     /// The text the top bar's search box starts with.
     pub search: Option<&'a str>,
 }
@@ -74,6 +76,7 @@ impl<'a> Frame<'a> {
             issue_number: None,
             initiative_id: None,
             document_id: None,
+            run_id: None,
             search: None,
         }
     }
@@ -98,7 +101,8 @@ fn layout(frame: &Frame<'_>, content: Markup) -> Markup {
                 data-issue-id=[frame.issue_id]
                 data-issue-number=[frame.issue_number]
                 data-initiative-id=[frame.initiative_id]
-                data-document-id=[frame.document_id] {
+                data-document-id=[frame.document_id]
+                data-run-id=[frame.run_id] {
                 a.skip href="#main" { "Skip to content" }
                 header.topbar {
                     a.brand href="/" { "Aurora" }
@@ -1567,6 +1571,7 @@ pub fn agent_page(data: &AgentData) -> Markup {
                     @if let Some(prompt) = &data.prompt {
                         (prompt_section(&data.projects, prompt))
                     }
+                    (run_now_section(agent))
                     h2 { "Keys" }
                     @if data.keys.is_empty() {
                         p.empty { "This agent has no keys." }
@@ -1618,6 +1623,48 @@ pub fn agent_page(data: &AgentData) -> Markup {
             }
         },
     )
+}
+
+/// Owner only, like the rest of the agent controls; members start runs
+/// through the API.
+fn run_now_section(agent: &Agent) -> Markup {
+    html! {
+        section.run-now aria-labelledby="run-now-heading" {
+            h2 #run-now-heading { "Run on an issue now" }
+            @if !agent.enabled {
+                p.hint { "The agent is disabled. Enable it to start a run." }
+            } @else if agent.projects.is_empty() {
+                p.hint { "The agent has no allowed project. Allow one to start a run." }
+            } @else {
+                form.agent-form data-form="start-run" {
+                    div.field {
+                        label for="rn-project" { "Project" }
+                        select #rn-project name="project" {
+                            @for key in &agent.projects { option value=(key) { (key) } }
+                        }
+                    }
+                    div.field {
+                        label for="rn-number" { "Issue number" }
+                        input #rn-number name="number" type="number" min="1"
+                            inputmode="numeric" required;
+                    }
+                    div.field {
+                        label for="rn-message" { "First message (optional)" }
+                        textarea #rn-message name="message" rows="8" {}
+                    }
+                    p.hint {
+                        "Preview fills the box with exactly what the agent would get. "
+                        "Edit it if you like. Left empty or unchanged, the stored template is used."
+                    }
+                    div.row {
+                        button type="button" data-action="preview-run" { "Preview" }
+                        button.primary type="submit" { "Start run" }
+                    }
+                    p.field-msg role="alert" {}
+                }
+            }
+        }
+    }
 }
 
 pub fn history_page(data: &HistoryData) -> Markup {
@@ -2071,6 +2118,159 @@ pub fn activity_fragment(data: &ActivityData) -> Markup {
     activity_list(&data.activity, &lookup)
 }
 
+// ---- runs ----
+
+fn run_chip(run: &Run) -> Markup {
+    html! {
+        span.chip.chip-run data-status=(run.status.as_str()) { (run.status.as_str()) }
+    }
+}
+
+fn run_time(label: &str, at: Option<i64>) -> Markup {
+    html! {
+        @if let Some(at) = at {
+            span.meta {
+                (label) " "
+                time.when datetime=(utc_iso(at)) data-ts=(at) { (utc_text(at)) }
+            }
+        }
+    }
+}
+
+fn runs_list(key: &str, runs: &[Run]) -> Markup {
+    html! {
+        section #runs.runs aria-labelledby="runs-heading" {
+            h2 #runs-heading { "Runs" }
+            @if runs.is_empty() {
+                p.empty { "No runs yet." }
+            } @else {
+                ul.run-list {
+                    @for run in runs {
+                        li {
+                            a.run-link href={ "/p/" (key) "/runs/" (run.id) } { "Run " (run.id) }
+                            " "
+                            (run_chip(run))
+                            " "
+                            span { (run.agent) }
+                            " "
+                            span.meta { (run.reason.as_str()) }
+                            " "
+                            (run_time("started", run.started.or(Some(run.created))))
+                            (run_time("finished", run.finished))
+                            @if let Some(code) = run.exit_code {
+                                " " span.meta { "exit " (code) }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+pub fn runs_fragment(data: &RunsData) -> Markup {
+    runs_list(&data.project, &data.runs)
+}
+
+/// What changes while a run goes on: facts, the stop button, the first
+/// message and the output. Everything is element text, never markup.
+pub fn run_fragment(data: &RunPageData) -> Markup {
+    let run = &data.detail.run;
+    let key = data.project.key.as_str();
+    html! {
+        div #run-live.run-live data-status=(run.status.as_str()) {
+            div.row {
+                (run_chip(run))
+                @if run.status.is_active() {
+                    button type="button" data-action="cancel-run" data-run-id=(run.id) {
+                        "Cancel run"
+                    }
+                }
+            }
+            dl.facts {
+                dt { "Agent" }
+                dd { a href={ "/agents/" (run.agent_id) } { (run.agent) } }
+                dt { "Issue" }
+                dd { a href={ "/p/" (key) "/" (run.issue_number) } { (run.issue) } }
+                dt { "Started because" }
+                dd {
+                    (run.reason.as_str())
+                    @if run.edited { " (message edited by a person)" }
+                }
+                @if let Some(source) = &run.template_source {
+                    dt { "Message written from" }
+                    dd { (source.replace('_', " ")) }
+                }
+                dt { "Created" }
+                dd { (run_time("", Some(run.created))) }
+                @if run.started.is_some() {
+                    dt { "Started" }
+                    dd { (run_time("", run.started)) }
+                }
+                @if run.finished.is_some() {
+                    dt { "Finished" }
+                    dd { (run_time("", run.finished)) }
+                }
+                @if let Some(code) = run.exit_code {
+                    dt { "Exit code" }
+                    dd { (code) }
+                }
+                @if let Some(error) = &run.error {
+                    dt { "Error" }
+                    dd { (error) }
+                }
+            }
+            h2 { "First message" }
+            pre.run-text { (data.detail.message) }
+            h2 { "Output" }
+            @if run.output_truncated {
+                p.hint { "Only the last part of the output is kept." }
+            }
+            @if data.detail.output_tail.is_empty() {
+                p.empty {
+                    @if run.status.is_active() {
+                        "Nothing yet. The output is recorded when the run ends."
+                    } @else {
+                        "The process printed nothing."
+                    }
+                }
+            } @else {
+                pre.run-text { (data.detail.output_tail) }
+            }
+        }
+    }
+}
+
+pub fn run_page(data: &RunPageData) -> Markup {
+    let run = &data.detail.run;
+    let key = data.project.key.as_str();
+    let title = format!("Run {} of {}", run.id, run.issue);
+    let mut frame = Frame::new(&title, "run");
+    frame.user = Some(&data.user);
+    frame.project = Some(&data.project);
+    frame.last_event = Some(data.last_event);
+    frame.run_id = Some(run.id);
+    layout(
+        &frame,
+        html! {
+            article.page {
+                nav.crumbs aria-label="Breadcrumb" {
+                    a href={ "/p/" (key) } { (data.project.name) }
+                    " / "
+                    a href={ "/p/" (key) "/" (run.issue_number) } { (run.issue) }
+                    " / "
+                    span { "Run " (run.id) }
+                }
+                div.issue-head {
+                    h1 { "Run " (run.id) }
+                }
+                p.field-msg #page-msg role="alert" {}
+                (run_fragment(data))
+            }
+        },
+    )
+}
+
 pub fn issue_page(data: &IssueData) -> Markup {
     let issue = &data.detail.issue;
     let key = data.project.key.as_str();
@@ -2154,6 +2354,7 @@ pub fn issue_page(data: &IssueData) -> Markup {
                         }
                         (links_section(&data.detail.links, issue.blocked, key, &lookup))
                         (documents_section(&data.detail.documents, key))
+                        (runs_list(key, &data.runs))
                         (comments_list(&data.comments, &data.user))
                         (activity_list(&data.activity, &lookup))
                     }

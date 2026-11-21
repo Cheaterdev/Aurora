@@ -70,6 +70,8 @@ pub struct Snapshot {
     /// (agent id, project key, issue type id) -> length of the prompt template
     /// override; the text itself is never in the log
     pub templates: BTreeMap<(i64, String, Option<i64>), i64>,
+    /// run id -> run (agent, project, issue number, status)
+    pub runs: BTreeMap<i64, (i64, i64, i64, String)>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -555,6 +557,24 @@ fn apply(s: &mut Snapshot, e: &Event) -> Res<()> {
         "document.link_removed" => {
             s.doc_links.remove(&int(&p["link_id"])?);
         }
+        "run.created" => {
+            s.runs.insert(
+                e.entity_id,
+                (
+                    int(&p["agent_id"])?,
+                    pid,
+                    int(&p["issue"]["number"])?,
+                    "starting".to_string(),
+                ),
+            );
+        }
+        "run.started" => {
+            int(&p["pid"])?;
+            entry(&mut s.runs, e.entity_id, "run")?.3 = "running".into();
+        }
+        "run.finished" => {
+            entry(&mut s.runs, e.entity_id, "run")?.3 = text(&p["status"])?;
+        }
         other => return Err(format!("the replay does not know the event kind {other}")),
     }
     Ok(())
@@ -793,6 +813,20 @@ pub fn table_snapshot(conn: &Connection) -> Result<Snapshot, StoreError> {
         let (scope, chars) = row?;
         s.templates.insert(scope, chars);
     }
+    let mut stmt = conn.prepare(
+        "SELECT r.id, r.agent_id, r.project_id, i.number, r.status
+         FROM run r JOIN issue i ON i.id = r.issue_id",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, i64>(0)?,
+            (r.get(1)?, r.get(2)?, r.get(3)?, r.get::<_, String>(4)?),
+        ))
+    })?;
+    for row in rows {
+        let (id, run) = row?;
+        s.runs.insert(id, run);
+    }
     Ok(s)
 }
 
@@ -885,5 +919,6 @@ pub fn diff(from_log: &Snapshot, from_tables: &Snapshot) -> Vec<String> {
         &from_tables.templates,
         &mut out,
     );
+    diff_map("run", &from_log.runs, &from_tables.runs, &mut out);
     out
 }

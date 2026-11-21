@@ -564,8 +564,7 @@ The first message of a run is rendered from a template, so an agent starts
 with the issue, why it was started, the recent comments, the open blockers and
 the project's rules, and a person can change what it says. The pieces that do
 not need a run exist now: the template language, storage, resolution, the
-preview and the variable catalogue. Starting a run with the rendered text is
-the runner's job (TRK-15); it calls one function,
+preview and the variable catalogue. The runner (see Runs) calls one function,
 `aurora_store::prompt::render_prompt`, and stores what it returns.
 
 **Which template applies**, most specific first:
@@ -707,7 +706,7 @@ agent's. One `prompt_template.deleted` event. Takes a request id.
 ### `POST /api/v1/agents/{id}/prompt-preview`
 
 The exact message a run of this agent would get for an issue, without
-starting anything. Owners and members may ask; an agent's key gets `403`.
+starting anything (use `POST /agents/{id}/runs` to start). Owners and members may ask; an agent's key gets `403`.
 Body `{"project": "KEY", "number": n, "trigger"?: "assigned" | "mentioned" |
 "schedule" | "manual" (default "manual"), "comment_id"?: n, "template"?:
 "..."}`; `template` renders that text instead of the stored one (an unsaved
@@ -727,6 +726,66 @@ example}` with `type` one of `text`, `number`, `boolean`, `list`; a list also
 has `item` (`text` or `record`) and, for records, `fields: [{name, type,
 description}]`. `limits` has `max_template_chars`, `max_depth`,
 `max_output_chars`, `max_comments` and `max_comment_chars`.
+
+## Runs
+
+A run is one launch of an agent's command for one issue. The server starts it
+when an issue is assigned to the agent's user or the agent is mentioned in a
+comment (when `on_assign` / `on_mention` allow it and the agent is enabled and
+may use the project), or when the owner or a member starts one by hand. The
+command runs as a plain child process: the first message goes to its standard
+input (or into a `{prompt}` argument), `{issue}`, `{run_id}` and `{mcp_config}`
+are substituted in the arguments, and the environment carries
+`AURORA_URL`, `AURORA_MCP_URL`, `AURORA_API_KEY` (a write key made for this run
+only), `AURORA_RUN_ID`, `AURORA_ISSUE`, `AURORA_PROJECT` and `AURORA_TRIGGER`.
+The key is revoked in the transaction that records the end of the run.
+Standard output and error, merged, are the transcript (the last 64 KiB are
+kept); the exit status is the result. There is at most one active run
+(`starting` or `running`) per issue; a trigger that arrives meanwhile is
+dropped (queueing is a later task).
+
+A run is `{id, agent_id, agent, project, issue, issue_number, reason, status,
+trigger_event_id, pid, template_source, template_id, edited, exit_code, error,
+output_truncated, started, finished, created, created_by}`. `reason` is
+`assigned`, `mentioned`, `manual` or `schedule`; `status` is `starting`,
+`running`, `succeeded`, `failed`, `interrupted` or `canceled`. Times are
+milliseconds since the epoch. The detail of a run adds `message` (the exact
+first message) and `output_tail`; both can hold secrets, so only the owner and
+members get them. A registered agent's key sees the runs of its allowed
+projects without `message` and `output_tail`.
+
+Events: `run.created`, `run.started` and `run.finished` carry no message and
+no output.
+
+### `POST /api/v1/agents/{id}/runs`
+
+Owner or member (an agent's key gets `403`). Body `{"issue": "KEY-12",
+"message"?: "...", "trigger_comment_id"?: n}`; `message` replaces the rendered
+first message and is sent verbatim. `201` with the run detail. `404` for an
+unknown agent, `422` for a malformed or unknown issue, a disabled agent or
+user, or a project the agent may not use, `409` when the issue already has an
+active run, `503` when this server has no runner. It takes a request id: a
+repeat returns the recorded response and starts no second process.
+
+### `GET /api/v1/runs`
+
+Query: `issue` (`KEY-12`), `agent` (id), `status`, `limit` (default 50, max
+200), `offset`. Newest first, as an array of runs (no message or output). Only
+runs of projects the key may use are listed; asking for another project's issue
+is `403`. `422` for a malformed `issue` or an unknown `status`.
+
+### `GET /api/v1/runs/{id}`
+
+The run: the detail for owners and members, the plain run for an agent's key.
+`404`, or `403` for a project the key may not use.
+
+### `POST /api/v1/runs/{id}/cancel`
+
+Owner or member. The run becomes `canceled` and its key is revoked in this
+request's transaction; the process tree is stopped right after the commit and
+the output it had printed is recorded then, so it can appear a moment later.
+`200` with the run, `409` when it already finished, `404`, `503` without a
+runner. It takes a request id.
 
 ## Search
 

@@ -12,8 +12,7 @@
 //! rename one. Every check needs a test in `tests_invariants.rs` that corrupts
 //! a copy of a database and proves the check notices.
 //!
-//! The slot `runs.no_orphans` exists but is vacuous until the runner has a
-//! table (TRK-15); that task fills it in, TRK-18 and TRK-45 extend it.
+//! `runs.no_orphans` is real since TRK-15 (TRK-18 and TRK-45 extend it).
 //!
 //! # What a clean report does not prove
 //!
@@ -177,7 +176,7 @@ pub const INVARIANTS: &[Invariant] = &[
     },
     Invariant {
         name: "runs.no_orphans",
-        proves: "no run is left active without a process that owns it (VACUOUS until the runner exists, TRK-15)",
+        proves: "every active run has a live key and a pid once running, every finished run has no live key; with a boot id, every active run belongs to it",
         needs_current_schema: true,
         run: runs_no_orphans,
     },
@@ -597,9 +596,56 @@ fn search_index(conn: &Connection) -> Result<Finding, StoreError> {
     )
 }
 
-/// Vacuous until TRK-15 adds the runner's tables: there is nothing that could
-/// be orphaned yet. The runner tasks replace this body with the real query
-/// (a run marked active whose owning process is gone) and keep the name.
-fn runs_no_orphans(_conn: &Connection) -> Result<Finding, StoreError> {
-    Finding::of("vacuous: there are no runs yet (TRK-15)", Vec::new())
+/// Offline rule (no live server needed): an active run has a live key of its
+/// agent's user, no finish time, and a pid once it is `running`; a finished run
+/// has a finish time and no live key. The rule that every active run belongs
+/// to the current boot needs a live server: see [`check_with_boot`].
+fn runs_no_orphans(conn: &Connection) -> Result<Finding, StoreError> {
+    let violations = lines(
+        conn,
+        "SELECT 'run ' || r.id || ' is ' || r.status || ' but has no live key'
+         FROM run r LEFT JOIN api_key k ON k.id = r.key_id
+         WHERE r.status IN ('starting', 'running') AND (k.id IS NULL OR k.revoked IS NOT NULL)
+         UNION ALL
+         SELECT 'run ' || r.id || ' is running without a pid' FROM run r
+         WHERE r.status = 'running' AND r.pid IS NULL
+         UNION ALL
+         SELECT 'run ' || r.id || ' is ' || r.status || ' but has a finish time' FROM run r
+         WHERE r.status IN ('starting', 'running') AND r.finished IS NOT NULL
+         UNION ALL
+         SELECT 'run ' || r.id || ' is ' || r.status || ' without a finish time' FROM run r
+         WHERE r.status NOT IN ('starting', 'running') AND r.finished IS NULL
+         UNION ALL
+         SELECT 'run ' || r.id || ' is ' || r.status || ' but its key is still live' FROM run r
+         JOIN api_key k ON k.id = r.key_id
+         WHERE r.status NOT IN ('starting', 'running') AND k.revoked IS NULL
+         UNION ALL
+         SELECT 'run ' || r.id || ' has a key of another user' FROM run r
+         JOIN api_key k ON k.id = r.key_id JOIN agent a ON a.id = r.agent_id
+         WHERE k.user_id <> a.user_id",
+        |r| r.get(0),
+    )?;
+    let runs = count(conn, "SELECT COUNT(*) FROM run")?;
+    let active = count(
+        conn,
+        "SELECT COUNT(*) FROM run WHERE status IN ('starting', 'running')",
+    )?;
+    Finding::of(format!("{runs} runs, {active} active"), violations)
+}
+
+/// [`check`], plus the live-server rule: every active run belongs to
+/// `boot_id`. Run by a server on itself after its start-up reconciliation.
+pub fn check_with_boot(conn: &Connection, boot_id: &str) -> Report {
+    let mut report = check(conn);
+    let foreign = crate::runs::foreign_active_runs(conn, boot_id).unwrap_or_default();
+    if !foreign.is_empty()
+        && let Some(entry) = report
+            .checks
+            .iter_mut()
+            .find(|c| c.name == "runs.no_orphans")
+    {
+        entry.ok = false;
+        entry.details = cap(&foreign);
+    }
+    report
 }

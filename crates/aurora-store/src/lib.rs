@@ -31,6 +31,7 @@ pub mod projects;
 pub mod prompt;
 pub mod replay;
 pub mod request_log;
+pub mod runs;
 pub mod search;
 
 use std::io::Write;
@@ -405,6 +406,22 @@ impl Store {
             request_log::purge_expired(tx, now, retention, request_log::PURGE_BATCH)
         })
         .await
+    }
+
+    /// The database file.
+    pub fn path(&self) -> &Path {
+        &self.inner.path
+    }
+
+    /// Like [`Store::write`] for background tasks (the runner): the write does
+    /// not count toward the `before_commit` / `after_commit` failpoint hits, so
+    /// those keep counting only the writes a client asked for.
+    pub async fn write_background<T, F>(&self, f: F) -> Result<T, StoreError>
+    where
+        F: FnOnce(&Transaction<'_>) -> Result<T, StoreError> + Send + 'static,
+        T: Send + 'static,
+    {
+        self.write_with(false, f).await
     }
 
     /// Runs `f` in a transaction on the writer thread. The transaction commits
@@ -939,6 +956,8 @@ mod tests_0012;
 #[cfg(test)]
 mod tests_0013;
 #[cfg(test)]
+mod tests_0014;
+#[cfg(test)]
 mod tests_actor;
 #[cfg(test)]
 mod tests_agents;
@@ -962,6 +981,8 @@ mod tests_links;
 mod tests_prompt;
 #[cfg(test)]
 mod tests_request_log;
+#[cfg(test)]
+mod tests_runs;
 #[cfg(test)]
 mod tests_search;
 

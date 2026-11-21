@@ -283,6 +283,27 @@ pub fn ack(
     name: &str,
     up_to_id: i64,
 ) -> Result<Cursor, StoreError> {
+    ack_with(tx, now, name, up_to_id, true)
+}
+
+/// [`ack`] for the server's own consumers (the runner): the `mid_ack`
+/// failpoint does not fire, so its hit count stays about clients' acks.
+pub fn ack_background(
+    tx: &Transaction<'_>,
+    now: i64,
+    name: &str,
+    up_to_id: i64,
+) -> Result<Cursor, StoreError> {
+    ack_with(tx, now, name, up_to_id, false)
+}
+
+fn ack_with(
+    tx: &Transaction<'_>,
+    now: i64,
+    name: &str,
+    up_to_id: i64,
+    failpoint: bool,
+) -> Result<Cursor, StoreError> {
     let current = get_cursor(tx, name)?;
     if up_to_id < 0 {
         return Err(invalid("up_to must not be negative"));
@@ -299,6 +320,8 @@ pub fn ack(
         "UPDATE consumer_cursor SET last_event_id = ?1, updated = ?2 WHERE name = ?3",
         params![up_to_id, now, name],
     )?;
-    crate::failpoints::hit(crate::failpoints::Point::MidAck);
+    if failpoint {
+        crate::failpoints::hit(crate::failpoints::Point::MidAck);
+    }
     get_cursor(tx, name)
 }
