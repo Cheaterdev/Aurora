@@ -20,144 +20,285 @@ use axum::extract::{FromRequest, FromRequestParts, Path, Query, Request, State};
 use axum::http::request::Parts;
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, patch, post, put};
+use axum::routing::{MethodRouter, delete, get, patch, post, put};
 use axum::{Extension, Json, Router, middleware};
-use serde::Deserialize;
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::{auth, markdown};
 
 const DEFAULT_LABEL_COLOR: &str = "#808080";
 
-/// `store` is only needed to build the authentication layer.
-pub fn api_router(store: Store) -> Router<Store> {
-    let public = Router::new()
-        .route("/setup", post(auth::setup))
-        .route("/auth/sign-in", post(auth::sign_in));
-    let protected = Router::new()
-        .route("/auth/sign-out", post(auth::sign_out))
-        .route("/auth/me", get(auth::me))
-        .route("/keys", get(auth::list_keys).post(auth::create_key))
-        .route("/keys/{id}", delete(auth::revoke_key))
-        .route("/keys/{id}/rotate", post(auth::rotate_key))
-        .route("/users", get(auth::list_users).post(auth::create_user))
-        .route("/projects", get(list_projects).post(create_project))
-        .route("/projects/{key}", get(get_project).patch(rename_project))
+/// One method of one route under `/api/v1`. `path` is relative to `/api/v1`.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct Endpoint {
+    pub method: &'static str,
+    pub path: &'static str,
+    /// Reachable without credentials.
+    pub public: bool,
+}
+
+/// A router that remembers what was registered on it, so the route table
+/// that `GET /api/v1` serves and that the documentation test checks is the
+/// registration itself. The `methods` of a route are checked against the real
+/// router by `tests/api_routes.rs`, so they cannot drift from the handlers.
+struct Table {
+    router: Router<Store>,
+    endpoints: Vec<Endpoint>,
+    public: bool,
+}
+
+impl Table {
+    fn new(public: bool) -> Self {
+        Table {
+            router: Router::new(),
+            endpoints: Vec::new(),
+            public,
+        }
+    }
+
+    fn route(
+        mut self,
+        path: &'static str,
+        methods: &'static [&'static str],
+        handler: MethodRouter<Store>,
+    ) -> Self {
+        for &method in methods {
+            self.endpoints.push(Endpoint {
+                method,
+                path,
+                public: self.public,
+            });
+        }
+        self.router = self.router.route(path, handler);
+        self
+    }
+}
+
+fn api_tables() -> (Table, Table) {
+    let public = Table::new(true)
+        .route("/setup", &["POST"], post(auth::setup))
+        .route("/auth/sign-in", &["POST"], post(auth::sign_in));
+    let protected = Table::new(false)
+        .route("/", &["GET"], get(api_index))
+        .route("/auth/sign-out", &["POST"], post(auth::sign_out))
+        .route("/auth/me", &["GET"], get(auth::me))
+        .route(
+            "/keys",
+            &["GET", "POST"],
+            get(auth::list_keys).post(auth::create_key),
+        )
+        .route("/keys/{id}", &["DELETE"], delete(auth::revoke_key))
+        .route("/keys/{id}/rotate", &["POST"], post(auth::rotate_key))
+        .route(
+            "/users",
+            &["GET", "POST"],
+            get(auth::list_users).post(auth::create_user),
+        )
+        .route(
+            "/projects",
+            &["GET", "POST"],
+            get(list_projects).post(create_project),
+        )
+        .route(
+            "/projects/{key}",
+            &["GET", "PATCH"],
+            get(get_project).patch(rename_project),
+        )
         .route(
             "/projects/{key}/columns",
+            &["GET", "POST"],
             get(list_columns).post(create_column),
         )
-        .route("/projects/{key}/columns/order", put(reorder_columns))
+        .route(
+            "/projects/{key}/columns/order",
+            &["PUT"],
+            put(reorder_columns),
+        )
         .route(
             "/projects/{key}/columns/{id}",
+            &["PATCH", "DELETE"],
             patch(rename_column).delete(delete_column),
         )
         .route(
             "/projects/{key}/issue-types",
+            &["GET", "POST"],
             get(list_issue_types).post(create_issue_type),
         )
         .route(
             "/projects/{key}/issue-types/{id}",
+            &["PATCH", "DELETE"],
             patch(rename_issue_type).delete(delete_issue_type),
         )
         .route(
             "/projects/{key}/labels",
+            &["GET", "POST"],
             get(list_labels).post(create_label),
         )
         .route(
             "/projects/{key}/labels/{id}",
+            &["PATCH", "DELETE"],
             patch(update_label).delete(delete_label),
         )
         .route(
             "/projects/{key}/issues",
+            &["GET", "POST"],
             get(list_issues).post(create_issue),
         )
         .route(
             "/projects/{key}/issues/{number}",
+            &["GET", "PATCH"],
             get(get_issue).patch(update_issue),
         )
-        .route("/projects/{key}/issues/{number}/move", post(move_issue))
+        .route(
+            "/projects/{key}/issues/{number}/move",
+            &["POST"],
+            post(move_issue),
+        )
         .route(
             "/projects/{key}/issues/{number}/archive",
+            &["POST"],
             post(archive_issue),
         )
         .route(
             "/projects/{key}/issues/{number}/unarchive",
+            &["POST"],
             post(unarchive_issue),
         )
         .route(
+            "/projects/{key}/issues/{number}/events",
+            &["GET"],
+            get(issue_events),
+        )
+        .route(
             "/projects/{key}/issues/{number}/links",
+            &["GET", "POST"],
             get(list_links).post(add_link),
         )
-        .route("/projects/{key}/links/{id}", delete(remove_link))
+        .route(
+            "/projects/{key}/links/{id}",
+            &["DELETE"],
+            delete(remove_link),
+        )
         .route(
             "/projects/{key}/issues/{number}/comments",
+            &["GET", "POST"],
             get(list_comments).post(add_comment),
         )
         .route(
             "/projects/{key}/comments/{id}",
-            patch(edit_comment).delete(delete_comment),
+            &["GET", "PATCH", "DELETE"],
+            get(get_comment).patch(edit_comment).delete(delete_comment),
         )
         .route(
             "/projects/{key}/initiatives",
+            &["GET", "POST"],
             get(list_initiatives).post(create_initiative),
         )
         .route(
             "/projects/{key}/initiatives/{id}",
+            &["GET", "PATCH", "DELETE"],
             get(get_initiative)
                 .patch(update_initiative)
                 .delete(delete_initiative),
         )
         .route(
             "/projects/{key}/documents",
+            &["GET", "POST"],
             get(list_documents).post(create_document),
         )
-        .route("/projects/{key}/documents/preview", post(preview_document))
+        .route(
+            "/projects/{key}/documents/preview",
+            &["POST"],
+            post(preview_document),
+        )
         .route(
             "/projects/{key}/documents/{id}",
+            &["GET", "PATCH"],
             get(get_document).patch(update_document),
         )
-        .route("/projects/{key}/documents/{id}/move", post(move_document))
+        .route(
+            "/projects/{key}/documents/{id}/move",
+            &["POST"],
+            post(move_document),
+        )
         .route(
             "/projects/{key}/documents/{id}/archive",
+            &["POST"],
             post(archive_document),
         )
         .route(
             "/projects/{key}/documents/{id}/unarchive",
+            &["POST"],
             post(unarchive_document),
         )
         .route(
             "/projects/{key}/documents/{id}/revisions",
+            &["GET"],
             get(list_revisions),
         )
         .route(
             "/projects/{key}/documents/{id}/revisions/{number}",
+            &["GET"],
             get(get_revision),
         )
         .route(
             "/projects/{key}/documents/{id}/restore",
+            &["POST"],
             post(restore_revision),
         )
         .route(
             "/projects/{key}/documents/{id}/links",
+            &["POST"],
             post(add_document_link),
         )
         .route(
             "/projects/{key}/documents/{id}/links/{link_id}",
+            &["DELETE"],
             delete(remove_document_link),
         )
-        .route("/search", get(search_all))
-        .route("/events", get(list_events))
-        .route("/consumers", get(list_consumers))
+        .route("/search", &["GET"], get(search_all))
+        .route("/events", &["GET"], get(list_events))
+        .route("/consumers", &["GET"], get(list_consumers))
         .route(
             "/consumers/{name}",
+            &["PUT", "DELETE"],
             put(register_consumer).delete(delete_consumer),
         )
-        .route("/consumers/{name}/events", get(poll_consumer))
-        .route("/consumers/{name}/ack", post(ack_consumer))
+        .route("/consumers/{name}/events", &["GET"], get(poll_consumer))
+        .route("/consumers/{name}/ack", &["POST"], post(ack_consumer));
+    (public, protected)
+}
+
+/// Every method of every route under `/api/v1`, in registration order.
+pub fn api_endpoints() -> Vec<Endpoint> {
+    let (public, protected) = api_tables();
+    public
+        .endpoints
+        .into_iter()
+        .chain(protected.endpoints)
+        .collect()
+}
+
+/// `store` is only needed to build the authentication layer.
+pub fn api_router(store: Store) -> Router<Store> {
+    let (public, protected) = api_tables();
+    let protected = protected
+        .router
         .layer(middleware::from_fn_with_state(store, auth::require_auth));
-    public.merge(protected)
+    public.router.merge(protected)
+}
+
+/// The route table, so a client can discover the API; see `docs/api.md`.
+async fn api_index() -> Json<serde_json::Value> {
+    Json(json!({
+        "name": "aurora",
+        "version": env!("CARGO_PKG_VERSION"),
+        "docs": "docs/api.md",
+        "mcp": "/mcp",
+        "endpoints": api_endpoints(),
+    }))
 }
 
 pub struct ApiError {
@@ -674,12 +815,33 @@ async fn unarchive_issue(
     Ok(Json(issue).into_response())
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ActivityQuery {
+    limit: Option<i64>,
+}
+
+/// The newest events about one issue, oldest first.
+async fn issue_events(
+    State(store): State<Store>,
+    Path((key, number)): Path<(String, i64)>,
+    ApiQuery(query): ApiQuery<ActivityQuery>,
+) -> ApiResult<Response> {
+    let list = store
+        .read(move |c| {
+            let detail = issues::get_issue(c, &key, number)?;
+            events::entity_events(c, "issue", detail.issue.id, query.limit.unwrap_or(50))
+        })
+        .await?;
+    Ok(Json(json!({ "events": list })).into_response())
+}
+
 // ---- links ----
 
 /// The other issue: a number in this project, or `KEY-n` (which must name this project).
 #[derive(Deserialize)]
 #[serde(untagged)]
-enum LinkTarget {
+pub(crate) enum LinkTarget {
     Number(i64),
     Identifier(String),
 }
@@ -702,7 +864,7 @@ struct NewLinkBody {
 }
 
 impl LinkTarget {
-    fn number_in(self, key: &str) -> Result<i64, ApiError> {
+    pub(crate) fn number_in(self, key: &str) -> Result<i64, ApiError> {
         match self {
             LinkTarget::Number(number) => Ok(number),
             LinkTarget::Identifier(text) => {
@@ -799,6 +961,16 @@ async fn add_comment(
         .write(move |tx| comments::add_comment(tx, now_millis(), &actor, &key, number, body))
         .await?;
     Ok(created(comment))
+}
+
+async fn get_comment(
+    State(store): State<Store>,
+    Path((key, id)): Path<(String, i64)>,
+) -> ApiResult<Response> {
+    let comment = store
+        .read(move |c| comments::get_comment(c, &key, id))
+        .await?;
+    Ok(Json(comment).into_response())
 }
 
 async fn edit_comment(

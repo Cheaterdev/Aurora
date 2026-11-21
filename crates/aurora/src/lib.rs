@@ -3,6 +3,7 @@
 pub mod auth;
 pub mod config;
 pub mod markdown;
+pub mod mcp;
 pub mod pages;
 pub mod routes;
 pub mod shutdown;
@@ -61,6 +62,7 @@ fn app_routes_with(store: Store, live: Live) -> Router<Store> {
     Router::new()
         .route("/health", get(health))
         .nest("/api/v1", routes::api_router(store.clone()))
+        .merge(mcp::router())
         .merge(pages::router(store, live))
 }
 
