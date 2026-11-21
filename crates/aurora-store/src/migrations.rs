@@ -133,8 +133,7 @@ pub(crate) fn migrate(
     for migration in migrations.iter().filter(|m| m.version > current) {
         let tx = conn.transaction()?;
         tx.execute_batch(migration.sql)?;
-        #[cfg(test)]
-        crate::tests_support::abort_if_requested(migration.version);
+        crate::failpoints::hit(crate::failpoints::Point::MidMigration);
         tx.execute(
             "INSERT INTO schema_version (version, name, applied_at)
              VALUES (?1, ?2, CAST(unixepoch('subsec') * 1000 AS INTEGER))",

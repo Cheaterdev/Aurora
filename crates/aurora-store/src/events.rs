@@ -299,5 +299,6 @@ pub fn ack(
         "UPDATE consumer_cursor SET last_event_id = ?1, updated = ?2 WHERE name = ?3",
         params![up_to_id, now, name],
     )?;
+    crate::failpoints::hit(crate::failpoints::Point::MidAck);
     get_cursor(tx, name)
 }

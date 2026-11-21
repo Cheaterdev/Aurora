@@ -19,6 +19,9 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
 [dev-dependencies]
+# Feature unification: `cargo test` builds the server binary with the failpoints
+# compiled in; `cargo build` does not.
+aurora-store = { version = "0.1.0", path = "../aurora-store", features = ["failpoints"] }
 sha2 = "0.10.9"
 tempfile = "3.27.0"
 tokio = { version = "1.54.1", features = ["io-util"] }

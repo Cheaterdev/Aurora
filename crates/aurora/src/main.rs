@@ -14,7 +14,22 @@ async fn main() -> ExitCode {
         )
         .init();
 
-    match run().await {
+    let command = match Config::parse(std::env::args().skip(1), |k| std::env::var(k).ok()) {
+        Ok(command) => command,
+        Err(err) => {
+            eprintln!("aurora: {err:#}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let config = match command {
+        Command::Run(config) => config,
+        Command::Check(check) => return aurora::check::run(&check),
+        Command::Help => {
+            println!("{USAGE}");
+            return ExitCode::SUCCESS;
+        }
+    };
+    match run(config).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             eprintln!("aurora: {err:#}");
@@ -23,15 +38,7 @@ async fn main() -> ExitCode {
     }
 }
 
-async fn run() -> Result<()> {
-    let config = match Config::parse(std::env::args().skip(1), |k| std::env::var(k).ok())? {
-        Command::Run(config) => config,
-        Command::Help => {
-            println!("{USAGE}");
-            return Ok(());
-        }
-    };
-
+async fn run(config: Config) -> Result<()> {
     let options = OpenOptions {
         backup_dir: config.backup_dir.clone(),
         allow_unsafe_location: config.allow_unsafe_location,

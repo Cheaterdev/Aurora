@@ -3,6 +3,8 @@
 use aurora_store::Store;
 use sha2::{Digest, Sha256};
 
+pub mod harness;
+
 /// A fixed key for tests that are not about authentication.
 const TEST_KEY: &str = "aur_integration_tests_only_not_a_secret";
 

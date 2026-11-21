@@ -4,6 +4,11 @@ version.workspace = true
 edition.workspace = true
 publish.workspace = true
 
+[features]
+# Compiles the failpoints in `failpoints.rs` in, so a test can kill the process
+# at a named point. Off in every normal build; `aurora` enables it for its tests.
+failpoints = []
+
 [dependencies]
 argon2 = "0.5.3"
 getrandom = "0.4.3"

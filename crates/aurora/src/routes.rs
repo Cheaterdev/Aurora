@@ -1470,6 +1470,9 @@ async fn poll_consumer(
             Ok((cursor, list))
         })
         .await?;
+    if !list.is_empty() {
+        aurora_store::failpoints::hit(aurora_store::failpoints::Point::BeforeEventDelivery);
+    }
     Ok(Json(json!({ "consumer": cursor, "events": list })).into_response())
 }
 

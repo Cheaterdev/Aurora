@@ -17,7 +17,14 @@ Usage: aurora [--db <path>] [--host <ip>] [--port <port>] [--backup-dir <path>]
                        use a network or cloud-synced folder anyway, development
                        only (env AURORA_ALLOW_UNSAFE_LOCATION=1)
 
-Flags override environment variables.";
+Flags override environment variables.
+
+       aurora check [--db <path>] [--json]
+
+  Runs the invariant checks on a database without changing it (see
+  docs/operations.md). Works on an offline file, a copy, or beside a running
+  server. Exit code 0: every check passed, 1: a check failed, 2: the database
+  could not be opened.";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
@@ -44,10 +51,47 @@ impl Default for Config {
     }
 }
 
+/// What `aurora check` was asked to check.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckConfig {
+    pub db_path: PathBuf,
+    pub json: bool,
+}
+
 /// What the command line asked for.
 pub enum Command {
     Run(Config),
+    Check(CheckConfig),
     Help,
+}
+
+fn parse_check(
+    args: impl Iterator<Item = String>,
+    env: impl Fn(&str) -> Option<String>,
+) -> Result<Command> {
+    let mut check = CheckConfig {
+        db_path: env("AURORA_DB").map_or_else(|| Config::default().db_path, PathBuf::from),
+        json: false,
+    };
+    let mut args = args;
+    while let Some(arg) = args.next() {
+        let (flag, inline) = match arg.split_once('=') {
+            Some((flag, value)) => (flag.to_owned(), Some(value.to_owned())),
+            None => (arg, None),
+        };
+        match (flag.as_str(), inline) {
+            ("--help" | "-h", _) => return Ok(Command::Help),
+            ("--json", None) => check.json = true,
+            ("--db", inline) => {
+                let Some(value) = inline.or_else(|| args.next()) else {
+                    bail!("--db needs a value");
+                };
+                check.db_path = PathBuf::from(value);
+            }
+            _ => bail!("unknown argument {flag:?} for `aurora check`\n\n{USAGE}"),
+        }
+    }
+    Ok(Command::Check(check))
 }
 
 impl Config {
@@ -56,6 +100,11 @@ impl Config {
         args: impl IntoIterator<Item = String>,
         env: impl Fn(&str) -> Option<String>,
     ) -> Result<Command> {
+        let mut args = args.into_iter().peekable();
+        if args.peek().is_some_and(|first| first == "check") {
+            args.next();
+            return parse_check(args, env);
+        }
         let mut config = Config::default();
         if let Some(v) = env("AURORA_DB") {
             config.db_path = PathBuf::from(v);
@@ -77,7 +126,6 @@ impl Config {
                 Some(parse_days(&v).context("AURORA_REQUEST_RETENTION_DAYS")?);
         }
 
-        let mut args = args.into_iter();
         while let Some(arg) = args.next() {
             let (flag, inline) = match arg.split_once('=') {
                 Some((flag, value)) => (flag.to_owned(), Some(value.to_owned())),
@@ -145,8 +193,33 @@ mod tests {
         let lookup = move |k: &str| env.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
         match Config::parse(args.iter().map(|s| s.to_string()), lookup)? {
             Command::Run(c) => Ok(c),
+            Command::Check(_) => bail!("check"),
             Command::Help => bail!("help"),
         }
+    }
+
+    fn check(args: &[&str], env: &[(&str, &str)]) -> Result<CheckConfig> {
+        let env: Vec<(String, String)> = env
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let lookup = move |k: &str| env.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
+        match Config::parse(args.iter().map(|s| s.to_string()), lookup)? {
+            Command::Check(c) => Ok(c),
+            _ => bail!("not a check"),
+        }
+    }
+
+    #[test]
+    fn check_takes_a_database_and_a_json_flag() {
+        let c = check(&["check", "--db", "x.db", "--json"], &[]).unwrap();
+        assert_eq!((c.db_path, c.json), (PathBuf::from("x.db"), true));
+        let c = check(&["check"], &[("AURORA_DB", "e.db")]).unwrap();
+        assert_eq!((c.db_path, c.json), (PathBuf::from("e.db"), false));
+        let c = check(&["check", "--db=y.db"], &[("AURORA_DB", "e.db")]).unwrap();
+        assert_eq!(c.db_path, PathBuf::from("y.db"));
+        assert!(check(&["check", "--port", "1"], &[]).is_err());
+        assert!(check(&["check", "--db"], &[]).is_err());
     }
 
     #[test]

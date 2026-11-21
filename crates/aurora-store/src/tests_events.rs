@@ -1,16 +1,16 @@
 //! The event log and consumer cursors: reading, filters, cursors, restart,
 //! replay and immutability.
 
-use std::collections::BTreeMap;
-
 use rusqlite::Transaction;
-use serde_json::Value;
 
 use crate::agents::{self, AgentPatch, NewAgent};
 use crate::auth::{Principal, Role, Scope};
 use crate::comments::{self, NewComment};
 use crate::events::{self, Event, EventFilter, Start};
 use crate::projects::{NewColumn, Rejection, StateType};
+use crate::replay::{
+    self, AgentSnap, CommentSnap, DocSnap, InitiativeSnap, IssueSnap, Snapshot, link_snap,
+};
 use crate::tests_support::documents::{
     self, DocumentMove, DocumentPatch, DocumentTarget, NewDocument,
 };
@@ -546,418 +546,6 @@ fn no_store_function_edits_an_event() {
 }
 
 // ---- replay ----
-
-#[derive(Debug, PartialEq, Default)]
-struct Snapshot {
-    /// project id -> (key, name)
-    projects: BTreeMap<i64, (String, String)>,
-    /// project id -> column names, sorted
-    columns: BTreeMap<i64, Vec<String>>,
-    /// id -> (project id, name)
-    types: BTreeMap<i64, (i64, String)>,
-    /// id -> (project id, name, color)
-    labels: BTreeMap<i64, (i64, String, String)>,
-    /// issue id -> issue
-    issues: BTreeMap<i64, IssueSnap>,
-    /// initiative id -> initiative
-    initiatives: BTreeMap<i64, InitiativeSnap>,
-    /// link id -> (kind, project id, from number, to number); a `relates` link
-    /// has the lower number first
-    links: BTreeMap<i64, (String, i64, i64, i64)>,
-    /// comment id -> comment, for the comments a reader sees
-    comments: BTreeMap<i64, CommentSnap>,
-    /// document id -> document, archived ones included
-    docs: BTreeMap<i64, DocSnap>,
-    /// document link id -> (document id, "issue" or "initiative", issue number or initiative id)
-    doc_links: BTreeMap<i64, (i64, String, i64)>,
-    /// agent id -> agent, without the command, arguments and instructions: the
-    /// log never holds them
-    agents: BTreeMap<i64, AgentSnap>,
-}
-
-#[derive(Debug, PartialEq)]
-struct AgentSnap {
-    name: String,
-    user_id: i64,
-    on_assign: bool,
-    on_mention: bool,
-    enabled: bool,
-    max_concurrent: i64,
-    timeout_seconds: i64,
-    projects: Vec<String>,
-}
-
-/// What the log can say about a document: where it is, its title, its
-/// revision number and the size of its body. The body text itself is never in
-/// an event, so it is verified through the revisions in the document tests.
-#[derive(Debug, PartialEq)]
-struct DocSnap {
-    project_id: i64,
-    parent: Option<i64>,
-    title: String,
-    archived: bool,
-    revision: i64,
-    chars: i64,
-}
-
-fn doc_target(target: &Value) -> (String, i64) {
-    match target["kind"].as_str().unwrap() {
-        "issue" => ("issue".to_string(), target["number"].as_i64().unwrap()),
-        _ => ("initiative".to_string(), target["id"].as_i64().unwrap()),
-    }
-}
-
-#[derive(Debug, PartialEq)]
-struct CommentSnap {
-    issue_id: i64,
-    parent: Option<i64>,
-    author: i64,
-    mentions: Vec<String>,
-    edited: bool,
-    deleted: bool,
-}
-
-fn strings(value: &Value) -> Vec<String> {
-    value.as_array().unwrap().iter().map(text).collect()
-}
-
-/// What readers see: a deleted reply is gone, a deleted top-level comment only
-/// stays while a live reply hangs off it, and a deleted comment has no mentions.
-fn visible(comments: &mut BTreeMap<i64, CommentSnap>) {
-    let with_replies: std::collections::BTreeSet<i64> = comments
-        .values()
-        .filter(|c| !c.deleted)
-        .filter_map(|c| c.parent)
-        .collect();
-    let gone: Vec<i64> = comments
-        .iter()
-        .filter(|(id, c)| c.deleted && (c.parent.is_some() || !with_replies.contains(id)))
-        .map(|(id, _)| *id)
-        .collect();
-    for id in gone {
-        comments.remove(&id);
-    }
-    for c in comments.values_mut().filter(|c| c.deleted) {
-        c.mentions.clear();
-    }
-}
-
-fn link_snap(kind: &str, pid: i64, from: i64, to: i64) -> (String, i64, i64, i64) {
-    if kind == "relates" {
-        (kind.to_string(), pid, from.min(to), from.max(to))
-    } else {
-        (kind.to_string(), pid, from, to)
-    }
-}
-
-/// The description is only in the log as a change, never at creation, so it
-/// is not modelled.
-#[derive(Debug, PartialEq)]
-struct InitiativeSnap {
-    project_id: i64,
-    name: String,
-    status: String,
-    target_date: Option<String>,
-}
-
-#[derive(Debug, PartialEq)]
-struct IssueSnap {
-    project_id: i64,
-    number: i64,
-    title: String,
-    type_id: i64,
-    column_id: i64,
-    assignee_id: Option<i64>,
-    parent: Option<i64>,
-    initiative: Option<i64>,
-    priority: Option<String>,
-    labels: Vec<i64>,
-    archived: bool,
-}
-
-fn text(value: &Value) -> String {
-    value.as_str().unwrap().to_string()
-}
-
-fn ids(value: &Value) -> Vec<i64> {
-    value
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|v| v.as_i64().unwrap())
-        .collect()
-}
-
-/// The events that have no project: users and the agent registry. `true` when
-/// `e` was one of them.
-fn replay_registry(s: &mut Snapshot, e: &Event) -> bool {
-    let p = &e.payload;
-    match e.kind.as_str() {
-        // Users are not modelled here.
-        "user.created" => {}
-        "agent.created" => {
-            s.agents.insert(
-                e.entity_id,
-                AgentSnap {
-                    name: text(&p["name"]),
-                    user_id: p["user_id"].as_i64().unwrap(),
-                    on_assign: p["on_assign"].as_bool().unwrap(),
-                    on_mention: p["on_mention"].as_bool().unwrap(),
-                    enabled: p["enabled"].as_bool().unwrap(),
-                    max_concurrent: p["max_concurrent"].as_i64().unwrap(),
-                    timeout_seconds: p["timeout_seconds"].as_i64().unwrap(),
-                    projects: strings(&p["projects"]),
-                },
-            );
-        }
-        "agent.updated" => {
-            let agent = s.agents.get_mut(&e.entity_id).unwrap();
-            for (field, change) in p["changes"].as_object().unwrap() {
-                let to = &change["to"];
-                match field.as_str() {
-                    "on_assign" => agent.on_assign = to.as_bool().unwrap(),
-                    "on_mention" => agent.on_mention = to.as_bool().unwrap(),
-                    "enabled" => agent.enabled = to.as_bool().unwrap(),
-                    "max_concurrent" => agent.max_concurrent = to.as_i64().unwrap(),
-                    "timeout_seconds" => agent.timeout_seconds = to.as_i64().unwrap(),
-                    "projects" => agent.projects = strings(to),
-                    // Text that may hold a secret: the log only says it changed.
-                    "description" | "command" | "args" | "model" | "instructions" | "work_dir" => {
-                        assert_eq!(change, &serde_json::json!({ "changed": true }));
-                    }
-                    other => panic!("unknown agent field {other}"),
-                }
-            }
-        }
-        "agent.deleted" => {
-            s.agents.remove(&e.entity_id);
-        }
-        _ => return false,
-    }
-    assert_eq!(e.project_id, None, "{} has no project", e.kind);
-    true
-}
-
-/// Rebuilds state from the events alone. Panics on a kind it does not know, so
-/// a new event kind cannot be added without teaching the replay about it.
-fn replay(log: &[Event]) -> Snapshot {
-    let mut s = Snapshot::default();
-    for e in log {
-        if replay_registry(&mut s, e) {
-            continue;
-        }
-        let pid = e.project_id.unwrap();
-        let p = &e.payload;
-        match e.kind.as_str() {
-            "project.created" => {
-                s.projects.insert(pid, (text(&p["key"]), text(&p["name"])));
-                let names = p["columns"].as_array().unwrap().iter().map(text).collect();
-                s.columns.insert(pid, names);
-            }
-            "project.updated" => s.projects.get_mut(&pid).unwrap().1 = text(&p["name"]),
-            "column.created" => s.columns.get_mut(&pid).unwrap().push(text(&p["name"])),
-            "column.renamed" => {
-                let names = s.columns.get_mut(&pid).unwrap();
-                let at = names.iter().position(|n| *n == text(&p["previous_name"]));
-                names[at.unwrap()] = text(&p["name"]);
-            }
-            "column.deleted" => {
-                let names = s.columns.get_mut(&pid).unwrap();
-                let at = names.iter().position(|n| *n == text(&p["name"]));
-                names.remove(at.unwrap());
-            }
-            "column.reordered" => {}
-            "issue_type.created" => {
-                s.types.insert(e.entity_id, (pid, text(&p["name"])));
-            }
-            "issue_type.renamed" => s.types.get_mut(&e.entity_id).unwrap().1 = text(&p["name"]),
-            "issue_type.deleted" => {
-                s.types.remove(&e.entity_id);
-            }
-            "label.created" => {
-                s.labels
-                    .insert(e.entity_id, (pid, text(&p["name"]), text(&p["color"])));
-            }
-            "label.renamed" => s.labels.get_mut(&e.entity_id).unwrap().1 = text(&p["name"]),
-            "label.recolored" => s.labels.get_mut(&e.entity_id).unwrap().2 = text(&p["color"]),
-            "label.deleted" => {
-                s.labels.remove(&e.entity_id);
-                for issue in s.issues.values_mut().filter(|i| i.project_id == pid) {
-                    issue.labels.retain(|l| *l != e.entity_id);
-                }
-            }
-            "issue.created" => {
-                s.issues.insert(
-                    e.entity_id,
-                    IssueSnap {
-                        project_id: pid,
-                        number: p["number"].as_i64().unwrap(),
-                        title: text(&p["title"]),
-                        type_id: p["type_id"].as_i64().unwrap(),
-                        column_id: p["column_id"].as_i64().unwrap(),
-                        assignee_id: p["assignee_id"].as_i64(),
-                        parent: p["parent"].as_i64(),
-                        initiative: p["initiative"].as_i64(),
-                        priority: p["priority"].as_str().map(String::from),
-                        labels: ids(&p["labels"]),
-                        archived: false,
-                    },
-                );
-            }
-            "initiative.created" => {
-                s.initiatives.insert(
-                    e.entity_id,
-                    InitiativeSnap {
-                        project_id: pid,
-                        name: text(&p["name"]),
-                        status: text(&p["status"]),
-                        target_date: p["target_date"].as_str().map(String::from),
-                    },
-                );
-            }
-            "initiative.updated" => {
-                let initiative = s.initiatives.get_mut(&e.entity_id).unwrap();
-                for (field, change) in p["changes"].as_object().unwrap() {
-                    let to = &change["to"];
-                    match field.as_str() {
-                        "name" => initiative.name = text(to),
-                        "status" => initiative.status = text(to),
-                        "target_date" => initiative.target_date = to.as_str().map(String::from),
-                        "description" => {}
-                        other => panic!("unknown initiative field {other}"),
-                    }
-                }
-            }
-            "initiative.deleted" => {
-                // The deleted initiative's issues are unassigned by their own
-                // issue.updated events, which come first.
-                assert!(
-                    s.issues.values().all(|i| i.initiative != Some(e.entity_id)),
-                    "issues still point at the deleted initiative"
-                );
-                s.initiatives.remove(&e.entity_id);
-            }
-            "issue.updated" => {
-                let issue = s.issues.get_mut(&e.entity_id).unwrap();
-                for (field, change) in p["changes"].as_object().unwrap() {
-                    let to = &change["to"];
-                    match field.as_str() {
-                        "title" => issue.title = text(to),
-                        "type_id" => issue.type_id = to.as_i64().unwrap(),
-                        "assignee_id" => issue.assignee_id = to.as_i64(),
-                        "parent" => issue.parent = to.as_i64(),
-                        "initiative" => issue.initiative = to.as_i64(),
-                        "priority" => issue.priority = to.as_str().map(String::from),
-                        "labels" => issue.labels = ids(to),
-                        // The description is only in the log as a change, never at creation.
-                        "description" => {}
-                        other => panic!("unknown issue field {other}"),
-                    }
-                }
-            }
-            "issue.moved" => {
-                s.issues.get_mut(&e.entity_id).unwrap().column_id =
-                    p["to"]["column_id"].as_i64().unwrap();
-            }
-            "issue.archived" => s.issues.get_mut(&e.entity_id).unwrap().archived = true,
-            "issue.unarchived" => s.issues.get_mut(&e.entity_id).unwrap().archived = false,
-            "link.added" => {
-                let snap = link_snap(
-                    &text(&p["kind"]),
-                    pid,
-                    p["from"]["number"].as_i64().unwrap(),
-                    p["to"]["number"].as_i64().unwrap(),
-                );
-                s.links.insert(p["link_id"].as_i64().unwrap(), snap);
-            }
-            "link.removed" => {
-                s.links.remove(&p["link_id"].as_i64().unwrap());
-            }
-            "comment.created" => {
-                s.comments.insert(
-                    p["comment_id"].as_i64().unwrap(),
-                    CommentSnap {
-                        issue_id: e.entity_id,
-                        parent: p["parent"].as_i64(),
-                        author: p["author"]["id"].as_i64().unwrap(),
-                        mentions: strings(&p["mentions"]),
-                        edited: false,
-                        deleted: false,
-                    },
-                );
-            }
-            "comment.edited" => {
-                let c = s
-                    .comments
-                    .get_mut(&p["comment_id"].as_i64().unwrap())
-                    .unwrap();
-                c.mentions = strings(&p["mentions"]);
-                c.edited = true;
-            }
-            "comment.deleted" => {
-                s.comments
-                    .get_mut(&p["comment_id"].as_i64().unwrap())
-                    .unwrap()
-                    .deleted = true;
-            }
-            "mention.created" => {
-                // No state of its own: it names a user the comment mentions.
-                let c = &s.comments[&p["comment_id"].as_i64().unwrap()];
-                assert!(c.mentions.contains(&text(&p["user_name"])));
-                assert_eq!(c.issue_id, e.entity_id);
-            }
-            "document.created" => {
-                s.docs.insert(
-                    e.entity_id,
-                    DocSnap {
-                        project_id: pid,
-                        parent: p["parent"].as_i64(),
-                        title: text(&p["title"]),
-                        archived: false,
-                        revision: p["revision"].as_i64().unwrap(),
-                        chars: p["chars"].as_i64().unwrap(),
-                    },
-                );
-            }
-            "document.updated" => {
-                let doc = s.docs.get_mut(&e.entity_id).unwrap();
-                doc.revision = p["revision"].as_i64().unwrap();
-                doc.chars = p["chars"].as_i64().unwrap();
-                for (field, change) in p["changes"].as_object().unwrap() {
-                    match field.as_str() {
-                        "title" => doc.title = text(&change["to"]),
-                        other => panic!("unknown document field {other}"),
-                    }
-                }
-            }
-            "document.moved" => {
-                s.docs.get_mut(&e.entity_id).unwrap().parent = p["to_parent"].as_i64();
-            }
-            "document.archived" => s.docs.get_mut(&e.entity_id).unwrap().archived = true,
-            "document.unarchived" => s.docs.get_mut(&e.entity_id).unwrap().archived = false,
-            "document.restored" => {
-                let doc = s.docs.get_mut(&e.entity_id).unwrap();
-                doc.title = text(&p["title"]);
-                doc.revision = p["revision"].as_i64().unwrap();
-                doc.chars = p["chars"].as_i64().unwrap();
-            }
-            "document.link_added" => {
-                let (kind, target) = doc_target(&p["target"]);
-                s.doc_links
-                    .insert(p["link_id"].as_i64().unwrap(), (e.entity_id, kind, target));
-            }
-            "document.link_removed" => {
-                s.doc_links.remove(&p["link_id"].as_i64().unwrap());
-            }
-            other => panic!("replay does not know the event kind {other}"),
-        }
-    }
-    visible(&mut s.comments);
-    for names in s.columns.values_mut() {
-        names.sort();
-    }
-    s
-}
 
 async fn read_state(store: &Store) -> Snapshot {
     store
@@ -1768,9 +1356,15 @@ async fn replaying_the_log_rebuilds_the_state() {
 
     let log = all_events(s).await;
     assert!(log.len() > 30, "{} events", log.len());
-    let replayed = replay(&log);
+    let replayed = replay::replay(&log).unwrap();
     let actual = read_state(s).await;
     assert_eq!(replayed, actual);
+    let from_tables = s.read(replay::table_snapshot).await.unwrap();
+    assert_eq!(
+        replay::diff(&replayed, &from_tables),
+        Vec::<String>::new(),
+        "the SQL reading of the tables agrees too"
+    );
     assert_eq!(actual.links.len(), 3);
     assert_eq!(actual.agents.len(), 1, "temp-runner is gone");
     let agent = &actual.agents[&runner.id];
@@ -1841,6 +1435,10 @@ async fn replaying_the_log_rebuilds_the_state() {
     assert!(actual.issues.values().any(|i| i.parent.is_some()));
     assert!(actual.issues.values().any(|i| i.labels == [b_id]));
 
-    assert_eq!(replay(&log), replayed, "replay is deterministic");
+    assert_eq!(
+        replay::replay(&log).unwrap(),
+        replayed,
+        "replay is deterministic"
+    );
     store.close().await;
 }

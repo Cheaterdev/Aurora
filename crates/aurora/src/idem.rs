@@ -17,6 +17,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use aurora_store::auth::{KEY_PREFIX, Principal};
+use aurora_store::failpoints::{self, Point};
 use aurora_store::request_log::{self, Replayed, Reply, RequestKey, Run};
 use aurora_store::rusqlite::Transaction;
 use aurora_store::{Rejection, Store, StoreError, now_millis};
@@ -140,19 +141,6 @@ pub(crate) async fn layer(req: Request, next: Next) -> Response {
     response
 }
 
-/// Kills the process at a named point when a test child asks for it, to
-/// simulate power loss. Absent from release builds.
-#[cfg(test)]
-pub(crate) fn failpoint(name: &str) {
-    if std::env::var("AURORA_TEST_FAILPOINT").is_ok_and(|wanted| wanted == name) {
-        std::process::abort();
-    }
-}
-
-#[cfg(not(test))]
-#[inline]
-pub(crate) fn failpoint(_name: &str) {}
-
 fn answer(status: u16, body: String, replayed: bool) -> Response {
     let status = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     let mut response = (status, [(header::CONTENT_TYPE, "application/json")], body).into_response();
@@ -186,13 +174,9 @@ async fn run(
     let now = now_millis();
     let retention = store.request_retention();
     let outcome = store
-        .write(move |tx| {
-            let outcome = request_log::run(tx, key.as_ref(), now, retention, || change(tx))?;
-            failpoint("before_commit");
-            Ok(outcome)
-        })
+        .write(move |tx| request_log::run(tx, key.as_ref(), now, retention, || change(tx)))
         .await?;
-    failpoint("after_commit_before_response");
+    failpoints::hit(Point::AfterCommitBeforeResponse);
     Ok(match outcome {
         Run::Fresh(reply) => answer(reply.status, reply.body, false),
         Run::Replayed(replayed) => replay(replayed),

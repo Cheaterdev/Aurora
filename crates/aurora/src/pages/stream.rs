@@ -11,6 +11,7 @@ use std::convert::Infallible;
 use std::time::Duration;
 
 use aurora_store::events::{self, Event as LogEvent, EventFilter};
+use aurora_store::failpoints::{self, Point};
 use aurora_store::projects::get_project;
 use aurora_store::{Store, StoreError};
 use axum::Extension;
@@ -149,6 +150,7 @@ impl Tail {
                 .await
             {
                 Ok(list) if !list.is_empty() => {
+                    failpoints::hit(Point::BeforeEventDelivery);
                     self.queue = list.into();
                     continue;
                 }

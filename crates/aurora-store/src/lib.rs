@@ -16,8 +16,10 @@ mod backup;
 pub mod comments;
 pub mod documents;
 pub mod events;
+pub mod failpoints;
 pub mod initiatives;
 mod integrity;
+pub mod invariants;
 pub mod issues;
 pub mod links;
 mod location;
@@ -26,6 +28,7 @@ mod migrations;
 #[cfg_attr(not(windows), path = "platform/other.rs")]
 mod platform;
 pub mod projects;
+pub mod replay;
 pub mod request_log;
 pub mod search;
 
@@ -192,6 +195,17 @@ impl Store {
         Store::open_inner(path.as_ref(), options, migrations::MIGRATIONS)
     }
 
+    /// Opens `path` applying only the first `version` migrations, which builds
+    /// a database as an older release left it. For crash tests of the
+    /// migration path; not part of the product.
+    #[cfg(any(test, feature = "failpoints"))]
+    pub fn open_at_version(path: impl AsRef<Path>, version: usize) -> Result<Store, StoreError> {
+        let list = migrations::MIGRATIONS
+            .get(..version)
+            .unwrap_or(migrations::MIGRATIONS);
+        Store::open_inner(path.as_ref(), &OpenOptions::default(), list)
+    }
+
     #[cfg(test)]
     fn open_with_migrations(
         path: impl AsRef<Path>,
@@ -348,7 +362,7 @@ impl Store {
     /// returns a full batch. Each call is its own short write.
     pub async fn purge_request_log(&self, now: i64) -> Result<usize, StoreError> {
         let retention = self.inner.request_retention;
-        self.write(move |tx| {
+        self.write_with(false, move |tx| {
             request_log::purge_expired(tx, now, retention, request_log::PURGE_BATCH)
         })
         .await
@@ -357,6 +371,16 @@ impl Store {
     /// Runs `f` in a transaction on the writer thread. The transaction commits
     /// if `f` returns `Ok` and rolls back on `Err` or panic.
     pub async fn write<T, F>(&self, f: F) -> Result<T, StoreError>
+    where
+        F: FnOnce(&Transaction<'_>) -> Result<T, StoreError> + Send + 'static,
+        T: Send + 'static,
+    {
+        self.write_with(true, f).await
+    }
+
+    /// `failpoints` is `false` for maintenance writes, so that a failpoint's
+    /// hit count counts only the writes a client asked for.
+    async fn write_with<T, F>(&self, failpoints: bool, f: F) -> Result<T, StoreError>
     where
         F: FnOnce(&Transaction<'_>) -> Result<T, StoreError> + Send + 'static,
         T: Send + 'static,
@@ -370,7 +394,13 @@ impl Store {
             let outcome = catch_unwind(AssertUnwindSafe(|| {
                 let tx = conn.transaction()?;
                 let value = f(&tx)?;
+                if failpoints {
+                    failpoints::hit(failpoints::Point::BeforeCommit);
+                }
                 tx.commit()?;
+                if failpoints {
+                    failpoints::hit(failpoints::Point::AfterCommit);
+                }
                 Ok(value)
             }))
             .unwrap_or(Err(StoreError::Panicked));
@@ -843,16 +873,6 @@ mod tests_support {
             crate::links::remove_link(tx, now, &test_actor(tx), project_key, link_id)
         }
     }
-
-    /// Kills the process, simulating power loss, when a test child asks for it.
-    /// Called inside the migration transaction after its SQL ran and before
-    /// the version row is recorded or anything is committed.
-    pub(crate) fn abort_if_requested(version: i64) {
-        let wanted = std::env::var("AURORA_TEST_ABORT_AT_VERSION").ok();
-        if wanted.is_some_and(|v| v == version.to_string()) {
-            std::process::abort();
-        }
-    }
 }
 
 #[cfg(test)]
@@ -891,6 +911,8 @@ mod tests_documents;
 mod tests_events;
 #[cfg(test)]
 mod tests_initiatives;
+#[cfg(test)]
+mod tests_invariants;
 #[cfg(test)]
 mod tests_issues;
 #[cfg(test)]
@@ -1471,7 +1493,7 @@ mod tests {
         let status = std::process::Command::new(std::env::current_exe().unwrap())
             .args([KILL_HELPER, "--exact", "--test-threads=1", "--nocapture"])
             .env(KILL_DB, &path)
-            .env("AURORA_TEST_ABORT_AT_VERSION", "2")
+            .env("AURORA_TEST_FAILPOINT", "mid_migration")
             .status()
             .unwrap();
         assert!(!status.success(), "child must die abnormally, got {status}");

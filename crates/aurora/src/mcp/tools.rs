@@ -16,6 +16,7 @@ use aurora_store::agents;
 use aurora_store::auth::{self, Principal};
 use aurora_store::comments::{self, NewComment};
 use aurora_store::documents::{self, DocumentPatch, NewDocument};
+use aurora_store::failpoints::{self, Point};
 use aurora_store::initiatives::{self, InitiativeStatus};
 use aurora_store::issues::{self, IssueFilter, IssuePatch, MoveTarget, NewIssue, ParentFilter};
 use aurora_store::links::{self, LinkKind};
@@ -28,7 +29,6 @@ use serde::Serialize;
 use serde_json::{Map, Value, json};
 
 use crate::auth::Access;
-use crate::idem::failpoint;
 use crate::routes::LinkTarget;
 
 /// What a successful tool returns: a short sentence and the data.
@@ -1009,17 +1009,15 @@ where
     let retention = store.request_retention();
     let run = store
         .write(move |tx| {
-            let run = request_log::run(tx, key.as_ref(), now, retention, || {
+            request_log::run(tx, key.as_ref(), now, retention, || {
                 let done = change(tx)?;
                 let body = json!({ "summary": done.summary, "data": done.data });
                 Ok(Reply::new(200, body.to_string()))
-            })?;
-            failpoint("before_commit");
-            Ok(run)
+            })
         })
         .await
         .map_err(describe)?;
-    failpoint("after_commit_before_response");
+    failpoints::hit(Point::AfterCommitBeforeResponse);
     let (body, replayed) = match run {
         Run::Fresh(reply) => (Some(reply.body), false),
         Run::Replayed(replayed) => (replayed.body, true),
