@@ -109,12 +109,39 @@ pub struct Project {
     pub created: i64,
     /// The project's rules text, shown to agents; empty when there are none.
     pub rules: String,
+    /// The local git repository runs get their working copies from: its
+    /// top-level folder. Not serialized: agents must never learn it; people get
+    /// it through [`Project::for_people`].
+    #[serde(skip)]
+    pub repo_path: Option<String>,
+    /// The branch runs start from; `None` means the repository's default.
+    #[serde(skip)]
+    pub base_branch: Option<String>,
+}
+
+impl Project {
+    /// The project as a person sees it: the usual fields plus `repo_path` and
+    /// `base_branch` (both `null` when not set).
+    pub fn for_people(&self) -> Value {
+        let mut value = serde_json::to_value(self).unwrap_or(Value::Null);
+        if let Some(map) = value.as_object_mut() {
+            map.insert("repo_path".into(), json!(self.repo_path));
+            map.insert("base_branch".into(), json!(self.base_branch));
+        }
+        value
+    }
 }
 
 /// The longest rules text of a project.
 pub const MAX_RULES_CHARS: usize = 10_000;
+/// The longest repository path.
+pub const MAX_REPO_PATH_CHARS: usize = 1000;
+/// The longest branch name.
+pub const MAX_BRANCH_CHARS: usize = 200;
 
-/// Only the fields that are present change.
+/// Only the fields that are present change. Setting `repo_path` or
+/// `base_branch` is for the owner (`Forbidden` otherwise); the server checks
+/// them against git before it calls [`update_project`].
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProjectPatch {
@@ -122,6 +149,19 @@ pub struct ProjectPatch {
     /// `null` or blank text clears the rules.
     #[serde(default, deserialize_with = "present")]
     pub rules: Option<Option<String>>,
+    /// `null` or blank text clears the repository.
+    #[serde(default, deserialize_with = "present")]
+    pub repo_path: Option<Option<String>>,
+    /// `null` or blank text clears the base branch (the repository's default).
+    #[serde(default, deserialize_with = "present")]
+    pub base_branch: Option<Option<String>>,
+}
+
+impl ProjectPatch {
+    /// Whether the patch touches the repository settings.
+    pub fn touches_repo(&self) -> bool {
+        self.repo_path.is_some() || self.base_branch.is_some()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -186,10 +226,13 @@ fn project_row(row: &Row<'_>) -> rusqlite::Result<Project> {
         name: row.get(2)?,
         created: row.get(3)?,
         rules: row.get(4)?,
+        repo_path: row.get(5)?,
+        base_branch: row.get(6)?,
     })
 }
 
-const PROJECT_SELECT: &str = "SELECT id, key, name, created, COALESCE(rules, '') FROM project";
+const PROJECT_SELECT: &str =
+    "SELECT id, key, name, created, COALESCE(rules, ''), repo_path, base_branch FROM project";
 
 fn column_row(row: &Row<'_>) -> rusqlite::Result<Column> {
     Ok(Column {
@@ -384,9 +427,40 @@ pub fn rename_project(
 ) -> Result<Project, StoreError> {
     let patch = ProjectPatch {
         name: Some(name.to_string()),
-        rules: None,
+        ..ProjectPatch::default()
     };
     update_project(tx, now, actor, key, patch)
+}
+
+/// `None` for blank text. The path must be absolute; whether it is a git
+/// repository is for the server to check (it needs git), the store only keeps
+/// what it is given.
+fn clean_repo_path(path: Option<&str>) -> Result<Option<String>, StoreError> {
+    let Some(path) = path.map(str::trim).filter(|text| !text.is_empty()) else {
+        return Ok(None);
+    };
+    if path.chars().count() > MAX_REPO_PATH_CHARS || path.contains('\0') {
+        return Err(invalid(format!(
+            "repo_path must be at most {MAX_REPO_PATH_CHARS} characters without NUL"
+        )));
+    }
+    if !std::path::Path::new(path).is_absolute() {
+        return Err(invalid("repo_path must be an absolute path"));
+    }
+    Ok(Some(path.to_string()))
+}
+
+/// `None` for blank text. Whether the branch exists is for the server to check.
+fn clean_base_branch(branch: Option<&str>) -> Result<Option<String>, StoreError> {
+    let Some(branch) = branch.map(str::trim).filter(|text| !text.is_empty()) else {
+        return Ok(None);
+    };
+    if branch.chars().count() > MAX_BRANCH_CHARS || branch.contains(['\0', '\n', '\r']) {
+        return Err(invalid(format!(
+            "base_branch must be at most {MAX_BRANCH_CHARS} characters on one line"
+        )));
+    }
+    Ok(Some(branch.to_string()))
 }
 
 /// `None` for blank text: a project without rules stores NULL.
@@ -402,10 +476,13 @@ fn clean_rules(rules: Option<&str>) -> Result<Option<String>, StoreError> {
     Ok(Some(rules.to_string()))
 }
 
-/// Changes the name and/or the rules. One `project.updated` event, with
-/// `{name, previous_name}` when the name changed and `{rules: {changed: true,
-/// chars}}` when the rules changed (the text itself is never logged). Nothing
-/// is written, and no event, when nothing differs.
+/// Changes the name, the rules and/or the repository settings. One
+/// `project.updated` event, with `{name, previous_name}` when the name changed,
+/// `{rules: {changed: true, chars}}` when the rules changed (the text itself is
+/// never logged) and `{repo_path: {changed: true, set}}` /
+/// `{base_branch: {changed: true, set}}` when those changed (never the value).
+/// Nothing is written, and no event, when nothing differs. The repository
+/// settings are for the owner only (`Forbidden`).
 pub fn update_project(
     tx: &Transaction<'_>,
     now: i64,
@@ -413,9 +490,25 @@ pub fn update_project(
     key: &str,
     patch: ProjectPatch,
 ) -> Result<Project, StoreError> {
-    if patch.name.is_none() && patch.rules.is_none() {
-        return Err(invalid("give a name, rules or both"));
+    if patch.name.is_none() && patch.rules.is_none() && !patch.touches_repo() {
+        return Err(invalid(
+            "give a name, rules, repo_path or base_branch (at least one)",
+        ));
     }
+    if patch.touches_repo() && !actor.is_owner() {
+        return Err(Rejection::Forbidden(
+            "only the owner can change the repository settings of a project".to_string(),
+        )
+        .into());
+    }
+    let repo_path = match &patch.repo_path {
+        Some(path) => Some(clean_repo_path(path.as_deref())?),
+        None => None,
+    };
+    let base_branch = match &patch.base_branch {
+        Some(branch) => Some(clean_base_branch(branch.as_deref())?),
+        None => None,
+    };
     let name = patch
         .name
         .as_deref()
@@ -444,6 +537,28 @@ pub fn update_project(
         let chars = rules.as_deref().map_or(0, |text| text.chars().count());
         payload.insert("rules".into(), json!({ "changed": true, "chars": chars }));
         project.rules = rules.unwrap_or_default();
+    }
+    if let Some(path) = repo_path.filter(|path| *path != project.repo_path) {
+        tx.execute(
+            "UPDATE project SET repo_path = ?1 WHERE id = ?2",
+            params![path, project.id],
+        )?;
+        payload.insert(
+            "repo_path".into(),
+            json!({ "changed": true, "set": path.is_some() }),
+        );
+        project.repo_path = path;
+    }
+    if let Some(branch) = base_branch.filter(|branch| *branch != project.base_branch) {
+        tx.execute(
+            "UPDATE project SET base_branch = ?1 WHERE id = ?2",
+            params![branch, project.id],
+        )?;
+        payload.insert(
+            "base_branch".into(),
+            json!({ "changed": true, "set": branch.is_some() }),
+        );
+        project.base_branch = branch;
     }
     if !payload.is_empty() {
         emit(

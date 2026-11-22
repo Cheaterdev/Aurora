@@ -36,12 +36,33 @@
 //! asked (a manual start, a cancel) and absent for the system:
 //!
 //! * `run.created` `{agent_id, issue: {number, identifier}, reason,
-//!   trigger_event_id, template_source}`
+//!   trigger_event_id, template_source, branch, worktree_state}`
 //! * `run.started` `{pid}`
-//! * `run.finished` `{status, exit_code, error?}`
+//! * `run.finished` `{status, exit_code, error?, worktree_state?, has_changes?}`
 //!
 //! The per-run key's own `key.created` and `key.revoked` events (actor: the
 //! agent's user) are written in the same transactions.
+//!
+//! # The working copy (TRK-16)
+//!
+//! A project with a repository gives each run of an agent without an explicit
+//! `work_dir` its own git worktree. [`create_run`] only *plans* it, in the
+//! transaction that creates the run: the path (`<data folder>/worktrees/<run
+//! id>`) and the branch (`aurora/<KEY>-<n>-run<id>`, see [`branch_name`]) are
+//! functions of the run's id, so the first message can name them before git
+//! has run. The state is then `created`. The runner makes the worktree,
+//! records the base it resolved ([`set_worktree_base`]) and, when the run
+//! ends, inspects it and passes what it found in [`Outcome::worktree`], which
+//! [`finish_run`] stores in the same transaction as the end of the run.
+//! `removed` means it had no changes and was deleted; `kept` means it has
+//! changes (or nobody could tell) and stays. **Nothing here ever decides to
+//! delete a working copy that has changes.** A run that ends without anyone
+//! having inspected its working copy (a crash, the shutdown sweep, a panic) is
+//! recorded `kept` with a note, and start-up reconciliation turns every
+//! leftover `created` into `kept` without touching the disk. A run canceled by
+//! a person is finished before its process is stopped, so its working copy is
+//! settled a moment later by [`record_worktree`] (no event; the row is the
+//! authority).
 
 use rusqlite::types::{FromSql, FromSqlError, FromSqlResult, ToSql, ToSqlOutput, ValueRef};
 use rusqlite::{Connection, OptionalExtension, Row, Transaction, params, params_from_iter};
@@ -154,6 +175,116 @@ impl FromSql for RunReason {
     }
 }
 
+/// What became of a run's working copy; see the module docs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WorktreeState {
+    None,
+    Created,
+    Removed,
+    Kept,
+}
+
+impl WorktreeState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            WorktreeState::None => "none",
+            WorktreeState::Created => "created",
+            WorktreeState::Removed => "removed",
+            WorktreeState::Kept => "kept",
+        }
+    }
+
+    pub fn parse(text: &str) -> Option<WorktreeState> {
+        Some(match text {
+            "none" => WorktreeState::None,
+            "created" => WorktreeState::Created,
+            "removed" => WorktreeState::Removed,
+            "kept" => WorktreeState::Kept,
+            _ => return None,
+        })
+    }
+}
+
+impl ToSql for WorktreeState {
+    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
+        self.as_str().to_sql()
+    }
+}
+
+impl FromSql for WorktreeState {
+    fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
+        let text = value.as_str()?;
+        WorktreeState::parse(text)
+            .ok_or_else(|| FromSqlError::Other(format!("worktree state {text}").into()))
+    }
+}
+
+/// What a run left in its working copy, found by the runner before the run is
+/// finished. Counts are capped at [`MAX_COUNT`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorktreeEnd {
+    pub state: WorktreeState,
+    pub has_changes: bool,
+    pub changed_files: i64,
+    pub ahead: i64,
+    pub note: Option<String>,
+}
+
+/// Counts of changed files and commits are bounded.
+pub const MAX_COUNT: i64 = 1_000_000;
+const MAX_NOTE_CHARS: usize = 300;
+
+impl WorktreeEnd {
+    /// There never was a working copy (it could not be created).
+    pub fn none(note: impl Into<String>) -> WorktreeEnd {
+        WorktreeEnd {
+            state: WorktreeState::None,
+            has_changes: false,
+            changed_files: 0,
+            ahead: 0,
+            note: Some(note.into()),
+        }
+    }
+
+    /// No changes: the folder and the branch were deleted.
+    pub fn removed() -> WorktreeEnd {
+        WorktreeEnd {
+            state: WorktreeState::Removed,
+            has_changes: false,
+            changed_files: 0,
+            ahead: 0,
+            note: None,
+        }
+    }
+
+    /// The folder and the branch stay. `has_changes` is false only when nobody
+    /// could tell (then `note` says why).
+    pub fn kept(
+        has_changes: bool,
+        changed_files: i64,
+        ahead: i64,
+        note: Option<String>,
+    ) -> WorktreeEnd {
+        WorktreeEnd {
+            state: WorktreeState::Kept,
+            has_changes,
+            changed_files: changed_files.clamp(0, MAX_COUNT),
+            ahead: ahead.clamp(0, MAX_COUNT),
+            note,
+        }
+    }
+
+    fn not_inspected() -> WorktreeEnd {
+        WorktreeEnd::kept(
+            false,
+            0,
+            0,
+            Some("the working copy was not inspected when the run ended".to_string()),
+        )
+    }
+}
+
 /// A run without its message and output: safe to show to anyone who may see
 /// the issue, an agent's key included.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -183,6 +314,23 @@ pub struct Run {
     pub finished: Option<i64>,
     pub created: i64,
     pub created_by: Option<i64>,
+    /// The run's working copy: its folder (absolute), kept for the run's life
+    /// and afterwards when it has changes. Empty when there is none.
+    pub worktree_path: Option<String>,
+    /// The git branch of the working copy.
+    pub branch: Option<String>,
+    /// The branch the working copy was made from, as resolved when it started.
+    pub base_ref: Option<String>,
+    /// The full SHA the working copy started from.
+    pub base_commit: Option<String>,
+    pub worktree_state: WorktreeState,
+    /// The working copy had uncommitted or untracked files, or commits, when
+    /// the run ended.
+    pub has_changes: bool,
+    pub changed_files: i64,
+    /// Commits the branch is ahead of `base_commit`.
+    pub ahead: i64,
+    pub worktree_note: Option<String>,
 }
 
 /// A run with the sensitive text. Owner and members only.
@@ -199,6 +347,8 @@ pub struct RunDetail {
 const RUN_SELECT: &str = "SELECT r.id, r.agent_id, u.name, p.key, i.number, r.reason, r.status,
         r.trigger_event_id, r.pid, r.template_source, r.template_id, r.edited, r.exit_code,
         r.error, r.output_truncated, r.started, r.finished, r.created, r.created_by,
+        r.worktree_path, r.branch, r.base_ref, r.base_commit, r.worktree_state, r.has_changes,
+        r.changed_files, r.ahead, r.worktree_note,
         r.message, r.output_tail
      FROM run r
      JOIN agent a ON a.id = r.agent_id
@@ -231,9 +381,18 @@ fn run_row(row: &Row<'_>) -> rusqlite::Result<RunDetail> {
             finished: row.get(16)?,
             created: row.get(17)?,
             created_by: row.get(18)?,
+            worktree_path: row.get(19)?,
+            branch: row.get(20)?,
+            base_ref: row.get(21)?,
+            base_commit: row.get(22)?,
+            worktree_state: row.get(23)?,
+            has_changes: row.get(24)?,
+            changed_files: row.get(25)?,
+            ahead: row.get(26)?,
+            worktree_note: row.get(27)?,
         },
-        message: row.get(19)?,
-        output_tail: row.get(20)?,
+        message: row.get(28)?,
+        output_tail: row.get(29)?,
     })
 }
 
@@ -270,6 +429,49 @@ pub struct NewRun {
     /// When set the run is recorded as `failed` with this reason and never
     /// gets a process or a key (the first message could not be rendered).
     pub failed: Option<String>,
+    /// The server's data folder (absolute, UTF-8). A run of an agent without a
+    /// `work_dir` in a project with a repository gets a working copy under it
+    /// (see the module docs); `None` plans none.
+    pub worktree_root: Option<String>,
+    /// Start from this branch instead of the project's `base_branch`.
+    pub base_branch: Option<String>,
+}
+
+/// The longest branch name [`branch_name`] makes.
+pub const MAX_RUN_BRANCH_CHARS: usize = 100;
+
+/// The branch of a run's working copy: `aurora/<KEY>-<number>-run<id>`, every
+/// character outside ASCII letters, digits, `-` and `_` in the key replaced by
+/// `-`, at most [`MAX_RUN_BRANCH_CHARS`] long (a long key is cut, the number and
+/// the run id never are), so it is always a valid git ref name.
+pub fn branch_name(key: &str, number: i64, run_id: i64) -> String {
+    let suffix = format!("-{number}-run{run_id}");
+    let prefix = "aurora/";
+    let room = MAX_RUN_BRANCH_CHARS.saturating_sub(prefix.len() + suffix.len());
+    let mut key: String = key
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .take(room)
+        .collect();
+    if key.is_empty() {
+        key.push('x');
+    }
+    format!("{prefix}{key}{suffix}")
+}
+
+/// The folder of a run's working copy under the data folder `root`.
+pub fn worktree_dir(root: &str, run_id: i64) -> String {
+    std::path::Path::new(root)
+        .join("worktrees")
+        .join(run_id.to_string())
+        .to_string_lossy()
+        .into_owned()
 }
 
 /// The result of [`create_run`].
@@ -435,6 +637,42 @@ pub fn create_run(
         )?;
         secret = Some(key.key);
     }
+
+    let fixed_folder = agent
+        .private
+        .as_ref()
+        .is_none_or(|private| private.work_dir.is_some());
+    let mut branch = None;
+    let mut worktree_state = WorktreeState::None;
+    if new.failed.is_none()
+        && !fixed_folder
+        && let Some(root) = &new.worktree_root
+    {
+        let repo: Option<(Option<String>, Option<String>)> = tx
+            .query_row(
+                "SELECT repo_path, base_branch FROM project WHERE id = ?1",
+                [project_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        if let Some((Some(repo), configured)) = repo {
+            let name = branch_name(&new.project, new.number, id);
+            tx.execute(
+                "UPDATE run SET worktree_path = ?1, worktree_repo = ?2, branch = ?3,
+                                base_ref = ?4, worktree_state = 'created'
+                 WHERE id = ?5",
+                params![
+                    worktree_dir(root, id),
+                    repo,
+                    name,
+                    new.base_branch.clone().or(configured),
+                    id
+                ],
+            )?;
+            branch = Some(name);
+            worktree_state = WorktreeState::Created;
+        }
+    }
     emit_as(
         tx,
         now,
@@ -449,6 +687,8 @@ pub fn create_run(
             "reason": new.reason,
             "trigger_event_id": new.trigger_event_id,
             "template_source": new.template_source,
+            "branch": branch,
+            "worktree_state": worktree_state,
         }),
     )?;
     if let Some(error) = &error {
@@ -546,6 +786,10 @@ pub struct Outcome {
     pub error: Option<String>,
     pub output_tail: String,
     pub truncated: bool,
+    /// What the runner found in the working copy. `None`: nobody looked; a run
+    /// that ends this way and is not a cancel gets its working copy recorded as
+    /// `kept` (see the module docs), a cancel is settled later.
+    pub worktree: Option<WorktreeEnd>,
 }
 
 impl Outcome {
@@ -556,6 +800,7 @@ impl Outcome {
             error: None,
             output_tail: String::new(),
             truncated: false,
+            worktree: None,
         }
     }
 
@@ -615,9 +860,24 @@ pub fn finish_run(
         };
         auth::revoke_key(tx, now, &principal, key_id)?;
     }
+    let settled = match &outcome.worktree {
+        Some(end) => Some(end.clone()),
+        None if outcome.status != RunStatus::Canceled => Some(WorktreeEnd::not_inspected()),
+        None => None,
+    };
+    let mut worktree = None;
+    if let Some(end) = settled
+        && apply_worktree_end(tx, run_id, &end)?
+    {
+        worktree = Some(end);
+    }
     let mut payload = json!({ "status": outcome.status, "exit_code": outcome.exit_code });
     if let (Some(error), Some(map)) = (&error, payload.as_object_mut()) {
         map.insert("error".into(), json!(error));
+    }
+    if let (Some(end), Some(map)) = (&worktree, payload.as_object_mut()) {
+        map.insert("worktree_state".into(), json!(end.state));
+        map.insert("has_changes".into(), json!(end.has_changes));
     }
     emit_as(
         tx,
@@ -630,6 +890,111 @@ pub fn finish_run(
         &payload,
     )?;
     Ok(true)
+}
+
+/// Stores what was found in a working copy that is still `created`. `false`
+/// (nothing changed) for any other state, so a repeat or a late settle never
+/// overwrites a result.
+fn apply_worktree_end(
+    tx: &Transaction<'_>,
+    run_id: i64,
+    end: &WorktreeEnd,
+) -> Result<bool, StoreError> {
+    if end.state == WorktreeState::Created {
+        return Err(invalid("a working copy cannot be settled as created"));
+    }
+    let note = end.note.as_deref().map(|n| clip(n, MAX_NOTE_CHARS));
+    let changed = tx.execute(
+        "UPDATE run SET worktree_state = ?1, has_changes = ?2, changed_files = ?3,
+                        ahead = ?4, worktree_note = ?5
+         WHERE id = ?6 AND worktree_state = 'created'",
+        params![
+            end.state,
+            end.has_changes,
+            end.changed_files.clamp(0, MAX_COUNT),
+            end.ahead.clamp(0, MAX_COUNT),
+            note,
+            run_id
+        ],
+    )?;
+    Ok(changed > 0)
+}
+
+/// Settles the working copy of a run that was finished before anyone looked at
+/// it (a cancel finishes the run first and stops the process after). `false`
+/// when the working copy was settled already.
+pub fn record_worktree(
+    tx: &Transaction<'_>,
+    run_id: i64,
+    end: &WorktreeEnd,
+) -> Result<bool, StoreError> {
+    apply_worktree_end(tx, run_id, end)
+}
+
+/// Records the base the runner resolved and made the working copy from.
+pub fn set_worktree_base(
+    tx: &Transaction<'_>,
+    run_id: i64,
+    base_ref: &str,
+    base_commit: &str,
+) -> Result<(), StoreError> {
+    tx.execute(
+        "UPDATE run SET base_ref = ?1, base_commit = ?2
+         WHERE id = ?3 AND worktree_state = 'created'",
+        params![base_ref, base_commit, run_id],
+    )?;
+    Ok(())
+}
+
+/// What the runner needs to make, inspect and remove a run's working copy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorktreeTarget {
+    pub repo: String,
+    pub path: String,
+    pub branch: String,
+    /// The branch asked for (the run's override or the project's setting);
+    /// `None` when the repository's default is to be used.
+    pub base_ref: Option<String>,
+    pub base_commit: Option<String>,
+    pub state: WorktreeState,
+}
+
+/// The working copy of a run, if it has one planned or made.
+pub fn worktree_target(
+    conn: &Connection,
+    run_id: i64,
+) -> Result<Option<WorktreeTarget>, StoreError> {
+    let found = conn
+        .query_row(
+            "SELECT worktree_repo, worktree_path, branch, base_ref, base_commit, worktree_state
+             FROM run WHERE id = ?1",
+            [run_id],
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, WorktreeState>(5)?,
+                ))
+            },
+        )
+        .optional()?
+        .ok_or_else(|| not_found("run"))?;
+    Ok(match found {
+        (Some(repo), Some(path), Some(branch), base_ref, base_commit, state) => {
+            Some(WorktreeTarget {
+                repo,
+                path,
+                branch,
+                base_ref,
+                base_commit,
+                state,
+            })
+        }
+        _ => None,
+    })
 }
 
 /// A run canceled by a person is finished (and its key revoked) before the
@@ -659,6 +1024,8 @@ pub struct RunFilter {
     pub status: Option<RunStatus>,
     /// Only runs of these projects (`None`: no limit, an empty list: none).
     pub allowed_projects: Option<Vec<String>>,
+    /// `Some(true)`: only runs that left changes in their working copy.
+    pub has_changes: Option<bool>,
     pub limit: Option<i64>,
     pub offset: Option<i64>,
 }
@@ -679,6 +1046,10 @@ pub fn list_runs(conn: &Connection, filter: &RunFilter) -> Result<Vec<Run>, Stor
     if let Some(status) = filter.status {
         conditions.push("r.status = ?".into());
         values.push(status.as_str().to_string().into());
+    }
+    if let Some(changes) = filter.has_changes {
+        conditions.push("r.has_changes = ?".into());
+        values.push(i64::from(changes).into());
     }
     if let Some(allowed) = &filter.allowed_projects {
         let marks = vec!["?"; allowed.len()].join(", ");
@@ -751,7 +1122,17 @@ pub fn reconcile_startup(
         "SELECT id FROM run WHERE status IN ('starting', 'running') AND boot_id <> ?1 ORDER BY id",
         boot_id,
     )?;
-    interrupt(tx, now, ids, "server restarted")
+    let done = interrupt(tx, now, ids, "server restarted")?;
+    // A working copy still `created` under another boot was never looked at
+    // (a crash, or a cancel whose process was still being stopped). Without
+    // touching the disk, the safe reading is "may have changes".
+    tx.execute(
+        "UPDATE run SET worktree_state = 'kept',
+                        worktree_note = 'the server stopped before the working copy was inspected'
+         WHERE worktree_state = 'created' AND boot_id <> ?1 AND status NOT IN ('starting', 'running')",
+        [boot_id],
+    )?;
+    Ok(done)
 }
 
 /// At shutdown, after the run tasks stopped: whatever of this boot is still
@@ -767,7 +1148,14 @@ pub fn interrupt_boot(
         "SELECT id FROM run WHERE status IN ('starting', 'running') AND boot_id = ?1 ORDER BY id",
         boot_id,
     )?;
-    interrupt(tx, now, ids, "server stopped")
+    let done = interrupt(tx, now, ids, "server stopped")?;
+    tx.execute(
+        "UPDATE run SET worktree_state = 'kept',
+                        worktree_note = 'the server stopped before the working copy was inspected'
+         WHERE worktree_state = 'created' AND boot_id = ?1 AND status NOT IN ('starting', 'running')",
+        [boot_id],
+    )?;
+    Ok(done)
 }
 
 /// Active runs that do not belong to `boot_id`: when a live server checks

@@ -18,7 +18,7 @@ use aurora_store::issues::{Issue, Priority};
 use aurora_store::links::{Blocker, IssueLinks, LinkedIssue};
 use aurora_store::projects::{Column, IssueType, Label, Project};
 use aurora_store::prompt::{TemplateSource, VariableInfo};
-use aurora_store::runs::Run;
+use aurora_store::runs::{Run, WorktreeState};
 use aurora_store::search::{Hit, Kind, Segment};
 use maud::{DOCTYPE, Markup, html};
 use serde_json::Value;
@@ -626,6 +626,34 @@ pub fn board_fragment(data: &BoardData) -> Markup {
     }
 }
 
+/// The repository runs take their working copies from. Owner only: the caller
+/// does not build it for anyone else.
+fn repository_form(project: &Project) -> Markup {
+    html! {
+        form.inline-form data-form="repo-settings" {
+            h3 { "Repository" }
+            p.hint {
+                "Each run of an agent without a fixed working folder gets its own git worktree of this repository. "
+                "Leave it empty to give runs an empty folder instead."
+            }
+            div.field {
+                label for="repo-path" { "Repository folder" }
+                input #repo-path name="repo_path" maxlength="1000" autocomplete="off"
+                    value=(project.repo_path.as_deref().unwrap_or(""))
+                    placeholder="The folder of an existing git repository";
+            }
+            div.field {
+                label for="base-branch" { "Base branch" }
+                input #base-branch name="base_branch" maxlength="200" autocomplete="off"
+                    value=(project.base_branch.as_deref().unwrap_or(""))
+                    placeholder="Empty: the repository's default branch";
+            }
+            button type="submit" { "Save repository" }
+            p.field-msg role="alert" {}
+        }
+    }
+}
+
 pub fn board_page(data: &BoardData) -> Markup {
     let mut frame = Frame::new(&data.project.name, "board");
     frame.user = Some(&data.user);
@@ -670,6 +698,9 @@ pub fn board_page(data: &BoardData) -> Markup {
                             }
                             button type="submit" { "Add label" }
                             p.field-msg role="alert" {}
+                        }
+                        @if data.user.role == Role::Owner {
+                            (repository_form(&data.project))
                         }
                     }
                 }
@@ -2126,6 +2157,33 @@ fn run_chip(run: &Run) -> Markup {
     }
 }
 
+/// What became of the run's working copy, in words (never colour alone).
+fn worktree_text(run: &Run) -> &'static str {
+    match run.worktree_state {
+        WorktreeState::None => "no working copy of its own",
+        WorktreeState::Created if run.status.is_active() => "worktree in use",
+        WorktreeState::Created => "worktree not settled yet",
+        WorktreeState::Removed => "worktree removed \u{2014} no changes",
+        WorktreeState::Kept if run.has_changes => "worktree kept \u{2014} has changes",
+        WorktreeState::Kept => "worktree kept \u{2014} not inspected",
+    }
+}
+
+fn short_sha(sha: &str) -> &str {
+    sha.get(..8).unwrap_or(sha)
+}
+
+fn worktree_chip(run: &Run) -> Markup {
+    html! {
+        @if run.worktree_state != WorktreeState::None {
+            span.chip.chip-worktree data-state=(run.worktree_state.as_str())
+                data-changes=(run.has_changes) {
+                (worktree_text(run))
+            }
+        }
+    }
+}
+
 fn run_time(label: &str, at: Option<i64>) -> Markup {
     html! {
         @if let Some(at) = at {
@@ -2159,6 +2217,15 @@ fn runs_list(key: &str, runs: &[Run]) -> Markup {
                             (run_time("finished", run.finished))
                             @if let Some(code) = run.exit_code {
                                 " " span.meta { "exit " (code) }
+                            }
+                            @if run.worktree_state != WorktreeState::None {
+                                " " (worktree_chip(run))
+                                @if let Some(branch) = &run.branch {
+                                    " " code.branch { (branch) }
+                                }
+                                @if run.has_changes {
+                                    " " span.meta { (run.changed_files) " changed files" }
+                                }
                             }
                         }
                     }
@@ -2218,6 +2285,41 @@ pub fn run_fragment(data: &RunPageData) -> Markup {
                 @if let Some(error) = &run.error {
                     dt { "Error" }
                     dd { (error) }
+                }
+                dt { "Working copy" }
+                dd {
+                    (worktree_chip(run))
+                    @if run.worktree_state == WorktreeState::None {
+                        (worktree_text(run))
+                    }
+                }
+                @if let Some(branch) = &run.branch {
+                    dt { "Branch" }
+                    dd { code.branch { (branch) } }
+                }
+                @if let Some(path) = &run.worktree_path {
+                    dt { "Folder" }
+                    dd { code.path { (path) } }
+                }
+                @if let Some(base) = &run.base_ref {
+                    dt { "Started from" }
+                    dd {
+                        code { (base) }
+                        @if let Some(commit) = &run.base_commit {
+                            " at " code { (short_sha(commit)) }
+                        }
+                    }
+                }
+                @if run.has_changes {
+                    dt { "Changes" }
+                    dd {
+                        (run.changed_files) " changed files, "
+                        (run.ahead) " commits ahead"
+                    }
+                }
+                @if let Some(note) = &run.worktree_note {
+                    dt { "Working copy note" }
+                    dd { (note) }
                 }
             }
             h2 { "First message" }

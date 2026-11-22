@@ -202,6 +202,11 @@ through its keys). `201` with the user. `409` if the name is taken.
 A project is `{id, key, name, created, rules}`. `rules` is the project's own
 rules text for agents (empty when there is none; see Prompt templates).
 
+Owners and members also see `repo_path` and `base_branch` (both `null` until
+set): the git repository the project's runs take their working copies from
+(see Runs). A registered agent's key never gets these two fields, and no MCP
+tool returns them: the repository's folder is not for agents.
+
 ### `GET /api/v1/projects`
 
 Array of projects.
@@ -220,13 +225,32 @@ The project.
 
 ### `PATCH /api/v1/projects/{key}`
 
-Body: `name` and/or `rules`; only the fields present change, and at least one
-is required (`422` otherwise). `rules` is free text of at most 10000
-characters that the default prompt template shows to agents under "Project
-rules"; `null` or blank clears it. A request that changes nothing writes no
-event. The key cannot be changed. `200` with the project, `404`, `422`.
-The `project.updated` event carries the new name, and for the rules only
-`{"rules": {"changed": true, "chars": n}}`, never the text.
+Body: `name`, `rules`, `repo_path` and/or `base_branch`; only the fields
+present change, and at least one is required (`422` otherwise). `rules` is free
+text of at most 10000 characters that the default prompt template shows to
+agents under "Project rules"; `null` or blank clears it. A request that changes
+nothing writes no event. The key cannot be changed. `200` with the project,
+`404`, `422`. The `project.updated` event carries the new name, and for the
+rules only `{"rules": {"changed": true, "chars": n}}`, never the text.
+
+`repo_path` and `base_branch` are an exception to "anyone who may write": only
+the **owner** may set them (`403` for a member or an agent's key), because they
+decide which folder of this machine runs work in.
+
+- `repo_path` is an absolute folder (at most 1000 characters). The server runs
+  `git` on it before saving: the folder must exist and be inside a non-bare git
+  repository with at least one commit. What is stored is the repository's
+  top-level folder, so a subfolder is accepted and normalised. `null` or blank
+  clears it, and runs go back to getting an empty folder of their own.
+- `base_branch` (at most 200 characters) is the branch new working copies start
+  from. It must exist in the repository (a local branch, or `origin/<name>`), and
+  a repository must be set first. `null` or blank means "the repository's
+  default": `origin/HEAD`, else the branch that is checked out, else `main`, else
+  `master`.
+- `422` says what is wrong in words, for example "git was not found on PATH" when
+  `git` is not installed.
+- The event carries only `{"repo_path": {"changed": true, "set": true|false}}`
+  (and the same for `base_branch`), never the folder or the branch name.
 
 ### `GET /api/v1/projects/{key}/columns`
 
@@ -657,8 +681,9 @@ templates, and a test checks that every name is listed here.
 | `trigger.comment` | text | The comment that mentioned the agent; empty otherwise. |
 | `trigger.actor` | text | Who caused the run; empty when unknown. |
 | `agent.name` | text | The agent's name. |
-| `workdir` | text | The run's working copy; empty until one is provided. |
+| `workdir` | text | The run's working copy (its git worktree folder, see Runs); empty when the run has none of its own. |
 | `run.id` | text | The run's id; empty in a preview. |
+| `run.branch` | text | The git branch of the run's working copy; empty when it has none. |
 | `server.url` | text | The MCP endpoint: absolute with a public URL, otherwise `/mcp`. |
 | `now` | text | The current time, ISO-8601 UTC. |
 
@@ -737,16 +762,45 @@ command runs as a plain child process: the first message goes to its standard
 input (or into a `{prompt}` argument), `{issue}`, `{run_id}` and `{mcp_config}`
 are substituted in the arguments, and the environment carries
 `AURORA_URL`, `AURORA_MCP_URL`, `AURORA_API_KEY` (a write key made for this run
-only), `AURORA_RUN_ID`, `AURORA_ISSUE`, `AURORA_PROJECT` and `AURORA_TRIGGER`.
+only), `AURORA_RUN_ID`, `AURORA_ISSUE`, `AURORA_PROJECT` and `AURORA_TRIGGER`, plus
+`AURORA_WORKDIR` (the folder the process starts in) and, for a run with a
+working copy of its own, `AURORA_BRANCH`.
 The key is revoked in the transaction that records the end of the run.
 Standard output and error, merged, are the transcript (the last 64 KiB are
 kept); the exit status is the result. There is at most one active run
 (`starting` or `running`) per issue; a trigger that arrives meanwhile is
 dropped (queueing is a later task).
 
+**A working copy per run.** When the project has a `repo_path` and the agent has
+no `work_dir` of its own, every run works in its own git worktree, so two
+writing agents never touch the same files. The worktree is made from the base
+branch (the project's `base_branch`, or the `base_branch` given when a person
+starts the run) at `<data>/worktrees/<run id>` on a new branch
+`aurora/<KEY>-<n>-run<id>` (letters, digits, `-` and `_` only; at most 100
+characters). The process starts in it, and the prompt's `workdir` and
+`run.branch` name it. An agent with an explicit `work_dir` gets no isolation
+(`worktree_state` `none`), and neither does a project without a repository: both
+behave exactly as before. If the worktree cannot be made, the run fails with
+`could not create worktree: <reason>` and nothing is left behind.
+
+When the run ends, however it ends (success, failure, timeout, cancel, shutdown),
+the worktree is inspected: it **has changes** when `git status` lists any file
+(untracked ones included) or its `HEAD` is not the commit it started from. A
+worktree without changes is removed together with its branch (`removed`). One
+with changes is never deleted: it stays, with its branch, for a person to look at
+(`kept`). When the server cannot tell (git failed, a crash), it is kept too, with
+a `worktree_note`. Cleanup problems never fail a run.
+
 A run is `{id, agent_id, agent, project, issue, issue_number, reason, status,
 trigger_event_id, pid, template_source, template_id, edited, exit_code, error,
-output_truncated, started, finished, created, created_by}`. `reason` is
+output_truncated, started, finished, created, created_by, worktree_state,
+worktree_path, branch, base_ref, base_commit, has_changes, changed_files, ahead,
+worktree_note}`. `worktree_state` is `none`, `created` (made, not yet settled),
+`removed` or `kept`; `base_ref` is the branch it started from and `base_commit`
+its commit at that moment; `changed_files` counts files `git status` lists and
+`ahead` the commits on the run's branch beyond `base_commit`. A registered
+agent's key sees `branch` and the state but not `worktree_path` or
+`worktree_note`. `reason` is
 `assigned`, `mentioned`, `manual` or `schedule`; `status` is `starting`,
 `running`, `succeeded`, `failed`, `interrupted` or `canceled`. Times are
 milliseconds since the epoch. The detail of a run adds `message` (the exact
@@ -755,24 +809,33 @@ members get them. A registered agent's key sees the runs of its allowed
 projects without `message` and `output_tail`.
 
 Events: `run.created`, `run.started` and `run.finished` carry no message and
-no output.
+no output. `run.created` also has `branch` and `worktree_state`, and
+`run.finished` has `worktree_state` and `has_changes`; no folder is ever in an
+event. A cancel finishes the run before its process is stopped, so the run it
+returns can still say `created`; the worktree is settled moments later, without
+another event, and the run then says `removed` or `kept`.
 
 ### `POST /api/v1/agents/{id}/runs`
 
 Owner or member (an agent's key gets `403`). Body `{"issue": "KEY-12",
-"message"?: "...", "trigger_comment_id"?: n}`; `message` replaces the rendered
-first message and is sent verbatim. `201` with the run detail. `404` for an
-unknown agent, `422` for a malformed or unknown issue, a disabled agent or
-user, or a project the agent may not use, `409` when the issue already has an
+"message"?: "...", "trigger_comment_id"?: n, "base_branch"?: "name"}`;
+`message` replaces the rendered first message and is sent verbatim.
+`base_branch` starts this run's worktree from another branch of the project's
+repository; `422` when it does not exist, or when the run gets no working copy
+(no repository, or the agent has a `work_dir`). `201` with the run detail.
+`404` for an unknown agent, `422` for a malformed or unknown issue, a disabled
+agent or user, or a project the agent may not use, `409` when the issue already has an
 active run, `503` when this server has no runner. It takes a request id: a
 repeat returns the recorded response and starts no second process.
 
 ### `GET /api/v1/runs`
 
-Query: `issue` (`KEY-12`), `agent` (id), `status`, `limit` (default 50, max
-200), `offset`. Newest first, as an array of runs (no message or output). Only
+Query: `issue` (`KEY-12`), `agent` (id), `status`, `has_changes` (`true` lists
+runs whose working copy has changes, `false` the others), `limit` (default 50,
+max 200), `offset`. Newest first, as an array of runs (no message or output). Only
 runs of projects the key may use are listed; asking for another project's issue
-is `403`. `422` for a malformed `issue` or an unknown `status`.
+is `403`. `422` for a malformed `issue`, an unknown `status` or a `has_changes`
+that is not `true` or `false`.
 
 ### `GET /api/v1/runs/{id}`
 

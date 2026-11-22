@@ -186,3 +186,155 @@ fn a_crash_after_the_process_is_spawned_interrupts_the_run_on_restart() {
 fn a_crash_before_the_finish_is_recorded_interrupts_the_run_on_restart() {
     case("run_before_finish");
 }
+
+/// A repository with one commit, in a temporary folder of its own.
+fn make_repo() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir.path())
+            .args(args)
+            .output()
+            .unwrap_or_else(|e| panic!("git must be installed and on PATH for this test: {e}"));
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    git(&["init", "-q", "-b", "main"]);
+    git(&["config", "user.email", "tests@example.invalid"]);
+    git(&["config", "user.name", "Tests"]);
+    git(&["config", "commit.gpgsign", "false"]);
+    std::fs::write(dir.path().join("README.md"), "hello\n").expect("write");
+    git(&["add", "-A"]);
+    git(&["commit", "-q", "-m", "first"]);
+    dir
+}
+
+/// Killed right after the run's working copy was made and before the process
+/// starts: after the restart the run is interrupted, its working copy is kept
+/// (not deleted, not claimed to be removed), the folder is still there, and
+/// nothing runs twice.
+#[test]
+fn a_crash_after_the_worktree_is_made_keeps_it_and_interrupts_the_run_on_restart() {
+    let point = "run_after_worktree";
+    let repo = make_repo();
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db = dir.path().join("aurora.db");
+    let key = bootstrap(&db);
+
+    let mut armed = Server::spawn(&db, Some(&format!("{point}:1")));
+    armed
+        .wait_ready(READY)
+        .unwrap_or_else(|why| panic!("{point}: the armed server did not start: {why}"));
+    let a = armed.addr.clone();
+    ok(
+        &a,
+        &key,
+        "POST",
+        "/api/v1/projects",
+        Some(json!({"key": "AA", "name": "A"})),
+    );
+    ok(
+        &a,
+        &key,
+        "POST",
+        "/api/v1/projects/AA/issue-types",
+        Some(json!({"name": "Task"})),
+    );
+    ok(
+        &a,
+        &key,
+        "PATCH",
+        "/api/v1/projects/AA",
+        Some(json!({"repo_path": repo.path().display().to_string(), "base_branch": "main"})),
+    );
+    ok(
+        &a,
+        &key,
+        "POST",
+        "/api/v1/projects/AA/issues",
+        Some(json!({"title": "Crash me"})),
+    );
+    let made = ok(
+        &a,
+        &key,
+        "POST",
+        "/api/v1/agents",
+        Some(
+            json!({"name": "bot", "command": fake_agent().display().to_string(),
+                    "args": ["--sleep", "2"], "projects": ["AA"]}),
+        ),
+    );
+    let user = made["user_id"].as_i64().expect("agent user");
+    ok(
+        &a,
+        &key,
+        "PATCH",
+        "/api/v1/projects/AA/issues/1",
+        Some(json!({"assignee_id": user})),
+    );
+    let status = armed
+        .wait_exit(DIES)
+        .unwrap_or_else(|| panic!("{point}: the server did not die:\n{}", armed.log_text()));
+    assert!(!status.success(), "{point}: exited cleanly");
+    drop(armed);
+
+    assert_eq!(
+        count(&db, "SELECT COUNT(*) FROM run"),
+        1,
+        "one run was made"
+    );
+    let id = count(&db, "SELECT id FROM run");
+    let folder = dir.path().join("worktrees").join(id.to_string());
+    assert!(folder.is_dir(), "the working copy exists after the crash");
+    assert_checks_green(&db, "after the crash, before the restart");
+
+    let mut server = Server::spawn(&db, None);
+    server
+        .wait_ready(READY)
+        .unwrap_or_else(|why| panic!("{point}: the restart failed: {why}"));
+    wait_for(
+        point,
+        &db,
+        "SELECT COUNT(*) FROM run WHERE status = 'interrupted' AND error = 'server restarted'",
+        1,
+    );
+    std::thread::sleep(Duration::from_millis(1500));
+    assert_eq!(count(&db, "SELECT COUNT(*) FROM run"), 1, "no second run");
+    assert_eq!(
+        count(
+            &db,
+            "SELECT COUNT(*) FROM run WHERE worktree_state = 'kept'"
+        ),
+        1,
+        "the working copy is kept, not claimed removed"
+    );
+    assert!(
+        folder.is_dir(),
+        "the folder is still there after the restart"
+    );
+    let branches = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo.path())
+        .args(["branch", "--list", "aurora/*"])
+        .output()
+        .expect("git");
+    assert!(
+        String::from_utf8_lossy(&branches.stdout).contains(&format!("run{id}")),
+        "the branch is kept: {}",
+        String::from_utf8_lossy(&branches.stdout)
+    );
+    assert_eq!(
+        count(
+            &db,
+            "SELECT COUNT(*) FROM run WHERE status IN ('starting', 'running')"
+        ),
+        0
+    );
+    assert_checks_green(&db, "after the restart");
+    server.kill();
+    assert_checks_green(&db, "after killing the restarted server");
+}

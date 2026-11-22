@@ -5,7 +5,9 @@
 //! authentication layer in [`crate::auth`] except `POST /setup` and
 //! `POST /auth/sign-in`; `/health` lives outside the API.
 
-use aurora_store::auth::Principal;
+use std::path::Path as FsPath;
+
+use aurora_store::auth::{Principal, Role};
 use aurora_store::comments::{self, NewComment};
 use aurora_store::documents::{self, DocumentMove, DocumentPatch, DocumentTarget, NewDocument};
 use aurora_store::events::{self, EventFilter, Start};
@@ -27,6 +29,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::auth::Access;
+use crate::gitwork::Git;
 use crate::{agents, auth, idem, markdown, prompts, runs};
 
 const DEFAULT_LABEL_COLOR: &str = "#808080";
@@ -483,14 +486,29 @@ struct NameBody {
     name: String,
 }
 
+/// A project as the caller may see it: people also get the repository
+/// settings, an agent's key never does.
+fn project_view(project: &projects::Project, reader: &Principal) -> serde_json::Value {
+    if reader.role == Role::Agent {
+        serde_json::to_value(project).unwrap_or(serde_json::Value::Null)
+    } else {
+        project.for_people()
+    }
+}
+
 /// A restricted agent sees only the projects on its allow-list.
 async fn list_projects(
     State(store): State<Store>,
+    Extension(reader): Extension<Principal>,
     Extension(access): Extension<Access>,
 ) -> ApiResult<Response> {
     let mut projects = store.read(projects::list_projects).await?;
     projects.retain(|project| access.allows(&project.key));
-    Ok(Json(projects).into_response())
+    let views: Vec<serde_json::Value> = projects
+        .iter()
+        .map(|project| project_view(project, &reader))
+        .collect();
+    Ok(Json(views).into_response())
 }
 
 async fn create_project(
@@ -518,20 +536,87 @@ async fn create_project(
     .await
 }
 
-async fn get_project(State(store): State<Store>, Path(key): Path<String>) -> ApiResult<Response> {
+async fn get_project(
+    State(store): State<Store>,
+    Extension(reader): Extension<Principal>,
+    Path(key): Path<String>,
+) -> ApiResult<Response> {
     let project = store.read(move |c| projects::get_project(c, &key)).await?;
-    Ok(Json(project).into_response())
+    Ok(Json(project_view(&project, &reader)).into_response())
 }
 
-/// Changes the name, the rules text, or both, in one write.
+/// Checks the repository settings of a patch against git, before anything is
+/// written, and replaces a repository path by the repository's canonical top
+/// level folder. The store rules (owner only, lengths) apply afterwards.
+async fn check_repository_patch(
+    store: &Store,
+    key: &str,
+    patch: &mut projects::ProjectPatch,
+) -> ApiResult<()> {
+    let git = Git::system();
+    let project = {
+        let key = key.to_string();
+        store.read(move |c| projects::get_project(c, &key)).await?
+    };
+    let blank = |text: &Option<String>| text.as_deref().is_none_or(|t| t.trim().is_empty());
+    if let Some(path) = &patch.repo_path
+        && !blank(path)
+    {
+        let given = path.as_deref().unwrap_or_default().trim().to_string();
+        let top = git.check_repository(&given).await.map_err(invalid)?;
+        patch.repo_path = Some(Some(top));
+    }
+    let repo = match &patch.repo_path {
+        Some(path) if blank(path) => None,
+        Some(path) => path.clone(),
+        None => project.repo_path.clone(),
+    };
+    let base = match &patch.base_branch {
+        Some(branch) if blank(branch) => None,
+        Some(branch) => branch.as_deref().map(|b| b.trim().to_string()),
+        None => project.base_branch.clone(),
+    };
+    let moved = patch.repo_path.is_some() || patch.base_branch.is_some();
+    if let (true, Some(base)) = (moved, &base) {
+        let Some(repo) = &repo else {
+            return Err(invalid(
+                "set repo_path before base_branch: there is no repository to take it from".into(),
+            ));
+        };
+        git.check_branch(FsPath::new(repo), base).await.map_err(|why| {
+            if patch.base_branch.is_some() {
+                invalid(why)
+            } else {
+                invalid(format!(
+                    "{why}; this repository does not have the project's base branch, change base_branch too"
+                ))
+            }
+        })?;
+    }
+    Ok(())
+}
+
+/// Changes the name, the rules text, the repository settings, or any of them,
+/// in one write. The repository settings are for the owner and are checked
+/// against git first.
 async fn update_project(
     State(store): State<Store>,
     Extension(actor): Extension<Principal>,
     Path(key): Path<String>,
-    ApiJson(patch): ApiJson<projects::ProjectPatch>,
+    ApiJson(mut patch): ApiJson<projects::ProjectPatch>,
 ) -> ApiResult<Response> {
+    if patch.touches_repo() {
+        if !actor.is_owner() {
+            return Err(StoreError::from(Rejection::Forbidden(
+                "only the owner can change the repository settings of a project".into(),
+            ))
+            .into());
+        }
+        check_repository_patch(&store, &key, &mut patch).await?;
+    }
     idem::json(&store, StatusCode::OK, move |tx| {
-        projects::update_project(tx, now_millis(), &actor, &key, patch)
+        let project = projects::update_project(tx, now_millis(), &actor, &key, patch)?;
+        Ok(project_view(&project, &actor))
     })
     .await
 }

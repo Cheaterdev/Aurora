@@ -11,8 +11,12 @@
 //! parent, author, mentions, edited, deleted; only the ones a reader sees),
 //! documents (parent, title, archived, revision, body length), document links
 //! and registered agents (name, user, triggers, limits, allowed projects),
-//! the length of each project's rules text, and the prompt template overrides
-//! of each agent (project, issue type, text length).
+//! the length of each project's rules text, the prompt template overrides
+//! of each agent (project, issue type, text length), whether a project has a
+//! repository path and a base branch (never their values), and each run's
+//! agent, issue, status and the branch of its working copy. A working copy's
+//! state is operational (the disk is the authority and a cancel settles it
+//! after the run's last event), so it is checked by `runs.worktrees` instead.
 //!
 //! # What the events do not carry, so it is not compared
 //!
@@ -70,8 +74,12 @@ pub struct Snapshot {
     /// (agent id, project key, issue type id) -> length of the prompt template
     /// override; the text itself is never in the log
     pub templates: BTreeMap<(i64, String, Option<i64>), i64>,
-    /// run id -> run (agent, project, issue number, status)
-    pub runs: BTreeMap<i64, (i64, i64, i64, String)>,
+    /// run id -> run (agent, project, issue number, status, branch of its
+    /// working copy)
+    pub runs: BTreeMap<i64, (i64, i64, i64, String, Option<String>)>,
+    /// project id -> (has a repository path, has a base branch); only projects
+    /// that have either. The values themselves are never in the log.
+    pub repos: BTreeMap<i64, (bool, bool)>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -359,6 +367,22 @@ fn apply(s: &mut Snapshot, e: &Event) -> Res<()> {
                     chars => s.rules.insert(pid, chars),
                 };
             }
+            for (field, slot) in [("repo_path", 0), ("base_branch", 1)] {
+                if let Some(change) = p.get(field) {
+                    let set = change["set"]
+                        .as_bool()
+                        .ok_or_else(|| format!("{field} has no boolean set"))?;
+                    let flags = s.repos.entry(pid).or_default();
+                    if slot == 0 {
+                        flags.0 = set;
+                    } else {
+                        flags.1 = set;
+                    }
+                    if *flags == (false, false) {
+                        s.repos.remove(&pid);
+                    }
+                }
+            }
         }
         "column.created" => entry(&mut s.columns, pid, "project columns")?.push(text(&p["name"])?),
         "column.renamed" => {
@@ -565,6 +589,7 @@ fn apply(s: &mut Snapshot, e: &Event) -> Res<()> {
                     pid,
                     int(&p["issue"]["number"])?,
                     "starting".to_string(),
+                    p["branch"].as_str().map(str::to_string),
                 ),
             );
         }
@@ -814,18 +839,33 @@ pub fn table_snapshot(conn: &Connection) -> Result<Snapshot, StoreError> {
         s.templates.insert(scope, chars);
     }
     let mut stmt = conn.prepare(
-        "SELECT r.id, r.agent_id, r.project_id, i.number, r.status
+        "SELECT r.id, r.agent_id, r.project_id, i.number, r.status, r.branch
          FROM run r JOIN issue i ON i.id = r.issue_id",
     )?;
     let rows = stmt.query_map([], |r| {
         Ok((
             r.get::<_, i64>(0)?,
-            (r.get(1)?, r.get(2)?, r.get(3)?, r.get::<_, String>(4)?),
+            (
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, Option<String>>(5)?,
+            ),
         ))
     })?;
     for row in rows {
         let (id, run) = row?;
         s.runs.insert(id, run);
+    }
+    let mut stmt = conn.prepare(
+        "SELECT id, repo_path IS NOT NULL, base_branch IS NOT NULL FROM project
+         WHERE repo_path IS NOT NULL OR base_branch IS NOT NULL",
+    )?;
+    let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, (r.get(1)?, r.get(2)?))))?;
+    for row in rows {
+        let (id, flags) = row?;
+        s.repos.insert(id, flags);
     }
     Ok(s)
 }
@@ -920,5 +960,11 @@ pub fn diff(from_log: &Snapshot, from_tables: &Snapshot) -> Vec<String> {
         &mut out,
     );
     diff_map("run", &from_log.runs, &from_tables.runs, &mut out);
+    diff_map(
+        "repository settings of project",
+        &from_log.repos,
+        &from_tables.repos,
+        &mut out,
+    );
     out
 }

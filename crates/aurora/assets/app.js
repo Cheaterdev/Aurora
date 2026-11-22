@@ -686,6 +686,19 @@
     'new-label': function (form) {
       return api('POST', '/projects/' + encodeURIComponent(project) + '/labels',
         { name: form.elements.name.value.trim(), color: form.elements.color.value }).then(function () { location.reload(); });
+    },
+    'repo-settings': function (form) {
+      var path = form.elements.repo_path.value.trim();
+      var branch = form.elements.base_branch.value.trim();
+      return api('PATCH', '/projects/' + encodeURIComponent(project), {
+        repo_path: path === '' ? null : path,
+        base_branch: branch === '' ? null : branch
+      }).then(function (saved) {
+        // The server keeps the repository's top-level folder.
+        form.elements.repo_path.value = saved.repo_path || '';
+        form.elements.base_branch.value = saved.base_branch || '';
+        message($('.field-msg', form), 'Saved', 'saved');
+      });
     }
   };
 

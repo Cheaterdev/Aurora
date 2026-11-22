@@ -12,6 +12,7 @@
 //! | `mid_ack`                      | consumer ack transaction, cursor updated, `COMMIT` not yet issued         | the cursor where it was; the events are delivered again         |
 //!
 //! | `run_after_create`             | runner, run row committed as `starting`, process not spawned              | the run is `interrupted`, key revoked, no second run for the event |
+//! | `run_after_worktree`           | runner, working copy made and recorded, process not spawned               | the run is `interrupted`, working copy `kept` and still on disk |
 //! | `run_after_spawn`              | runner, process spawned, run not yet marked `running`                     | same; the stray process is for TRK-45 to reap                   |
 //! | `run_before_finish`            | runner, process exited, the finish not yet committed                      | same                                                            |
 //!
@@ -45,12 +46,13 @@ pub enum Point {
     MidMigration,
     MidAck,
     RunAfterCreate,
+    RunAfterWorktree,
     RunAfterSpawn,
     RunBeforeFinish,
 }
 
 impl Point {
-    pub const ALL: [Point; 9] = [
+    pub const ALL: [Point; 10] = [
         Point::BeforeCommit,
         Point::AfterCommit,
         Point::AfterCommitBeforeResponse,
@@ -58,6 +60,7 @@ impl Point {
         Point::MidMigration,
         Point::MidAck,
         Point::RunAfterCreate,
+        Point::RunAfterWorktree,
         Point::RunAfterSpawn,
         Point::RunBeforeFinish,
     ];
@@ -71,6 +74,7 @@ impl Point {
             Point::MidMigration => "mid_migration",
             Point::MidAck => "mid_ack",
             Point::RunAfterCreate => "run_after_create",
+            Point::RunAfterWorktree => "run_after_worktree",
             Point::RunAfterSpawn => "run_after_spawn",
             Point::RunBeforeFinish => "run_before_finish",
         }

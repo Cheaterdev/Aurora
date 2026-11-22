@@ -288,6 +288,11 @@ pub const VARIABLES: &[Variable] = &[
         "57",
     ),
     text(
+        "run.branch",
+        "The git branch of the working copy of this run; empty when the run has no working copy of its own.",
+        "aurora/TRK-12-run57",
+    ),
+    text(
         "server.url",
         "The MCP endpoint of this server: absolute when the server knows its public URL, otherwise /mcp.",
         "http://localhost:8787/mcp",

@@ -26,6 +26,9 @@ pub struct Spec<'a> {
     pub command: &'a str,
     pub args: &'a [String],
     pub work_dir: Option<&'a str>,
+    /// The run's own git worktree and its branch; they replace the working
+    /// folder (an explicit `work_dir` never has one).
+    pub worktree: Option<(&'a Path, &'a str)>,
     pub data_dir: &'a Path,
     pub base_url: &'a str,
     /// The per-run key's secret.
@@ -79,15 +82,24 @@ pub fn prepare(spec: &Spec<'_>) -> Result<Prepared, String> {
     let dir = run_dir(spec.data_dir, spec.run_id);
     std::fs::create_dir_all(&dir)
         .map_err(|err| format!("could not create {}: {err}", dir.display()))?;
-    let cwd = match spec.work_dir {
-        Some(work) => {
+    let cwd = match (spec.worktree, spec.work_dir) {
+        (Some((tree, _)), _) => {
+            if !tree.is_dir() {
+                return Err(format!(
+                    "the working copy {} does not exist",
+                    tree.display()
+                ));
+            }
+            tree.to_path_buf()
+        }
+        (None, Some(work)) => {
             let path = PathBuf::from(work);
             if !path.is_dir() {
                 return Err(format!("the agent's work_dir {work} does not exist"));
             }
             path
         }
-        None => {
+        (None, None) => {
             // Not the run folder itself: the MCP config with the key is there.
             let path = dir.join("work");
             std::fs::create_dir_all(&path)
@@ -153,11 +165,15 @@ pub fn prepare(spec: &Spec<'_>) -> Result<Prepared, String> {
         .env("AURORA_PROJECT", spec.project)
         .env("AURORA_RUN_ID", spec.run_id.to_string())
         .env("AURORA_TRIGGER", spec.reason)
+        .env("AURORA_WORKDIR", &cwd)
         .env("AURORA_MCP_URL", format!("{}/mcp", spec.base_url))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    if let Some((_, branch)) = spec.worktree {
+        command.env("AURORA_BRANCH", branch);
+    }
     platform::prepare(&mut command);
     Ok(Prepared {
         command,

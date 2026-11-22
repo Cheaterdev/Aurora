@@ -45,6 +45,7 @@ command exits with 2 and says so; check a copy then.
 | `search.index` | the full-text index holds exactly the issues, comments and documents that should be in it |
 | `prompt_templates.valid` | every stored prompt template parses and uses only known variables, and its issue type belongs to its project, so a run can never start from a template that fails validation |
 | `runs.no_orphans` | an active run (`starting`/`running`) has a live key of its agent's user, no finish time, and a pid once `running`; a finished run has a finish time and no live key. (Foreign keys and a unique index cover missing rows and two active runs on one issue.) Offline (`aurora check`) an active run is allowed, because nobody can say whether its process lives; the server's own check right after start-up also demands that every active run belongs to the current boot |
+| `runs.worktrees` | a run's working copy is consistent with its row: a planned, kept or removed worktree has a folder path, a branch and the repository it belongs to; `removed` never goes with changes (`has_changes`, changed files or commits ahead); a run with no working copy (or one not yet settled) reports no changes; a run that is still active is not `kept` or `removed` yet; and a finished run is no longer `created` (a canceled run may be for the moment before its process is reaped). Only the database can fail this check. A folder that is missing for a `kept` copy, or still there for a `removed` one, is reported as a note and never fails, because the disk can legitimately differ (a person removed it by hand) |
 
 About `events.ids`: `AUTOINCREMENT` guarantees ids only grow and are never
 reused, not that they are contiguous. SQLite updates its counter inside the
@@ -94,6 +95,7 @@ named place in the write path. They are listed in one place,
 | `run_after_create` | runner, run row committed as `starting`, process not spawned | the run is `interrupted` ("server restarted"), its key revoked, no second run for the event |
 | `run_after_spawn` | runner, process spawned, run not yet marked `running` | same; the stray process is for TRK-45 to reap |
 | `run_before_finish` | runner, process exited, the finish not yet committed | same |
+| `run_after_worktree` | runner, the run's git worktree and branch made, process not spawned | the run is `interrupted`, its working copy is `kept` (never claimed removed, never deleted), the folder and the branch are still there, no second run; the leftover is for a person to remove (see "Working copies") |
 
 Arm one with `AURORA_TEST_FAILPOINT=<name>` (first hit) or `<name>:<n>` (the n-th
 hit of that point in this process). `before_commit` and `after_commit` cover
@@ -140,8 +142,11 @@ rules are in `docs/api.md` (Runs); this is what runs where.
   `{run_id}` and `{mcp_config}` are substituted too. The environment adds
   `AURORA_URL`, `AURORA_MCP_URL`, `AURORA_API_KEY` (a write key created for this
   run), `AURORA_RUN_ID`, `AURORA_ISSUE`, `AURORA_PROJECT` and `AURORA_TRIGGER`.
-  The working folder is the agent's `work_dir` (it must exist) or, when none is
-  set, a fresh `runs/<id>/work/` next to the database. `runs/<id>/` also holds
+  The working folder is, in this order: the run's own git worktree (see "Working
+  copies" below), the agent's `work_dir` (it must exist; no isolation) or, when
+  neither applies, a fresh `runs/<id>/work/` next to the database. The
+  environment also carries `AURORA_WORKDIR` (that folder) and, for a worktree,
+  `AURORA_BRANCH`. `runs/<id>/` also holds
   `mcp.json` for a command named `claude` (or when `{mcp_config}` is used); it
   is written to a temporary name, flushed and renamed, and holds the key, so it
   is as private as the data folder. Standard output and error, merged, are the
@@ -153,12 +158,74 @@ rules are in `docs/api.md` (Runs); this is what runs where.
   standard input). No console window is opened. Stopping a run (cancel, timeout,
   shutdown) ends the whole process tree with `taskkill /T /F`; on other systems
   the child leads its own process group and the group gets the signal.
-  Nothing besides the aurora binary and the agent's command is needed.
+  Nothing besides the aurora binary and the agent's command is needed, except
+  `git` when a project has a repository (see "Working copies").
 - **Not yet.** A process is not tied to the server: if the server is killed the
   agent keeps running until it ends by itself, and its key is already revoked at
   the next start. Job objects / process groups that die with the server, and
   reaping strays, are TRK-45. The transcript appears when the run ends (live
   output is TRK-17).
+
+## Working copies (git worktrees)
+
+A project with a repository (`repo_path`, set by the owner; see `docs/api.md`)
+gives every run of an agent without a `work_dir` its own git worktree. Aurora
+runs the `git` it finds on `PATH` (or the program named by `AURORA_GIT`); on
+Windows that is Git for Windows and nothing else is needed, WSL included.
+
+- **Layout.** `<data folder>/worktrees/<run id>/`, a checkout of a new branch
+  `aurora/<KEY>-<n>-run<id>` that starts at the base branch's commit (recorded in
+  the run as `base_ref` and `base_commit`). The repository's own folder is never
+  used as a working folder and its checked-out branch is never switched.
+- **What git is asked.** Only `git` with an argument list (never a shell and never
+  a command line built from text): `rev-parse`, `symbolic-ref`,
+  `check-ref-format`, `worktree add`/`remove`/`prune`, `branch -D`,
+  `status --porcelain --untracked-files=all` and `rev-list --count`. (`worktree
+  remove --force` is used only to undo a worktree that was made a moment ago and
+  failed to start, never on one a run has used.)
+  Every call has a 60 second timeout (the process is killed and the step
+  reported), at most 16 KiB of its error text is kept, prompts are off
+  (`GIT_TERMINAL_PROMPT=0`), `GIT_OPTIONAL_LOCKS=0` is set and the language is
+  fixed so the output can be read. All calls for one repository are serialised
+  inside the server, because `git worktree add` and `remove` take the repository's
+  lock; on Windows the repository's path is compared without regard to case. The
+  repository's folder is removed from the error text stored on the run, because
+  agents can read run errors.
+- **Windows.** `git` runs with `core.longpaths=true` and without a console window.
+  A `\\?\` prefix on a path (from canonicalisation) is stripped, and the forward
+  slashes git prints are turned into backslashes, before a path is stored or
+  compared. Keep the data folder path short anyway: a deep folder plus a deep
+  repository can still exceed what other tools accept.
+- **What is kept.** When the run ends, the worktree is inspected before the run's
+  end is committed. If `git status` lists anything (untracked files too) or the
+  worktree's `HEAD` is not `base_commit`, the folder and the branch are **kept**
+  and never deleted by Aurora, on any path: success, failure, cancel, timeout,
+  shutdown. If it is untouched, the worktree and its branch are removed (a plain
+  `git worktree remove`, without `--force`, so git itself refuses if it disagrees;
+  Aurora then deletes only a folder it can prove is `…/worktrees/<digits>` and
+  clean). When anything is uncertain the copy is kept with a note on the run.
+  Problems while cleaning up never fail the run.
+- **Crashes.** If the server dies after a worktree was made, the next start marks
+  the run `interrupted` and its working copy `kept`, without touching the disk
+  (`run_after_worktree` is the crash test). A copy left by a crash can therefore
+  be a stray, and nothing deletes it: it is for a person. (Reporting kept and
+  unknown copies when the server starts is TRK-45's job; it must report them and
+  still never delete one automatically.)
+- **Looking at and removing a kept copy.** The run page and the issue's Runs
+  section show the branch, folder, base and the number of changed files. To
+  remove one by hand once its work is no longer needed:
+
+  ```powershell
+  git -C <repository> worktree remove <worktree folder>      # add --force for a dirty one
+  git -C <repository> branch -D aurora/<KEY>-<n>-run<id>
+  git -C <repository> worktree prune                          # if the folder was deleted by hand
+  ```
+
+  `aurora check` (`runs.worktrees`) reports a kept copy whose folder is gone, or a
+  removed one whose folder is still there, as a note, never as a failure.
+- **Not exposed to agents.** The repository's folder (`repo_path`) is not in the
+  prompt, the environment, an MCP tool or an agent's view of the project or of a
+  run. Agents learn only the worktree's folder, `AURORA_WORKDIR`, and branch.
 
 ## The crash tests
 
@@ -166,7 +233,9 @@ rules are in `docs/api.md` (Runs); this is what runs where.
 failpoint while the fake agent (`crates/aurora/examples/fake_agent.rs`) is being
 launched, restarts it and checks that the run is `interrupted` exactly once, its
 key is revoked, redelivery of the assignment makes no second run and `aurora
-check` passes. The rest of this section is about the write-path matrix.
+check` passes. `run_after_worktree` is tested against a project with a real
+(temporary) git repository: the working copy and its branch survive the crash and
+the restart. The rest of this section is about the write-path matrix.
 
 `crates/aurora/tests/crash_matrix.rs` runs the real binary built by `cargo test`.
 For every failpoint above and several hit counts (1, 2, 5, 17 where there are

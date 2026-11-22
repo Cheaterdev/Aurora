@@ -126,6 +126,7 @@ pub(crate) async fn preview(
                     actor_id: Some(principal.user_id),
                 },
                 workdir: None,
+                branch: None,
                 run_id: None,
                 public_url: public_url.as_deref(),
                 override_template: body.template.as_deref(),

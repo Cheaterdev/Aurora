@@ -79,6 +79,8 @@ pub struct PromptRequest<'a> {
     pub trigger: TriggerCtx,
     /// The working copy of the run; `None` until one exists.
     pub workdir: Option<&'a str>,
+    /// The git branch of the run's working copy; `None` when there is none.
+    pub branch: Option<&'a str>,
     /// The run's id; `None` outside a run (a preview).
     pub run_id: Option<i64>,
     /// The server's public base URL, if configured (no trailing slash).
@@ -427,6 +429,7 @@ pub fn context_for(
         "run.id",
         text(request.run_id.map_or_else(String::new, |id| id.to_string())),
     );
+    put("run.branch", text(request.branch.unwrap_or_default()));
     put(
         "server.url",
         text(match base {

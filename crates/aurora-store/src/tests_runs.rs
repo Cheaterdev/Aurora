@@ -77,6 +77,8 @@ fn new_run(agent: i64, number: i64, event: Option<i64>) -> NewRun {
         edited: false,
         boot_id: "boot-1".into(),
         failed: None,
+        worktree_root: None,
+        base_branch: None,
     }
 }
 

@@ -4,6 +4,7 @@ pub mod agents;
 pub mod auth;
 pub mod check;
 pub mod config;
+pub mod gitwork;
 pub mod idem;
 pub mod markdown;
 pub mod mcp;

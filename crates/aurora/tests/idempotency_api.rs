@@ -490,6 +490,8 @@ async fn build_world(s: &Server) -> World {
                     edited: false,
                     boot_id: boot,
                     failed: None,
+                    worktree_root: None,
+                    base_branch: None,
                 },
             )?;
             Ok(made.run.id)

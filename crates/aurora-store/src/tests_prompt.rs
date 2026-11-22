@@ -536,6 +536,7 @@ fn base(agent_id: i64, number: i64) -> PromptRequest<'static> {
         number,
         trigger: TriggerCtx::new(TriggerKind::Manual),
         workdir: None,
+        branch: None,
         run_id: None,
         public_url: None,
         override_template: None,
@@ -1386,6 +1387,7 @@ async fn context_describes_the_issue_its_children_labels_documents_and_url() {
     let plain = fx.plain;
     let request = PromptRequest {
         workdir: Some("C:/work/tree"),
+        branch: Some("aurora/TRK-1-run41"),
         run_id: Some(41),
         public_url: Some("http://aurora.example:8080/"),
         ..base(plain, main)
@@ -1420,6 +1422,7 @@ async fn context_describes_the_issue_its_children_labels_documents_and_url() {
     assert_eq!(v["agent.name"], "coder");
     assert_eq!(v["workdir"], "C:/work/tree");
     assert_eq!(v["run.id"], "41");
+    assert_eq!(v["run.branch"], "aurora/TRK-1-run41");
     assert_eq!(v["server.url"], "http://aurora.example:8080/mcp");
     assert_eq!(v["now"], "2026-01-01T00:00:00Z");
     assert_eq!(v["trigger.manual"], true);
@@ -1436,6 +1439,7 @@ async fn context_describes_the_issue_its_children_labels_documents_and_url() {
     assert_eq!(context.vars["server.url"], "/mcp");
     assert_eq!(context.vars["workdir"], "");
     assert_eq!(context.vars["run.id"], "");
+    assert_eq!(context.vars["run.branch"], "");
 
     // Unknown agent, project and issue are not found.
     for request in [
@@ -2126,7 +2130,11 @@ async fn update_rules(
                 at,
                 &test_actor(tx),
                 "TRK",
-                projects::ProjectPatch { name, rules },
+                projects::ProjectPatch {
+                    name,
+                    rules,
+                    ..projects::ProjectPatch::default()
+                },
             )
         })
         .await

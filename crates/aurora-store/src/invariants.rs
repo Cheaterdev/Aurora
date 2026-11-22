@@ -180,6 +180,12 @@ pub const INVARIANTS: &[Invariant] = &[
         needs_current_schema: true,
         run: runs_no_orphans,
     },
+    Invariant {
+        name: "runs.worktrees",
+        proves: "a finished run's working copy is settled (kept or removed), a kept or removed one names its folder and branch, and one with changes was never recorded as removed; folders that are missing (or still there after removal) are only noted, because people may delete them",
+        needs_current_schema: true,
+        run: runs_worktrees,
+    },
 ];
 
 /// Runs every invariant on `conn`, which is not changed. The checks see one
@@ -631,6 +637,77 @@ fn runs_no_orphans(conn: &Connection) -> Result<Finding, StoreError> {
         "SELECT COUNT(*) FROM run WHERE status IN ('starting', 'running')",
     )?;
     Finding::of(format!("{runs} runs, {active} active"), violations)
+}
+
+/// Database rules about working copies (TRK-16), plus notes about the file
+/// system, which only mean something on the machine that made them: a `kept`
+/// or `created` working copy whose folder is missing, and a `removed` one whose
+/// folder is still there. Those are notes in the summary, never failures: a
+/// person may delete a kept working copy, and a copy of the database may be
+/// checked elsewhere. A canceled run may still be `created` for the moment its
+/// process is being stopped.
+fn runs_worktrees(conn: &Connection) -> Result<Finding, StoreError> {
+    let violations = lines(
+        conn,
+        "SELECT 'run ' || id || ' is ' || status || ' but its working copy was never settled'
+         FROM run WHERE worktree_state = 'created' AND status NOT IN ('starting', 'running', 'canceled')
+         UNION ALL
+         SELECT 'run ' || id || ' is ' || status || ' but its working copy is already ' || worktree_state
+         FROM run WHERE worktree_state IN ('removed', 'kept') AND status IN ('starting', 'running')
+         UNION ALL
+         SELECT 'run ' || id || ' has a ' || worktree_state || ' working copy without a folder or branch'
+         FROM run WHERE worktree_state IN ('created', 'kept', 'removed')
+           AND (worktree_path IS NULL OR branch IS NULL OR worktree_repo IS NULL)
+         UNION ALL
+         SELECT 'run ' || id || ' was recorded as removed although it had changes'
+         FROM run WHERE worktree_state = 'removed' AND (has_changes = 1 OR changed_files > 0 OR ahead > 0)
+         UNION ALL
+         SELECT 'run ' || id || ' reports changes but its working copy is ' || worktree_state
+         FROM run WHERE worktree_state IN ('none', 'created') AND has_changes = 1",
+        |r| r.get(0),
+    )?;
+    let mut stmt = conn.prepare(
+        "SELECT id, worktree_state, worktree_path FROM run
+         WHERE worktree_state IN ('created', 'kept', 'removed') AND worktree_path IS NOT NULL
+         ORDER BY id",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, i64>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+        ))
+    })?;
+    let (mut total, mut kept) = (0_usize, 0_usize);
+    let mut notes = Vec::new();
+    for row in rows {
+        let (id, state, path) = row?;
+        total += 1;
+        let exists = Path::new(&path).exists();
+        match state.as_str() {
+            "kept" => {
+                kept += 1;
+                if !exists {
+                    notes.push(format!("run {id} is kept but {path} is missing"));
+                }
+            }
+            "removed" if exists => notes.push(format!("run {id} is removed but {path} exists")),
+            _ => {}
+        }
+    }
+    let mut summary = format!("{total} working copies, {kept} kept");
+    if !notes.is_empty() {
+        summary.push_str(&format!(
+            "; note: {}{}",
+            notes.iter().take(3).cloned().collect::<Vec<_>>().join("; "),
+            if notes.len() > 3 {
+                format!("; and {} more", notes.len() - 3)
+            } else {
+                String::new()
+            }
+        ));
+    }
+    Finding::of(summary, violations)
 }
 
 /// [`check`], plus the live-server rule: every active run belongs to

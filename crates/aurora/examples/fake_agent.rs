@@ -9,6 +9,10 @@
 //! * `--flood <bytes>`    write that many bytes of filler, then `TAIL-MARKER`
 //! * `--comment <text>`   call the server's MCP `add_comment` tool on
 //!   `AURORA_ISSUE` with `AURORA_API_KEY`, to prove the per-run key works
+//! * `--touch <file>`     write a small file (relative to the working folder)
+//! * `--commit`           `git add -A` and `git commit --allow-empty` in the
+//!   working folder, with the repository's own identity configuration
+//! * `--print-cwd`        print `PRINT-CWD: <working folder>`
 //!
 //! It never prints the key.
 
@@ -47,6 +51,28 @@ fn mcp_comment(text: &str) -> Result<String, String> {
     ))
 }
 
+fn commit() -> String {
+    let run = |args: &[&str]| {
+        std::process::Command::new("git")
+            .args(args)
+            .output()
+            .map_err(|e| e.to_string())
+            .and_then(|out| {
+                if out.status.success() {
+                    Ok(())
+                } else {
+                    Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+                }
+            })
+    };
+    match run(&["add", "-A"])
+        .and_then(|()| run(&["commit", "-q", "--allow-empty", "-m", "fake agent"]))
+    {
+        Ok(()) => "ok".to_string(),
+        Err(why) => format!("failed: {why}"),
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut input = String::new();
@@ -64,6 +90,8 @@ fn main() {
         "AURORA_TRIGGER",
         "AURORA_PROJECT",
         "AURORA_URL",
+        "AURORA_WORKDIR",
+        "AURORA_BRANCH",
     ] {
         println!("{name}={}", std::env::var(name).unwrap_or_default());
     }
@@ -102,6 +130,25 @@ fn main() {
                 Ok(result) => println!("COMMENT: {result}"),
                 Err(why) => println!("COMMENT-FAILED: {why}"),
             },
+            "--touch" => match std::fs::write(&value, "written by the fake agent\n") {
+                Ok(()) => println!("TOUCHED: {value}"),
+                Err(why) => println!("TOUCH-FAILED: {why}"),
+            },
+            "--commit" => {
+                println!("COMMIT: {}", commit());
+                at += 1;
+                continue;
+            }
+            "--print-cwd" => {
+                println!(
+                    "PRINT-CWD: {}",
+                    std::env::current_dir()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_default()
+                );
+                at += 1;
+                continue;
+            }
             _ => {
                 at += 1;
                 continue;

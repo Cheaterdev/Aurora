@@ -16,6 +16,14 @@
 //!   their runs `interrupted`; [`Runner::start`] first reconciles runs left
 //!   active by a crashed server.
 //!
+//! * **A working copy per run** (TRK-16, see `aurora_store::runs` and
+//!   [`crate::gitwork`]): a run planned with one gets a git worktree made before
+//!   its process starts (the first message already names it), and when the run
+//!   ends, whatever the way, the worktree is inspected before the run is
+//!   finished: without changes it is removed together with its branch, with
+//!   changes (or when anything is unclear) it is kept for a person. The runner
+//!   never deletes a worktree that has changes.
+//!
 //! Children are killed as a tree on a best-effort basis only; they are not tied
 //! to the server's life (TRK-45 adds containment), so a hard-killed server can
 //! leave an agent process behind.
@@ -28,7 +36,7 @@ mod spawn;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
@@ -40,12 +48,14 @@ use aurora_store::projects::Rejection;
 use aurora_store::prompt::{self, PromptRequest, TriggerCtx, TriggerKind};
 use aurora_store::runs::{
     self, Created, NewRun, OUTPUT_TAIL_BYTES, Outcome, RunDetail, RunReason, RunStatus,
+    WorktreeEnd, WorktreeState, WorktreeTarget,
 };
 use aurora_store::rusqlite::Transaction;
 use aurora_store::{Store, StoreError, now_millis};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
+use crate::gitwork::Git;
 use capture::{SharedTail, Tail, pump};
 
 /// The name of the dispatcher's consumer cursor.
@@ -138,6 +148,7 @@ struct Control {
 
 struct Inner {
     store: Store,
+    git: Git,
     config: RunnerConfig,
     boot_id: String,
     stopping: AtomicBool,
@@ -171,6 +182,9 @@ pub struct StartRequest {
     pub actor: Option<i64>,
     /// A person's edited first message, sent verbatim.
     pub message: Option<String>,
+    /// Start the working copy from this branch instead of the project's
+    /// (already checked by the caller).
+    pub base_branch: Option<String>,
 }
 
 fn kind_of(reason: RunReason) -> TriggerKind {
@@ -231,6 +245,7 @@ impl Runner {
         let runner = Runner {
             inner: Arc::new(Inner {
                 store,
+                git: Git::system(),
                 config,
                 boot_id,
                 stopping: AtomicBool::new(false),
@@ -285,12 +300,18 @@ impl Runner {
                 edited,
                 boot_id: self.inner.boot_id.clone(),
                 failed: None,
+                worktree_root: self.inner.config.data_dir.to_str().map(str::to_string),
+                base_branch: request.base_branch.clone(),
             },
         )?;
         if created.duplicate || edited {
             return Ok(created);
         }
         let id = created.run.id;
+        // The path and the branch are known from the run's id before git has
+        // made anything, so the message can name them.
+        let tree = created.run.worktree_path.clone();
+        let branch = created.run.branch.clone();
         let rendered = prompt::render_prompt(
             tx,
             now,
@@ -303,7 +324,8 @@ impl Runner {
                     comment_id: request.comment_id,
                     actor_id: request.actor,
                 },
-                workdir: None,
+                workdir: tree.as_deref(),
+                branch: branch.as_deref(),
                 run_id: Some(id),
                 public_url: self.inner.store.public_url(),
                 override_template: None,
@@ -318,8 +340,9 @@ impl Runner {
                 rendered.template_id,
             )?,
             Err(StoreError::Rejected(Rejection::Invalid(why))) => {
-                let outcome = Outcome::new(RunStatus::Failed)
+                let mut outcome = Outcome::new(RunStatus::Failed)
                     .error(format!("prompt template invalid: {why}"));
+                outcome.worktree = Some(WorktreeEnd::none("the run never started"));
                 runs::finish_run(tx, now, request.actor, id, outcome)?;
                 created.key = None;
                 created.run = runs::get_run(tx, id)?.run;
@@ -433,6 +456,7 @@ impl Runner {
             comment_id: trigger.comment_id,
             actor: trigger.actor,
             message: None,
+            base_branch: None,
         };
         let runner = self.clone();
         let outcome = self
@@ -490,9 +514,156 @@ impl Runner {
 
     async fn execute(&self, run_id: i64, key: String, control: Arc<Control>) {
         failpoints::hit(Point::RunAfterCreate);
-        if let Some((outcome, actor)) = self.drive(run_id, &key, &control).await {
-            failpoints::hit(Point::RunBeforeFinish);
-            self.finish(run_id, actor, outcome).await;
+        match self.drive(run_id, &key, &control).await {
+            Some((mut outcome, actor)) => {
+                // Looked at before the finish transaction, so the result is
+                // recorded atomically with the end of the run.
+                outcome.worktree = self.settle(run_id).await;
+                failpoints::hit(Point::RunBeforeFinish);
+                self.finish(run_id, actor, outcome).await;
+            }
+            None => {
+                // Someone else finished the run (a cancel); its working copy
+                // is still ours to look at.
+                if let Some(end) = self.settle(run_id).await {
+                    self.record_worktree(run_id, end).await;
+                }
+            }
+        }
+    }
+
+    // ---- the working copy ----
+
+    /// A recorded folder is only touched when it is where this server would
+    /// have put the run's working copy (a damaged row must never point the
+    /// runner at some other folder).
+    fn is_planned_path(&self, run_id: i64, target: &WorktreeTarget) -> bool {
+        self.inner
+            .config
+            .data_dir
+            .to_str()
+            .map(|root| runs::worktree_dir(root, run_id))
+            .as_deref()
+            == Some(target.path.as_str())
+    }
+
+    /// Makes the worktree a run was planned with and records the base it
+    /// started from. Anything the creation made is removed again on failure.
+    async fn make_worktree(&self, run_id: i64, target: &WorktreeTarget) -> Result<(), String> {
+        if !self.is_planned_path(run_id, target) {
+            return Err("the planned folder is not under this server's data folder".to_string());
+        }
+        let base = self
+            .inner
+            .git
+            .create_worktree(
+                Path::new(&target.repo),
+                Path::new(&target.path),
+                &target.branch,
+                target.base_ref.as_deref(),
+            )
+            .await?;
+        let recorded = self
+            .inner
+            .store
+            .write_background(move |tx| {
+                runs::set_worktree_base(tx, run_id, &base.name, &base.commit)
+            })
+            .await;
+        recorded.map_err(|err| format!("could not record the working copy: {err}"))?;
+        failpoints::hit(Point::RunAfterWorktree);
+        Ok(())
+    }
+
+    /// Looks at the working copy of a run whose process has ended and removes
+    /// it when it has no changes. `None` when the run has none to settle.
+    /// Never turns a problem into a failure of the run: when unsure it keeps.
+    async fn settle(&self, run_id: i64) -> Option<WorktreeEnd> {
+        let target = match self
+            .inner
+            .store
+            .read(move |c| runs::worktree_target(c, run_id))
+            .await
+        {
+            Ok(Some(target)) if target.state == WorktreeState::Created => target,
+            Ok(_) => return None,
+            Err(err) => {
+                tracing::warn!(run = run_id, error = %err, "could not read the run's working copy");
+                return None;
+            }
+        };
+        let path = Path::new(&target.path);
+        if !path.exists() {
+            return Some(WorktreeEnd::none("the working copy was not created"));
+        }
+        let found = match self
+            .inner
+            .git
+            .inspect(path, target.base_commit.as_deref())
+            .await
+        {
+            Ok(found) => found,
+            Err(why) => {
+                tracing::warn!(run = run_id, %why, "could not inspect the working copy; keeping it");
+                let why = crate::gitwork::scrub(&why, &target.repo);
+                return Some(WorktreeEnd::kept(
+                    false,
+                    0,
+                    0,
+                    Some(format!("could not inspect the working copy: {why}")),
+                ));
+            }
+        };
+        if found.has_changes {
+            return Some(WorktreeEnd::kept(
+                true,
+                found.changed_files,
+                found.ahead,
+                None,
+            ));
+        }
+        if !self.is_planned_path(run_id, &target) {
+            return Some(WorktreeEnd::kept(
+                false,
+                0,
+                0,
+                Some("the working copy is not under this server's data folder; left alone".into()),
+            ));
+        }
+        match self
+            .inner
+            .git
+            .remove_worktree(
+                Path::new(&target.repo),
+                path,
+                &target.branch,
+                target.base_commit.as_deref(),
+            )
+            .await
+        {
+            Ok(()) => Some(WorktreeEnd::removed()),
+            Err(why) => {
+                tracing::warn!(run = run_id, %why, "could not remove the working copy; keeping it");
+                let why = crate::gitwork::scrub(&why, &target.repo);
+                Some(WorktreeEnd::kept(
+                    false,
+                    0,
+                    0,
+                    Some(format!("could not remove the working copy: {why}")),
+                ))
+            }
+        }
+    }
+
+    /// For a run somebody else already finished.
+    async fn record_worktree(&self, run_id: i64, end: WorktreeEnd) {
+        let result = self
+            .inner
+            .store
+            .write_background(move |tx| runs::record_worktree(tx, run_id, &end))
+            .await;
+        if let Err(err) = result {
+            tracing::warn!(run = run_id, error = %err, "could not record the working copy of a finished run");
         }
     }
 
@@ -527,6 +698,9 @@ impl Runner {
                         if let Err(err) = kept {
                             tracing::warn!(run = run_id, error = %err, "could not keep the output of a canceled run");
                         }
+                    }
+                    if let Some(end) = outcome.worktree.clone() {
+                        self.record_worktree(run_id, end).await;
                     }
                     return;
                 }
@@ -584,6 +758,25 @@ impl Runner {
                 Duration::from_secs(u64::try_from(agent.timeout_seconds).unwrap_or(3600))
             });
 
+        let mut tree = None;
+        if detail.run.worktree_state == WorktreeState::Created {
+            let target = match self
+                .inner
+                .store
+                .read(move |c| runs::worktree_target(c, run_id))
+                .await
+            {
+                Ok(Some(target)) => target,
+                Ok(None) => return fail("could not create worktree: the run records none".into()),
+                Err(err) => return fail(format!("could not load the run: {err}")),
+            };
+            if let Err(why) = self.make_worktree(run_id, &target).await {
+                let why = crate::gitwork::scrub(&why, &target.repo);
+                return fail(format!("could not create worktree: {why}"));
+            }
+            tree = Some((PathBuf::from(&target.path), target.branch));
+        }
+
         let data_dir = self.inner.config.data_dir.clone();
         let base_url = self.inner.config.base_url.clone();
         let secret = key.to_string();
@@ -598,6 +791,9 @@ impl Runner {
                 command: &private.command,
                 args: &private.args,
                 work_dir: private.work_dir.as_deref(),
+                worktree: tree
+                    .as_ref()
+                    .map(|(path, branch)| (path.as_path(), branch.as_str())),
                 data_dir: &data_dir,
                 base_url: &base_url,
                 key: &secret,

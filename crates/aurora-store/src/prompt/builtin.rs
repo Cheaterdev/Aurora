@@ -18,7 +18,7 @@ You were started by a schedule.
 A person started you by hand{{#if trigger.actor}} ({{trigger.actor}}){{/if}}.
 {{/if}}
 {{#if workdir}}
-Your working copy is {{workdir}}
+Your working copy is {{workdir}}{{#if run.branch}} (git branch {{run.branch}}){{/if}}
 {{/if}}
 
 ## The task

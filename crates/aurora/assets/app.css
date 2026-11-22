@@ -1278,6 +1278,15 @@ mark {
   color: var(--danger);
 }
 
+.chip-worktree[data-state="kept"][data-changes="true"] {
+  color: var(--success);
+}
+
+.chip-worktree[data-state="kept"][data-changes="false"] {
+  background: var(--danger-bg);
+  color: var(--danger);
+}
+
 .run-text {
   background: var(--surface);
   border: 1px solid var(--border);
