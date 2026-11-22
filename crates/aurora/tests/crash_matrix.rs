@@ -359,6 +359,10 @@ fn verify_acknowledged(addr: &str, key: &str, script: &Script) {
 
 /// An event a consumer did not acknowledge comes again, none is skipped.
 fn verify_redelivery(addr: &str, key: &str, db: &Path) {
+    // Read before polling: the running server may still write events (a run it
+    // starts, say) while this looks, and those are rightly in the poll but not
+    // in this count.
+    let latest = count(db, "SELECT COALESCE(MAX(id), 0) FROM event");
     let resp = request(
         addr,
         key,
@@ -378,11 +382,11 @@ fn verify_redelivery(addr: &str, key: &str, db: &Path) {
         .as_array()
         .map(|events| events.iter().filter_map(|e| e["id"].as_i64()).collect())
         .unwrap_or_default();
-    let latest = count(db, "SELECT COALESCE(MAX(id), 0) FROM event");
-    let expected: Vec<i64> = (cursor + 1..=latest.min(cursor + 500)).collect();
-    assert_eq!(
-        ids, expected,
-        "the consumer at {cursor} must be given every later event, once"
+    let owed: Vec<i64> = (cursor + 1..=latest.min(cursor + 500)).collect();
+    let contiguous: Vec<i64> = (cursor + 1..).take(ids.len()).collect();
+    assert!(
+        ids == contiguous && ids.len() >= owed.len(),
+        "the consumer at {cursor} must be given every later event, once: got {ids:?}, owed at least {owed:?}"
     );
 }
 

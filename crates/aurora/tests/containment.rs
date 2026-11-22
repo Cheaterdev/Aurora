@@ -456,12 +456,38 @@ fn a_crash_between_the_kill_and_the_update_is_repeated_safely() {
     move_card(&a, &key, 1, started_col);
     assign(&a, &s, 1);
     let (run, agent) = running_run(&a, &key);
+    // `running` only means the process exists. Wait until the agent has printed
+    // everything it prints (`going` is its last line): once the server is dead
+    // its pipes are broken, and an agent that prints after that panics and
+    // exits, leaving nothing for the next start to kill and the failpoint never
+    // firing. (This was the load-dependent failure of this test.)
+    wait_until(
+        "the agent to print its last line",
+        Duration::from_secs(30),
+        || {
+            let page = ok(
+                &a,
+                &key,
+                "GET",
+                &format!("/api/v1/runs/{run}/transcript"),
+                None,
+            );
+            page["entries"].as_array().is_some_and(|entries| {
+                entries
+                    .iter()
+                    .any(|e| e["d"].as_str().is_some_and(|d| d.starts_with("going")))
+            })
+        },
+    );
     first.kill();
 
     let mut armed = Server::spawn_with(&db, Some("reconcile_after_kill"), &[]);
-    let status = armed
-        .wait_exit(Duration::from_secs(30))
-        .expect("the server dies at the failpoint");
+    let Some(status) = armed.wait_exit(Duration::from_secs(30)) else {
+        panic!(
+            "the server dies at the failpoint; its log:\n{}",
+            armed.log_text()
+        );
+    };
     assert!(!status.success());
     drop(armed);
     wait_until("the agent to be gone", Duration::from_secs(10), || {

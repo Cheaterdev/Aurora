@@ -189,7 +189,9 @@ impl Server {
 
     /// Waits until no launched process is still changing its run, so that
     /// database dumps taken around it are comparable. The held run of the
-    /// cancel sample has no process and is not counted.
+    /// cancel sample has no process and is not counted. While it is queued it
+    /// also holds back the run queued behind it; once it is canceled that run
+    /// starts, and its start is part of what this waits for.
     async fn settle_runs(&self, held: i64) {
         for _ in 0..400 {
             let active: i64 = self
@@ -197,7 +199,10 @@ impl Server {
                 .read(move |c| {
                     Ok(c.query_row(
                         "SELECT COUNT(*) FROM run
-                         WHERE status IN ('starting', 'running') AND id <> ?1",
+                         WHERE id <> ?1 AND (status IN ('starting', 'running')
+                            OR (status = 'queued'
+                                AND (SELECT status FROM run WHERE id = ?1)
+                                    NOT IN ('queued', 'starting', 'running')))",
                         [held],
                         |r| r.get(0),
                     )?)
