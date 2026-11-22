@@ -15,6 +15,7 @@
 //! | `run_after_worktree`           | runner, working copy made and recorded, process not spawned               | the run is `interrupted`, working copy `kept` and still on disk |
 //! | `run_after_spawn`              | runner, process spawned, run not yet marked `running`                     | same; the stray process is for TRK-45 to reap                   |
 //! | `run_before_finish`            | runner, process exited, the finish not yet committed                      | same                                                            |
+//! | `run_after_transcript_write`   | runner, a batch of output appended to the transcript, process still running | same; the transcript file is readable up to its last complete line |
 //!
 //! `before_commit` and `after_commit` are in [`crate::Store::write`], so they
 //! cover every write of the server except the start-up and hourly purge of old
@@ -49,10 +50,11 @@ pub enum Point {
     RunAfterWorktree,
     RunAfterSpawn,
     RunBeforeFinish,
+    RunAfterTranscriptWrite,
 }
 
 impl Point {
-    pub const ALL: [Point; 10] = [
+    pub const ALL: [Point; 11] = [
         Point::BeforeCommit,
         Point::AfterCommit,
         Point::AfterCommitBeforeResponse,
@@ -63,6 +65,7 @@ impl Point {
         Point::RunAfterWorktree,
         Point::RunAfterSpawn,
         Point::RunBeforeFinish,
+        Point::RunAfterTranscriptWrite,
     ];
 
     pub fn name(self) -> &'static str {
@@ -77,6 +80,7 @@ impl Point {
             Point::RunAfterWorktree => "run_after_worktree",
             Point::RunAfterSpawn => "run_after_spawn",
             Point::RunBeforeFinish => "run_before_finish",
+            Point::RunAfterTranscriptWrite => "run_after_transcript_write",
         }
     }
 

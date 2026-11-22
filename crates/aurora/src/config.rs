@@ -42,6 +42,10 @@ pub struct Config {
     /// The base URL people reach the server at, without a trailing slash;
     /// used for absolute links in the first message of a run.
     pub public_url: Option<String>,
+    /// The size cap of one run's transcript file in bytes; `None` means 8 MiB.
+    /// Not in the usage text: `--transcript-max-bytes <n>` /
+    /// `AURORA_TRANSCRIPT_MAX_BYTES`.
+    pub transcript_max_bytes: Option<u64>,
 }
 
 impl Default for Config {
@@ -54,6 +58,7 @@ impl Default for Config {
             allow_unsafe_location: false,
             request_retention: None,
             public_url: None,
+            transcript_max_bytes: None,
         }
     }
 }
@@ -136,6 +141,10 @@ impl Config {
         if let Some(v) = env("AURORA_PUBLIC_URL") {
             config.public_url = Some(parse_public_url(&v).context("AURORA_PUBLIC_URL")?);
         }
+        if let Some(v) = env("AURORA_TRANSCRIPT_MAX_BYTES") {
+            config.transcript_max_bytes =
+                Some(parse_transcript_cap(&v).context("AURORA_TRANSCRIPT_MAX_BYTES")?);
+        }
 
         while let Some(arg) = args.next() {
             let (flag, inline) = match arg.split_once('=') {
@@ -157,6 +166,7 @@ impl Config {
                     | "--backup-dir"
                     | "--request-retention-days"
                     | "--public-url"
+                    | "--transcript-max-bytes"
             ) {
                 bail!("unknown argument {flag:?}\n\n{USAGE}");
             }
@@ -173,6 +183,10 @@ impl Config {
                 "--request-retention-days" => {
                     config.request_retention =
                         Some(parse_days(&value).context("--request-retention-days")?);
+                }
+                "--transcript-max-bytes" => {
+                    config.transcript_max_bytes =
+                        Some(parse_transcript_cap(&value).context("--transcript-max-bytes")?);
                 }
                 _ => config.port = parse_port(&value).context("--port")?,
             }
@@ -198,6 +212,18 @@ fn parse_days(v: &str) -> Result<Duration> {
         .filter(|days| (1..=3650).contains(days))
         .with_context(|| format!("{v:?} is not a number of days from 1 to 3650"))?;
     Ok(Duration::from_secs(days * 24 * 60 * 60))
+}
+
+fn parse_transcript_cap(v: &str) -> Result<u64> {
+    let (min, max) = (
+        crate::transcript::MIN_MAX_BYTES,
+        crate::transcript::LARGEST_MAX_BYTES,
+    );
+    v.trim()
+        .parse::<u64>()
+        .ok()
+        .filter(|bytes| (min..=max).contains(bytes))
+        .with_context(|| format!("{v:?} is not a number of bytes from {min} to {max}"))
 }
 
 fn parse_port(v: &str) -> Result<u16> {
@@ -288,6 +314,23 @@ mod tests {
         assert_eq!(c.request_retention, Some(Duration::from_secs(86_400)));
         assert!(run(&["--request-retention-days", "0"], &[]).is_err());
         assert!(run(&[], &[("AURORA_REQUEST_RETENTION_DAYS", "x")]).is_err());
+    }
+
+    #[test]
+    fn the_transcript_cap_is_a_checked_number_of_bytes() {
+        assert_eq!(run(&[], &[]).unwrap().transcript_max_bytes, None);
+        let c = run(&[], &[("AURORA_TRANSCRIPT_MAX_BYTES", "4096")]).unwrap();
+        assert_eq!(c.transcript_max_bytes, Some(4096));
+        let c = run(
+            &["--transcript-max-bytes=2048"],
+            &[("AURORA_TRANSCRIPT_MAX_BYTES", "4096")],
+        )
+        .unwrap();
+        assert_eq!(c.transcript_max_bytes, Some(2048));
+        assert!(run(&["--transcript-max-bytes", "10"], &[]).is_err());
+        assert!(run(&["--transcript-max-bytes", "x"], &[]).is_err());
+        assert!(run(&[], &[("AURORA_TRANSCRIPT_MAX_BYTES", "99999999999")]).is_err());
+        assert!(run(&["--transcript-max-bytes"], &[]).is_err());
     }
 
     #[test]

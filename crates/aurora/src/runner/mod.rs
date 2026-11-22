@@ -24,6 +24,12 @@
 //!   changes (or when anything is unclear) it is kept for a person. The runner
 //!   never deletes a worktree that has changes.
 //!
+//! * **A transcript per run** (TRK-17, see [`crate::transcript`]): the output
+//!   of both pipes is appended to `<data folder>/transcripts/<run id>.log`
+//!   while the process runs, with an end marker for every way the run ends
+//!   that the runner is alive to see (a crash leaves no marker). The file's
+//!   size is recorded on the run when it ends.
+//!
 //! Children are killed as a tree on a best-effort basis only; they are not tied
 //! to the server's life (TRK-45 adds containment), so a hard-killed server can
 //! leave an agent process behind.
@@ -48,7 +54,7 @@ use aurora_store::projects::Rejection;
 use aurora_store::prompt::{self, PromptRequest, TriggerCtx, TriggerKind};
 use aurora_store::runs::{
     self, Created, NewRun, OUTPUT_TAIL_BYTES, Outcome, RunDetail, RunReason, RunStatus,
-    WorktreeEnd, WorktreeState, WorktreeTarget,
+    TranscriptEnd, WorktreeEnd, WorktreeState, WorktreeTarget,
 };
 use aurora_store::rusqlite::Transaction;
 use aurora_store::{Store, StoreError, now_millis};
@@ -56,14 +62,17 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 use crate::gitwork::Git;
-use capture::{SharedTail, Tail, pump};
+use crate::transcript::{self, Scrubber, Stream, TranscriptWriter};
+use capture::{SharedTail, Sink, Tail, pump};
 
 /// The name of the dispatcher's consumer cursor.
 pub const CONSUMER: &str = "runner";
 const BATCH: i64 = 100;
 const FINISH_ATTEMPTS: u32 = 5;
 const READER_GRACE: Duration = Duration::from_secs(2);
-const CANCEL_WAIT: Duration = Duration::from_secs(10);
+/// How long a cancel waits for the runner to stop the process tree and settle
+/// the run before it answers with what it has.
+const CANCEL_WAIT: Duration = Duration::from_secs(5);
 const SHUTDOWN_WAIT: Duration = Duration::from_secs(7);
 
 /// A command file found by [`platform::resolve_command`].
@@ -97,6 +106,8 @@ pub struct RunnerConfig {
     /// What the agent is told the server's address is (no trailing slash).
     pub base_url: String,
     pub options: RunnerOptions,
+    /// The size cap of one run's transcript file; see [`crate::transcript`].
+    pub transcript_max_bytes: u64,
 }
 
 impl RunnerConfig {
@@ -104,12 +115,7 @@ impl RunnerConfig {
     /// URL if one is configured, else the listening address (a wildcard host
     /// becomes loopback).
     pub fn for_server(store: &Store, listen: SocketAddr, options: RunnerOptions) -> RunnerConfig {
-        let data_dir = store
-            .path()
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .map_or_else(|| PathBuf::from("."), PathBuf::from);
-        let data_dir = std::path::absolute(&data_dir).unwrap_or(data_dir);
+        let data_dir = transcript::data_dir(store);
         let ip = if listen.ip().is_unspecified() {
             if listen.is_ipv6() {
                 "[::1]".to_string()
@@ -128,6 +134,7 @@ impl RunnerConfig {
             data_dir,
             base_url,
             options,
+            transcript_max_bytes: transcript::DEFAULT_MAX_BYTES,
         }
     }
 }
@@ -198,6 +205,19 @@ fn kind_of(reason: RunReason) -> TriggerKind {
 fn split_issue(issue: &str) -> Option<(String, i64)> {
     let (key, number) = issue.rsplit_once('-')?;
     Some((key.to_string(), number.parse().ok().filter(|n| *n > 0)?))
+}
+
+/// Writes the end marker, syncs and closes a transcript (on a blocking
+/// thread: the sync can take a moment). `None` without one.
+async fn finish_transcript(
+    writer: Option<TranscriptWriter>,
+    marker: Option<&str>,
+) -> Option<TranscriptEnd> {
+    let writer = writer?;
+    let marker = marker.map(str::to_string);
+    tokio::task::spawn_blocking(move || writer.finish(marker.as_deref()))
+        .await
+        .ok()
 }
 
 fn describe(duration: Duration) -> String {
@@ -667,6 +687,19 @@ impl Runner {
         }
     }
 
+    /// For a run somebody else already finished: what the transcript file held
+    /// once the process was gone.
+    async fn record_transcript(&self, run_id: i64, end: TranscriptEnd) {
+        let result = self
+            .inner
+            .store
+            .write_background(move |tx| runs::record_transcript(tx, run_id, end))
+            .await;
+        if let Err(err) = result {
+            tracing::warn!(run = run_id, error = %err, "could not record the transcript of a finished run");
+        }
+    }
+
     /// Records the end of a run, retrying a transient write failure.
     async fn finish(&self, run_id: i64, actor: Option<i64>, outcome: Outcome) {
         for attempt in 1..=FINISH_ATTEMPTS {
@@ -698,6 +731,9 @@ impl Runner {
                         if let Err(err) = kept {
                             tracing::warn!(run = run_id, error = %err, "could not keep the output of a canceled run");
                         }
+                    }
+                    if let Some(end) = outcome.transcript {
+                        self.record_transcript(run_id, end).await;
                     }
                     if let Some(end) = outcome.worktree.clone() {
                         self.record_worktree(run_id, end).await;
@@ -759,6 +795,7 @@ impl Runner {
             });
 
         let mut tree = None;
+        let mut repo_path = None;
         if detail.run.worktree_state == WorktreeState::Created {
             let target = match self
                 .inner
@@ -775,6 +812,7 @@ impl Runner {
                 return fail(format!("could not create worktree: {why}"));
             }
             tree = Some((PathBuf::from(&target.path), target.branch));
+            repo_path = Some(target.repo);
         }
 
         let data_dir = self.inner.config.data_dir.clone();
@@ -815,12 +853,38 @@ impl Runner {
         failpoints::hit(Point::RunAfterSpawn);
 
         let tail: SharedTail = Arc::new(Mutex::new(Tail::new(OUTPUT_TAIL_BYTES)));
+        // A transcript that cannot be created costs the run its transcript,
+        // never the run.
+        let mut scrub = Scrubber::new().key(key);
+        if let Some(repo) = &repo_path {
+            scrub = scrub.repository(repo);
+        }
+        let transcript = match TranscriptWriter::create(
+            &runs::transcript_path(&self.inner.config.data_dir, run_id),
+            self.inner.config.transcript_max_bytes,
+            scrub,
+        ) {
+            Ok(writer) => Some(writer),
+            Err(err) => {
+                tracing::warn!(run = run_id, error = %err, "could not create the transcript file");
+                None
+            }
+        };
+        let ticker = transcript.clone().map(|writer| {
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(transcript::FLUSH_EVERY).await;
+                    writer.tick();
+                }
+            })
+        });
+        let sink = |stream| transcript.clone().map(|writer| Sink { writer, stream });
         let mut readers = Vec::new();
         if let Some(out) = child.stdout.take() {
-            readers.push(tokio::spawn(pump(out, tail.clone())));
+            readers.push(tokio::spawn(pump(out, tail.clone(), sink(Stream::Out))));
         }
         if let Some(err) = child.stderr.take() {
-            readers.push(tokio::spawn(pump(err, tail.clone())));
+            readers.push(tokio::spawn(pump(err, tail.clone(), sink(Stream::Err))));
         }
         if let Some(mut input) = child.stdin.take() {
             tokio::spawn(async move {
@@ -852,6 +916,13 @@ impl Runner {
                 // Canceled while starting: whoever canceled already finished it.
                 platform::kill_tree(pid).await;
                 let _ = child.kill().await;
+                if let Some(ticker) = &ticker {
+                    ticker.abort();
+                }
+                if let Some(end) = finish_transcript(transcript.clone(), Some("run canceled")).await
+                {
+                    self.record_transcript(run_id, end).await;
+                }
                 return None;
             }
             Err(err) => End::Lost(format!("could not record the start: {err}")),
@@ -882,7 +953,23 @@ impl Runner {
                 abort.abort();
             }
         }
+        if let Some(ticker) = &ticker {
+            ticker.abort();
+        }
         let (output_tail, truncated) = lock(&tail).finish();
+        let marker: Option<String> = match &end {
+            End::Exited(Ok(status)) if status.success() => None,
+            End::Exited(Ok(status)) => Some(match status.code() {
+                Some(code) => format!("process exited with code {code}"),
+                None => "process ended by a signal".to_string(),
+            }),
+            End::Exited(Err(_)) => Some("could not wait for the process".to_string()),
+            End::TimedOut => Some("run timed out".to_string()),
+            End::Stopped(Stop::Cancel(_)) => Some("run canceled".to_string()),
+            End::Stopped(Stop::Shutdown) => Some("server stopped".to_string()),
+            End::Lost(_) => Some("could not record the start of the run".to_string()),
+        };
+        let transcript_end = finish_transcript(transcript, marker.as_deref()).await;
 
         let mut outcome = match &end {
             End::Exited(Ok(status)) if status.success() => Outcome::new(RunStatus::Succeeded),
@@ -903,6 +990,7 @@ impl Runner {
         outcome.exit_code = code.map(i64::from);
         outcome.output_tail = output_tail;
         outcome.truncated = truncated;
+        outcome.transcript = transcript_end;
         let actor = match end {
             End::Stopped(Stop::Cancel(actor)) => actor,
             _ => None,
@@ -971,6 +1059,13 @@ impl Runner {
     /// How many runs have a live task, for tests.
     pub fn live_runs(&self) -> usize {
         lock(&self.inner.active).len()
+    }
+
+    /// Whether the runner is still working on `run_id`: its process, its
+    /// transcript and, after a cancel, settling it. A run that is finished in
+    /// the database but live here still has output to come (its end marker).
+    pub fn is_live(&self, run_id: i64) -> bool {
+        lock(&self.inner.active).contains_key(&run_id)
     }
 }
 

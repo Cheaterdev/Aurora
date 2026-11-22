@@ -229,7 +229,7 @@ async fn a_dangling_reference_fails_the_foreign_key_check() {
 
 #[tokio::test]
 async fn a_database_behind_this_build_fails_and_skips_the_rest() {
-    let report = corrupted("DELETE FROM schema_version WHERE version = 15;").await;
+    let report = corrupted("DELETE FROM schema_version WHERE version = 16;").await;
     let details = failed(&report, "schema.version");
     assert!(details.contains("start aurora to migrate"), "{details}");
     let skipped = failed(&report, "events.state_agreement");

@@ -1301,6 +1301,46 @@ mark {
   overflow-wrap: anywhere;
 }
 
+.output-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 12px;
+}
+
+.output-head h2 {
+  margin-right: auto;
+}
+
+.output-follow {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: var(--target);
+}
+
+.output-download {
+  display: inline-flex;
+  align-items: center;
+  min-height: var(--target);
+}
+
+.transcript {
+  min-height: 4rem;
+  height: 24rem;
+  max-height: 70vh;
+  resize: vertical;
+}
+
+.transcript .t-err {
+  color: var(--danger);
+}
+
+.transcript .t-mark {
+  color: var(--muted);
+  font-style: italic;
+}
+
 .run-now textarea {
   font-family: var(--font-mono);
 }

@@ -186,6 +186,12 @@ pub const INVARIANTS: &[Invariant] = &[
         needs_current_schema: true,
         run: runs_worktrees,
     },
+    Invariant {
+        name: "runs.transcripts",
+        proves: "a run's recorded transcript size and truncation flag make sense (nothing recorded while it is active, truncation only with a size), and a recorded size equals the size of the transcript file; a missing file is only noted, because backups and people may move the data folder",
+        needs_current_schema: true,
+        run: runs_transcripts,
+    },
 ];
 
 /// Runs every invariant on `conn`, which is not changed. The checks see one
@@ -696,6 +702,79 @@ fn runs_worktrees(conn: &Connection) -> Result<Finding, StoreError> {
         }
     }
     let mut summary = format!("{total} working copies, {kept} kept");
+    if !notes.is_empty() {
+        summary.push_str(&format!(
+            "; note: {}{}",
+            notes.iter().take(3).cloned().collect::<Vec<_>>().join("; "),
+            if notes.len() > 3 {
+                format!("; and {} more", notes.len() - 3)
+            } else {
+                String::new()
+            }
+        ));
+    }
+    Finding::of(summary, violations)
+}
+
+/// The transcript of a run (TRK-17). Database rules fail the check. The file
+/// is looked for next to the database (`<folder>/transcripts/<id>.log`): the
+/// runner records the file's size once, after its last write and sync, so a
+/// recorded size that differs from the file's means the file was edited,
+/// truncated or replaced, and fails. A recorded size of 0 means "not recorded"
+/// (a crash, a run that never had a process) and is never compared: the file of
+/// a run the server crashed in may hold more than anyone recorded. A missing
+/// file is a note only, like a missing working copy.
+fn runs_transcripts(conn: &Connection) -> Result<Finding, StoreError> {
+    let violations = lines(
+        conn,
+        "SELECT 'run ' || id || ' is ' || status || ' but has a recorded transcript of '
+                || transcript_bytes || ' bytes'
+         FROM run WHERE status IN ('starting', 'running') AND transcript_bytes > 0
+         UNION ALL
+         SELECT 'run ' || id || ' is marked truncated without a recorded transcript'
+         FROM run WHERE transcript_truncated = 1 AND transcript_bytes = 0",
+        |r| r.get(0),
+    )?;
+    let mut violations = violations;
+    let mut notes = Vec::new();
+    let mut with_size = 0_usize;
+    let folder = conn
+        .path()
+        .and_then(|db| Path::new(db).parent().map(Path::to_path_buf))
+        .map(|parent| {
+            if parent.as_os_str().is_empty() {
+                std::path::PathBuf::from(".")
+            } else {
+                parent
+            }
+        });
+    let mut stmt = conn
+        .prepare("SELECT id, transcript_bytes FROM run WHERE transcript_bytes > 0 ORDER BY id")?;
+    let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))?;
+    for row in rows {
+        let (id, recorded) = row?;
+        with_size += 1;
+        let Some(folder) = &folder else {
+            continue;
+        };
+        match std::fs::metadata(crate::runs::transcript_path(folder, id)) {
+            Ok(meta) => {
+                let size = i64::try_from(meta.len()).unwrap_or(i64::MAX);
+                if size != recorded {
+                    violations.push(format!(
+                        "run {id} recorded a transcript of {recorded} bytes but the file has {size}"
+                    ));
+                }
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                notes.push(format!("run {id} has no transcript file"));
+            }
+            Err(err) => notes.push(format!(
+                "run {id}: the transcript file is unreadable: {err}"
+            )),
+        }
+    }
+    let mut summary = format!("{with_size} recorded transcripts");
     if !notes.is_empty() {
         summary.push_str(&format!(
             "; note: {}{}",

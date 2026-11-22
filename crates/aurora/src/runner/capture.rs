@@ -1,9 +1,13 @@
-//! The bounded capture of a process's output: only the last bytes are kept,
-//! and the pipes are always drained so a chatty child never blocks.
+//! The bounded capture of a process's output: only the last bytes are kept in
+//! the tail (it goes on the run row), every byte also goes to the transcript
+//! when there is one, and the pipes are always drained so a chatty child never
+//! blocks.
 
 use std::sync::{Arc, Mutex};
 
 use tokio::io::{AsyncRead, AsyncReadExt};
+
+use crate::transcript::{Stream, TranscriptWriter};
 
 /// The last `cap` bytes written, however much was.
 pub struct Tail {
@@ -56,16 +60,27 @@ impl Tail {
 
 pub type SharedTail = Arc<Mutex<Tail>>;
 
-/// Reads `reader` to its end into the tail. Never stops early on a full tail.
-pub async fn pump<R: AsyncRead + Unpin>(mut reader: R, tail: SharedTail) {
+/// Where a pipe's output goes besides the tail.
+pub struct Sink {
+    pub writer: TranscriptWriter,
+    pub stream: Stream,
+}
+
+/// Reads `reader` to its end into the tail and the transcript. Never stops
+/// early on a full tail or a full transcript.
+pub async fn pump<R: AsyncRead + Unpin>(mut reader: R, tail: SharedTail, sink: Option<Sink>) {
     let mut chunk = vec![0_u8; 8192];
     loop {
         match reader.read(&mut chunk).await {
             Ok(0) | Err(_) => return,
-            Ok(n) => tail
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .push(&chunk[..n]),
+            Ok(n) => {
+                tail.lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push(&chunk[..n]);
+                if let Some(sink) = &sink {
+                    sink.writer.push(sink.stream, &chunk[..n]);
+                }
+            }
         }
     }
 }

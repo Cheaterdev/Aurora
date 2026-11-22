@@ -11,17 +11,18 @@ use aurora_store::auth::{Principal, Role};
 use aurora_store::runs::{self, Created, Outcome, Run, RunFilter, RunReason, RunStatus};
 use aurora_store::{Rejection, Store, StoreError, agents, now_millis, projects};
 use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::auth::Access;
 use crate::gitwork::Git;
 use crate::idem;
 use crate::routes::{ApiError, ApiJson, ApiQuery, ApiResult};
 use crate::runner::{Runner, StartRequest};
+use crate::transcript;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -217,7 +218,14 @@ pub(crate) async fn get_run(
 }
 
 /// Cancels a run: it becomes `canceled` and its key is revoked in this
-/// request's transaction; the process is stopped right after the commit.
+/// request's transaction (that transaction also records the request id, so a
+/// repeat is replayed, not applied twice); the process tree is stopped right
+/// after the commit. The answer waits, for at most 5 seconds, until the runner
+/// has ended the process, written the transcript's end marker and settled the
+/// working copy, and then reports the run as it is by then. When it does not
+/// settle in time, or on a replay, the answer is the run as it was committed
+/// (`worktree_state` may still say `created`; a later `GET` shows the settled
+/// run). A run that is already finished answers `409`.
 pub(crate) async fn cancel_run(
     State(store): State<Store>,
     Extension(principal): Extension<Principal>,
@@ -251,6 +259,147 @@ pub(crate) async fn cancel_run(
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     if ran {
         runner.stop_process(id, Some(user)).await;
+        if let Ok(settled) = store.read(move |c| runs::get_run(c, id)).await {
+            return Ok((StatusCode::OK, Json(settled)).into_response());
+        }
     }
     Ok(response)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TranscriptQuery {
+    /// A byte offset from a previous answer's `next`; default 0.
+    after: Option<u64>,
+    /// About how many bytes of lines to return; default 64 KiB, at most 256 KiB.
+    limit: Option<u64>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TextQuery {
+    /// `1`: answer with `Content-Disposition: attachment`.
+    download: Option<String>,
+}
+
+/// What the transcript endpoints need to know before they touch the file.
+/// Whoever reads output is an owner or a member: the output can hold secrets
+/// and a registered agent's key never sees it (it may belong to another run).
+async fn readable_run(
+    store: &Store,
+    principal: &Principal,
+    access: &Access,
+    id: i64,
+) -> Result<runs::Run, ApiError> {
+    let detail = store.read(move |c| runs::get_run(c, id)).await?;
+    access.check_project(&detail.run.project)?;
+    not_for_agents(principal, "read transcripts")?;
+    Ok(detail.run)
+}
+
+fn no_transcript() -> ApiError {
+    StoreError::from(Rejection::NotFound("transcript".into())).into()
+}
+
+fn blocking_failed(err: impl std::fmt::Display) -> ApiError {
+    tracing::warn!(error = %err, "could not read a transcript");
+    ApiError::new(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "the transcript could not be read",
+    )
+}
+
+/// One page of a run's transcript; see `docs/api.md` for the shape. A run that
+/// has not printed anything yet answers with no entries, not `404`; `404` means
+/// an unknown run or a finished run that never had a transcript.
+pub(crate) async fn get_transcript(
+    State(store): State<Store>,
+    Extension(principal): Extension<Principal>,
+    Extension(access): Extension<Access>,
+    Extension(runner): Extension<Option<Runner>>,
+    Path(id): Path<i64>,
+    ApiQuery(query): ApiQuery<TranscriptQuery>,
+) -> ApiResult<Response> {
+    let run = readable_run(&store, &principal, &access, id).await?;
+    // Asked before the file is read: a run that was finished and not live
+    // before the read has its last line in the file by then.
+    let writing = runner.as_ref().is_some_and(|r| r.is_live(id));
+    let finished = !run.status.is_active();
+    let after = query.after.unwrap_or(0);
+    let limit = usize::try_from(query.limit.unwrap_or(transcript::DEFAULT_PAGE_BYTES as u64))
+        .unwrap_or(transcript::MAX_PAGE_BYTES)
+        .clamp(1, transcript::MAX_PAGE_BYTES);
+    let path = runs::transcript_path(&transcript::data_dir(&store), id);
+    let page = tokio::task::spawn_blocking(move || transcript::read_page(&path, after, limit))
+        .await
+        .map_err(blocking_failed)?
+        .map_err(blocking_failed)?;
+    let body = match page {
+        Some(page) => json!({
+            "entries": page.entries,
+            "next": page.next,
+            "done": finished && !writing && page.at_end,
+            "truncated": page.truncated || run.transcript_truncated,
+            "status": run.status,
+        }),
+        None if !finished => json!({
+            "entries": [],
+            "next": after,
+            "done": false,
+            "truncated": false,
+            "status": run.status,
+        }),
+        None => return Err(no_transcript()),
+    };
+    let mut response = Json(body).into_response();
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    Ok(response)
+}
+
+/// The whole transcript as `text/plain`, for people.
+pub(crate) async fn get_transcript_text(
+    State(store): State<Store>,
+    Extension(principal): Extension<Principal>,
+    Extension(access): Extension<Access>,
+    Path(id): Path<i64>,
+    ApiQuery(query): ApiQuery<TextQuery>,
+) -> ApiResult<Response> {
+    let run = readable_run(&store, &principal, &access, id).await?;
+    let path = runs::transcript_path(&transcript::data_dir(&store), id);
+    let text = tokio::task::spawn_blocking(move || transcript::read_text(&path))
+        .await
+        .map_err(blocking_failed)?
+        .map_err(blocking_failed)?;
+    let Some(text) = text else {
+        if run.status.is_active() {
+            return Ok(text_response(String::new(), None));
+        }
+        return Err(no_transcript());
+    };
+    let name =
+        matches!(query.download.as_deref(), Some("1" | "true")).then(|| format!("run-{id}.txt"));
+    Ok(text_response(text, name))
+}
+
+fn text_response(text: String, attachment: Option<String>) -> Response {
+    let mut response = (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "text/plain; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-store"),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+        ],
+        text,
+    )
+        .into_response();
+    if let Some(name) = attachment
+        && let Ok(value) = HeaderValue::from_str(&format!("attachment; filename=\"{name}\""))
+    {
+        response
+            .headers_mut()
+            .insert(header::CONTENT_DISPOSITION, value);
+    }
+    response
 }

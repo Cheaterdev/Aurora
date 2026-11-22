@@ -167,6 +167,41 @@ fn case(point: &str) {
         1,
         "{point}: one finish event"
     );
+    if point == "run_after_transcript_write" {
+        // What was written before the crash is readable, a half-written last
+        // line is ignored, and no end note exists.
+        let run_id = count(&db, "SELECT id FROM run");
+        let file = dir.path().join("transcripts").join(format!("{run_id}.log"));
+        let len = std::fs::metadata(&file)
+            .unwrap_or_else(|e| panic!("{point}: no transcript file: {e}"))
+            .len();
+        assert!(len > 0, "{point}: the transcript has what was flushed");
+        let before = aurora::transcript::read_page(&file, 0, 1000)
+            .expect("read")
+            .expect("a file");
+        assert!(!before.entries.is_empty(), "{point}: whole lines are read");
+        assert!(
+            before.entries.iter().all(|e| e.s != "x"),
+            "{point}: a crash writes no end note"
+        );
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&file)
+                .expect("open");
+            f.write_all(br#"{"t":5,"s":"o","d":"torn"#).expect("append");
+        }
+        let after = aurora::transcript::read_page(&file, 0, 1000)
+            .expect("read")
+            .expect("a file");
+        assert_eq!(
+            after.entries.len(),
+            before.entries.len(),
+            "{point}: the torn last line is ignored"
+        );
+        assert_eq!(after.next, before.next);
+    }
     assert_checks_green(&db, &format!("{point}: after the restart"));
     server.kill();
     assert_checks_green(&db, &format!("{point}: after killing the restarted server"));
@@ -180,6 +215,11 @@ fn a_crash_after_the_run_is_created_interrupts_it_on_restart() {
 #[test]
 fn a_crash_after_the_process_is_spawned_interrupts_the_run_on_restart() {
     case("run_after_spawn");
+}
+
+#[test]
+fn a_crash_after_a_transcript_write_keeps_what_was_flushed() {
+    case("run_after_transcript_write");
 }
 
 #[test]

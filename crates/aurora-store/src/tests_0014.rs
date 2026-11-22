@@ -24,7 +24,7 @@ async fn populated_version_thirteen_database_gets_the_run_table() {
     v13.close().await;
 
     let store = Store::open(&path).unwrap();
-    assert_eq!(store.schema_version(), 15);
+    assert_eq!(store.schema_version(), 16);
     let backup = store.open_report().backup.clone().expect("backup taken");
     assert!(backup.starts_with(default_backup_dir(&path)));
     let (projects, runs, indexes) = store

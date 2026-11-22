@@ -18,6 +18,7 @@ pub mod shutdown;
 #[cfg_attr(not(windows), path = "signal/other.rs")]
 mod signal;
 pub mod supervise;
+pub mod transcript;
 
 use std::any::Any;
 use std::future::{Future, IntoFuture};

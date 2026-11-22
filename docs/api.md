@@ -766,8 +766,9 @@ only), `AURORA_RUN_ID`, `AURORA_ISSUE`, `AURORA_PROJECT` and `AURORA_TRIGGER`, p
 `AURORA_WORKDIR` (the folder the process starts in) and, for a run with a
 working copy of its own, `AURORA_BRANCH`.
 The key is revoked in the transaction that records the end of the run.
-Standard output and error, merged, are the transcript (the last 64 KiB are
-kept); the exit status is the result. There is at most one active run
+Standard output and error are read as they arrive and kept as the run's
+**transcript** (see below); the last 64 KiB are also kept on the run itself as
+`output_tail`; the exit status is the result. There is at most one active run
 (`starting` or `running`) per issue; a trigger that arrives meanwhile is
 dropped (queueing is a later task).
 
@@ -791,11 +792,39 @@ with changes is never deleted: it stays, with its branch, for a person to look a
 (`kept`). When the server cannot tell (git failed, a crash), it is kept too, with
 a `worktree_note`. Cleanup problems never fail a run.
 
+**The transcript.** Everything the process printed is appended, as it arrives, to
+an append-only file `<data>/transcripts/<run id>.log` (not to the database: it is
+large and changes all the time), standard output and standard error merged in the
+order they were read, each piece tagged with its stream. The file holds one JSON
+object per line, `{"t": ms since the process started, "s": "o" | "e" | "x", "d":
+"text"}`: `o` is standard output, `e` standard error, `x` a note written by
+Aurora itself and not output of the process (`run canceled`, `run timed out`,
+`server stopped`, `process exited with code 3`, `transcript truncated at N
+bytes`). A line of output is one frame including its line ending; a longer line
+is cut into frames of at most 8 KiB. Bytes that are not valid UTF-8 are replaced
+by U+FFFD. Batches are appended at least every 250 ms or 8 KiB, so a crash loses
+at most the last batch; the file is synced once when the run ends. It is capped
+(default 8 MiB, `AURORA_TRANSCRIPT_MAX_BYTES` or `--transcript-max-bytes`, 1024 to
+1 GiB): at the cap one `x` frame says so and nothing more is written, while the
+process keeps running and its output tail is still recorded. Before it is written
+the text has the run's own API key replaced by `[key]` and the project's
+repository path (either slash spelling) by `the repository`; this is exact-match,
+best effort (a secret split across a flush of a line that stays unterminated for
+more than 250 ms, or across a 64 KiB line, is not found). Every end the server is
+alive to see (cancel, timeout, shutdown, a failing exit) ends the file with an
+`x` frame; a successful exit has none, and a crash leaves no marker (the run is
+`interrupted` at the next start, and the file is left as it is: readable up to
+its last complete line). Transcripts are not deleted by Aurora (retention is a
+later task) and belong in backups of the data folder. They are not exposed
+through MCP: an agent could read another run's output.
+
 A run is `{id, agent_id, agent, project, issue, issue_number, reason, status,
 trigger_event_id, pid, template_source, template_id, edited, exit_code, error,
 output_truncated, started, finished, created, created_by, worktree_state,
 worktree_path, branch, base_ref, base_commit, has_changes, changed_files, ahead,
-worktree_note}`. `worktree_state` is `none`, `created` (made, not yet settled),
+worktree_note, transcript_bytes, transcript_truncated}`. `transcript_bytes` is
+the size of the transcript file when the run ended (0 until then, and after a
+crash); `transcript_truncated` says the cap was reached. `worktree_state` is `none`, `created` (made, not yet settled),
 `removed` or `kept`; `base_ref` is the branch it started from and `base_commit`
 its commit at that moment; `changed_files` counts files `git status` lists and
 `ahead` the commits on the run's branch beyond `base_commit`. A registered
@@ -809,11 +838,15 @@ members get them. A registered agent's key sees the runs of its allowed
 projects without `message` and `output_tail`.
 
 Events: `run.created`, `run.started` and `run.finished` carry no message and
-no output. `run.created` also has `branch` and `worktree_state`, and
-`run.finished` has `worktree_state` and `has_changes`; no folder is ever in an
-event. A cancel finishes the run before its process is stopped, so the run it
-returns can still say `created`; the worktree is settled moments later, without
-another event, and the run then says `removed` or `kept`.
+no output; there is no event per chunk of output. `run.created` also has
+`branch` and `worktree_state`, and `run.finished` has `worktree_state`,
+`has_changes` and, when the runner finished the file itself, `transcript_bytes`
+(absent for a cancel by a person: it is committed before the process is stopped,
+and the size is recorded on the run a moment later); no folder is ever in an
+event. A cancel finishes the run before its process is stopped; the worktree and
+the transcript size are settled moments later, without another event, and the
+run then says `removed` or `kept`. The cancel request waits for that (see
+below), so the run it returns is normally the settled one.
 
 ### `POST /api/v1/agents/{id}/runs`
 
@@ -844,11 +877,48 @@ The run: the detail for owners and members, the plain run for an agent's key.
 
 ### `POST /api/v1/runs/{id}/cancel`
 
-Owner or member. The run becomes `canceled` and its key is revoked in this
-request's transaction; the process tree is stopped right after the commit and
-the output it had printed is recorded then, so it can appear a moment later.
-`200` with the run, `409` when it already finished, `404`, `503` without a
-runner. It takes a request id.
+Owner or member (an agent's key gets `403`). The run becomes `canceled` and its
+key is revoked in this request's transaction, which also records the request id.
+The process tree is stopped right after the commit (`taskkill /T /F` on Windows,
+the process group elsewhere), the transcript gets its `run canceled` frame and
+the working copy is settled. The request waits for that, at most 5 seconds, and
+answers `200` with the run as it is then (the detail, as `GET /runs/{id}` gives
+an owner; `worktree_state` is normally already `removed` or `kept`). If the
+runner does not settle in time the answer is the run as committed (its
+`worktree_state` may still say `created`, and `transcript_bytes` 0); a later
+`GET` shows the settled run. `409` when the run already finished, `404`, `503`
+without a runner. It takes a request id; a repeat returns the response recorded
+with the change (the run as committed, with the `Idempotent-Replay` header) and
+stops nothing a second time.
+
+### `GET /api/v1/runs/{id}/transcript`
+
+Owner or member only: the output can hold secrets, so a registered agent's key
+gets `403` even for a run of its own project (the same rule as `output_tail`).
+Query `after` (a byte offset into the transcript file, default 0) and `limit`
+(about how many bytes of lines to return: default 65536, at most 262144; a line
+longer than that is still returned whole). `200` with `{"entries": [{"t", "s",
+"d"}, ...], "next": n, "done": bool, "truncated": bool, "status": "running"}`.
+Only whole lines are returned, so a reader that overlaps the writer never gets a
+torn line, and `next` is the offset to pass as `after` the next time: poll with
+`after=next` (every second while `done` is false). A line that a crash left half
+written at the end of the file is never returned and is not an error; a complete
+line that is not a valid frame is skipped. `done` is true only when the run has
+finished, the runner has finished writing the file (after a cancel that is a
+moment after the run says `canceled`) and this answer reached the end of the
+file. `truncated` is true once the size cap was hit. A running run that has not
+printed anything yet answers `200` with no entries; `404` for an unknown run, or
+a finished run that never had a transcript (it failed before its process
+started). The answer is `no-store`.
+
+### `GET /api/v1/runs/{id}/transcript.txt`
+
+Same access. The whole transcript as `text/plain; charset=utf-8`: the output of
+both streams concatenated in order (stderr is not marked), with each note of
+Aurora's own as a line `[aurora: run canceled]`. With `?download=1` the answer
+also has `Content-Disposition: attachment; filename="run-<id>.txt"`. `404` as
+above (a running run without output gives an empty text). The text is built in
+memory, so it is bounded by the transcript's size cap.
 
 ## Search
 

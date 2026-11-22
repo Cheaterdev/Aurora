@@ -327,6 +327,9 @@
       previewRun(button);
     } else if (action === 'cancel-run') {
       cancelRun(button);
+    } else if (action === 'more-output') {
+      var panel = button.closest('.run-output');
+      if (panel && panel.outputState) { button.hidden = true; outputFetch(panel.outputState); }
     }
   });
 
@@ -551,20 +554,187 @@
       if (!fresh) { return; }
       current.replaceWith(fresh);
       localizeTimes(fresh);
+      syncIssueOutput();
     });
   }
 
+  // No confirmation: the button is disabled at once and says what is going on.
+  // The answer comes when the process tree is gone (at most a few seconds).
   function cancelRun(button) {
-    if (!window.confirm('Stop this run? The process is ended.')) { return; }
+    if (button.disabled) { return; }
+    var label = button.textContent;
     button.disabled = true;
+    button.textContent = 'Canceling…';
     api('POST', '/runs/' + button.dataset.runId + '/cancel').then(function () {
-      // What the process printed is recorded a moment after the cancel.
-      refreshRun();
-      setTimeout(refreshRun, 2500);
+      if (page === 'run') { refreshRun(); } else if (page === 'issue') { refreshRuns(); }
     }, function (err) {
       button.disabled = false;
-      message($('#page-msg'), err.message, 'error');
+      button.textContent = label;
+      // The run may have ended on its own meanwhile: show what is true now.
+      if (err.status === 409) {
+        if (page === 'run') { refreshRun(); } else if (page === 'issue') { refreshRuns(); }
+      }
+      toast(err.message, 'error');
     });
+  }
+
+  // ---- output: the transcript of a run ----
+  // Polling, no sockets: GET /runs/{id}/transcript?after=<next> every second
+  // while the run is active (every 3 s once nothing new has come for a while),
+  // until the answer says `done`. Every piece of text goes in with
+  // textContent, never as markup. The server-rendered tail inside the panel is
+  // what shows without script; it is replaced by the stored transcript here.
+
+  var PAGE_BYTES = 262144;
+  var MAX_RENDERED_CHARS = 1500000;
+
+  function outputRole(panel, name) { return $('[data-role="' + name + '"]', panel); }
+
+  function atBottom(view) { return view.scrollTop + view.clientHeight >= view.scrollHeight - 8; }
+
+  function outputState(st, text) {
+    var el = outputRole(st.panel, 'state');
+    if (el) { el.textContent = text; }
+  }
+
+  function outputAppend(st, entries) {
+    var view = outputRole(st.panel, 'view');
+    var follow = outputRole(st.panel, 'follow');
+    var stick = !!(follow && follow.checked);
+    var fragment = document.createDocumentFragment();
+    entries.forEach(function (entry) {
+      var text = String(entry.d);
+      var span = document.createElement('span');
+      if (entry.s === 'e') {
+        span.className = 't-err';
+      } else if (entry.s === 'x') {
+        span.className = 't-mark';
+        text = (st.lastNewline ? '' : '\n') + '— ' + text + ' —\n';
+      }
+      span.textContent = text;
+      st.lastNewline = text.charAt(text.length - 1) === '\n';
+      st.chars += text.length;
+      fragment.appendChild(span);
+    });
+    view.appendChild(fragment);
+    while (st.chars > MAX_RENDERED_CHARS && view.firstChild && view.firstChild !== view.lastChild) {
+      st.chars -= view.firstChild.textContent.length;
+      view.removeChild(view.firstChild);
+      st.trimmed = true;
+    }
+    if (stick) { view.scrollTop = view.scrollHeight; }
+  }
+
+  function outputShow(st, hasText) {
+    var view = outputRole(st.panel, 'view');
+    var empty = outputRole(st.panel, 'empty');
+    if (view) { view.hidden = !hasText; }
+    if (empty) {
+      empty.hidden = hasText;
+      empty.textContent = st.active ? 'Nothing yet.' : 'The process printed nothing.';
+    }
+  }
+
+  function outputStop(st) {
+    st.stopped = true;
+    clearTimeout(st.timer);
+  }
+
+  function outputFetch(st) {
+    if (st.stopped || st.loading) { return; }
+    st.loading = true;
+    api('GET', '/runs/' + st.runId + '/transcript?after=' + st.next + '&limit=' + PAGE_BYTES).then(function (data) {
+      st.loading = false;
+      if (st.stopped) { return; }
+      if (!st.started) {
+        st.started = true;
+        // The stored transcript replaces the server-rendered tail.
+        outputRole(st.panel, 'view').textContent = '';
+        st.chars = 0;
+      }
+      if (data.entries.length > 0) { outputAppend(st, data.entries); st.idle = 0; } else { st.idle += 1; }
+      st.next = data.next;
+      st.done = data.done === true;
+      outputShow(st, st.chars > 0);
+      var note = [];
+      if (data.truncated) { note.push('Output was cut at the size limit.'); }
+      if (st.trimmed) { note.push('Showing the latest part; download for everything.'); }
+      var more = outputRole(st.panel, 'more');
+      if (st.done) {
+        outputState(st, ['Finished.'].concat(note).join(' '));
+        if (more) { more.hidden = true; }
+        outputStop(st);
+        return;
+      }
+      if (st.active) {
+        outputState(st, ['Live.'].concat(note).join(' '));
+        st.timer = setTimeout(function () { outputFetch(st); }, st.idle >= 3 ? 3000 : 1000);
+      } else {
+        // A finished run: pages are fetched on request.
+        var hasMore = data.entries.length > 0 && !data.done;
+        if (more) { more.hidden = !hasMore; }
+        outputState(st, note.join(' '));
+        if (!hasMore) { outputStop(st); }
+      }
+    }, function (err) {
+      st.loading = false;
+      if (st.stopped) { return; }
+      if (err.status === 404) {
+        st.started = true;
+        outputRole(st.panel, 'view').textContent = '';
+        st.chars = 0;
+        outputShow(st, false);
+        outputRole(st.panel, 'empty').textContent = 'No output was recorded for this run.';
+        outputState(st, '');
+        outputStop(st);
+        return;
+      }
+      outputState(st, 'Could not load the output (' + err.message + ') — retrying.');
+      if (st.active) { st.timer = setTimeout(function () { outputFetch(st); }, 3000); }
+    });
+  }
+
+  function startOutput(panel, runId, active) {
+    if (panel.outputState) { outputStop(panel.outputState); }
+    var view = outputRole(panel, 'view');
+    var st = {
+      panel: panel, runId: runId, active: active, next: 0, chars: 0, idle: 0, started: false,
+      loading: false, stopped: false, done: false, trimmed: false, lastNewline: true, timer: null
+    };
+    panel.outputState = st;
+    panel.dataset.runId = String(runId);
+    panel.dataset.active = active ? 'true' : 'false';
+    var link = outputRole(panel, 'download');
+    if (link) { link.href = '/api/v1/runs/' + runId + '/transcript.txt?download=1'; }
+    panel.hidden = false;
+    var label = outputRole(panel, 'follow-label');
+    var follow = outputRole(panel, 'follow');
+    if (label) { label.hidden = !active; }
+    if (follow) { follow.checked = true; }
+    if (view) {
+      view.onscroll = function () { if (follow) { follow.checked = atBottom(view); } };
+    }
+    if (follow) {
+      follow.onchange = function () { if (follow.checked && view) { view.scrollTop = view.scrollHeight; } };
+    }
+    outputState(st, 'Loading…');
+    outputFetch(st);
+  }
+
+  function initOutput() {
+    var panel = $('#run-output');
+    if (!panel || !panel.dataset.runId) { return; }
+    startOutput(panel, Number(panel.dataset.runId), panel.dataset.active === 'true');
+  }
+
+  // The issue page follows the newest active run of the issue.
+  function syncIssueOutput() {
+    var panel = $('#issue-output');
+    var runs = $('#runs');
+    if (!panel || !runs || !runs.dataset.liveRun) { return; }
+    var wanted = Number(runs.dataset.liveRun);
+    if (panel.outputState && panel.outputState.runId === wanted) { return; }
+    startOutput(panel, wanted, true);
   }
 
   var formHandlers = {
@@ -1090,5 +1260,7 @@
   colorize(document);
   localizeTimes(document);
   $$('[data-field]').forEach(remember);
+  initOutput();
+  syncIssueOutput();
   connect();
 }());

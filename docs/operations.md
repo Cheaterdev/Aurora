@@ -46,6 +46,7 @@ command exits with 2 and says so; check a copy then.
 | `prompt_templates.valid` | every stored prompt template parses and uses only known variables, and its issue type belongs to its project, so a run can never start from a template that fails validation |
 | `runs.no_orphans` | an active run (`starting`/`running`) has a live key of its agent's user, no finish time, and a pid once `running`; a finished run has a finish time and no live key. (Foreign keys and a unique index cover missing rows and two active runs on one issue.) Offline (`aurora check`) an active run is allowed, because nobody can say whether its process lives; the server's own check right after start-up also demands that every active run belongs to the current boot |
 | `runs.worktrees` | a run's working copy is consistent with its row: a planned, kept or removed worktree has a folder path, a branch and the repository it belongs to; `removed` never goes with changes (`has_changes`, changed files or commits ahead); a run with no working copy (or one not yet settled) reports no changes; a run that is still active is not `kept` or `removed` yet; and a finished run is no longer `created` (a canceled run may be for the moment before its process is reaped). Only the database can fail this check. A folder that is missing for a `kept` copy, or still there for a `removed` one, is reported as a note and never fails, because the disk can legitimately differ (a person removed it by hand) |
+| `runs.transcripts` | a run's recorded transcript size and truncation flag make sense (nothing recorded while the run is active; truncated only with a size), and a recorded size equals the size of `<folder of the database>/transcripts/<run id>.log`: the runner records it once, after its last write and sync, so a different size means the file was edited, cut or replaced. A size of 0 means "not recorded" (a crash, or a run that never had a process) and is never compared, because a crashed run's file may hold more than anyone recorded. A missing file is only a note (a copy of the database checked elsewhere, a backup without the data folder, a person who moved it) |
 
 About `events.ids`: `AUTOINCREMENT` guarantees ids only grow and are never
 reused, not that they are contiguous. SQLite updates its counter inside the
@@ -96,6 +97,7 @@ named place in the write path. They are listed in one place,
 | `run_after_spawn` | runner, process spawned, run not yet marked `running` | same; the stray process is for TRK-45 to reap |
 | `run_before_finish` | runner, process exited, the finish not yet committed | same |
 | `run_after_worktree` | runner, the run's git worktree and branch made, process not spawned | the run is `interrupted`, its working copy is `kept` (never claimed removed, never deleted), the folder and the branch are still there, no second run; the leftover is for a person to remove (see "Working copies") |
+| `run_after_transcript_write` | runner, a batch of output appended to the run's transcript, the process still running | the run is `interrupted` ("server restarted"), no second run, `aurora check` passes; the transcript file exists and is readable up to its last complete line (a half-written last line is ignored, never an error); its size is not recorded (`transcript_bytes` 0) and no end marker was written |
 
 Arm one with `AURORA_TEST_FAILPOINT=<name>` (first hit) or `<name>:<n>` (the n-th
 hit of that point in this process). `before_commit` and `after_commit` cover
@@ -149,8 +151,9 @@ rules are in `docs/api.md` (Runs); this is what runs where.
   `AURORA_BRANCH`. `runs/<id>/` also holds
   `mcp.json` for a command named `claude` (or when `{mcp_config}` is used); it
   is written to a temporary name, flushed and renamed, and holds the key, so it
-  is as private as the data folder. Standard output and error, merged, are the
-  transcript: the last 64 KiB are stored.
+  is as private as the data folder. Standard output and error are read as they
+  arrive into the transcript (see "Transcripts"); the last 64 KiB are also stored
+  on the run row.
 - **Windows.** The command is looked up on `PATH` with `PATHEXT` and may be an
   `.exe`, `.cmd` or `.bat`. A `.cmd`/`.bat` shim is run through the command
   interpreter with the arguments quoted for it, and an argument holding `{prompt}`
@@ -163,8 +166,50 @@ rules are in `docs/api.md` (Runs); this is what runs where.
 - **Not yet.** A process is not tied to the server: if the server is killed the
   agent keeps running until it ends by itself, and its key is already revoked at
   the next start. Job objects / process groups that die with the server, and
-  reaping strays, are TRK-45. The transcript appears when the run ends (live
-  output is TRK-17).
+  reaping strays, are TRK-45.
+
+## Transcripts (live output)
+
+The output of a run is written, as it arrives, to `<data folder>/transcripts/<run
+id>.log` (the data folder is the database's folder; the folder is created on
+demand). It is an append-only file of JSON lines `{"t","s","d"}`, with `s` of `o`
+(stdout), `e` (stderr) or `x` (a note from Aurora); the exact format, the
+scrubbing of the run's key and the repository path, the flush rule (every 250 ms
+or 8 KiB) and the reading rules are in `docs/api.md` (Runs) and at the top of
+`crates/aurora/src/transcript.rs`, the one module that knows the format.
+
+- **Cap.** 8 MiB per run by default; `AURORA_TRANSCRIPT_MAX_BYTES` (or
+  `--transcript-max-bytes`) sets it, from 1024 bytes to 1 GiB. At the cap the file
+  gets one `transcript truncated at N bytes` note and no more output; the process
+  is not stopped.
+- **Durability.** An append log: no rename-into-place, one `sync_data` when the run
+  ends. A crash loses at most the last batch (250 ms or 8 KiB) and can leave a
+  half-written last line, which readers ignore. The database records the file's
+  size (`run.transcript_bytes`) and the truncation flag once, when the run ends
+  (for a run canceled by a person, a moment after the cancel); no event is written
+  per chunk. Reconciliation at start-up never touches the file. `aurora check`
+  (`runs.transcripts`) fails when a recorded size does not match the file and only
+  notes a missing file.
+- **End notes.** The file ends with `run canceled`, `run timed out`, `server
+  stopped` or `process exited with code N` when the server was alive to write it;
+  a successful exit adds none, and a crash leaves none.
+- **Reading and the page.** `GET /api/v1/runs/{id}/transcript` (polled with
+  `after=next`) and `.../transcript.txt`; the run page and the issue's Runs
+  section show a live Output panel that polls every second (every 3 seconds once
+  nothing new arrives) until the run is done, with Follow and Download. There are
+  no sockets: a slow or vanished browser costs the server nothing. Windows opens
+  the file for the writer with std's default sharing, so a reader can open it
+  while it is appended to.
+- **Cancel.** The Cancel button (run page and Runs section; owners and members)
+  calls `POST /api/v1/runs/{id}/cancel`: the process tree is ended
+  (`taskkill /T /F` on Windows), the run becomes `canceled`, its key is revoked,
+  the transcript keeps everything up to the kill and its `run canceled` note.
+- **Backups.** Transcripts live under the data folder, outside the database. A
+  backup that is meant to bring runs back with their output must include the
+  `transcripts/` folder (the built-in database backups do not). Nothing deletes a
+  transcript; retention is a later task.
+- **Not in MCP.** Agents cannot read transcripts through MCP or with their key: the
+  output of one run can hold what another run's agent must not see.
 
 ## Working copies (git worktrees)
 
@@ -235,7 +280,10 @@ launched, restarts it and checks that the run is `interrupted` exactly once, its
 key is revoked, redelivery of the assignment makes no second run and `aurora
 check` passes. `run_after_worktree` is tested against a project with a real
 (temporary) git repository: the working copy and its branch survive the crash and
-the restart. The rest of this section is about the write-path matrix.
+the restart. `run_after_transcript_write` kills the server while the agent is
+still running and has printed part of its output: after the restart the run is
+interrupted, the transcript file is readable (a torn last line is ignored) and
+the checks pass. The rest of this section is about the write-path matrix.
 
 `crates/aurora/tests/crash_matrix.rs` runs the real binary built by `cargo test`.
 For every failpoint above and several hit counts (1, 2, 5, 17 where there are

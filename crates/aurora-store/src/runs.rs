@@ -38,7 +38,11 @@
 //! * `run.created` `{agent_id, issue: {number, identifier}, reason,
 //!   trigger_event_id, template_source, branch, worktree_state}`
 //! * `run.started` `{pid}`
-//! * `run.finished` `{status, exit_code, error?, worktree_state?, has_changes?}`
+//! * `run.finished` `{status, exit_code, error?, worktree_state?, has_changes?,
+//!   transcript_bytes?}` (`transcript_bytes` is the size of the transcript file
+//!   when the runner finished it, absent when the run was canceled by a person:
+//!   the cancel is committed before the process is stopped, see below). The
+//!   replay reads only `status`, so the additive field changes nothing there.
 //!
 //! The per-run key's own `key.created` and `key.revoked` events (actor: the
 //! agent's user) are written in the same transactions.
@@ -63,6 +67,16 @@
 //! a person is finished before its process is stopped, so its working copy is
 //! settled a moment later by [`record_worktree`] (no event; the row is the
 //! authority).
+//!
+//! # The transcript (TRK-17)
+//!
+//! The output of the process is kept in full, up to a cap, in an append-only
+//! file per run ([`transcript_path`]) that the runner writes while the process
+//! runs. The row only records what the file held when it was finished:
+//! `transcript_bytes` and `transcript_truncated`, set by [`finish_run`] (from
+//! [`Outcome::transcript`]) or, for a run a person canceled, a moment later by
+//! [`record_transcript`]. **No event is written per chunk.** A crash leaves
+//! the columns at 0 and the file as it was; nothing reconciles the file.
 
 use rusqlite::types::{FromSql, FromSqlError, FromSqlResult, ToSql, ToSqlOutput, ValueRef};
 use rusqlite::{Connection, OptionalExtension, Row, Transaction, params, params_from_iter};
@@ -331,6 +345,10 @@ pub struct Run {
     /// Commits the branch is ahead of `base_commit`.
     pub ahead: i64,
     pub worktree_note: Option<String>,
+    /// The size of the transcript file when the run ended; 0 when not recorded.
+    pub transcript_bytes: i64,
+    /// The transcript hit its size cap and the rest of the output is not in it.
+    pub transcript_truncated: bool,
 }
 
 /// A run with the sensitive text. Owner and members only.
@@ -349,7 +367,7 @@ const RUN_SELECT: &str = "SELECT r.id, r.agent_id, u.name, p.key, i.number, r.re
         r.error, r.output_truncated, r.started, r.finished, r.created, r.created_by,
         r.worktree_path, r.branch, r.base_ref, r.base_commit, r.worktree_state, r.has_changes,
         r.changed_files, r.ahead, r.worktree_note,
-        r.message, r.output_tail
+        r.message, r.output_tail, r.transcript_bytes, r.transcript_truncated
      FROM run r
      JOIN agent a ON a.id = r.agent_id
      JOIN user u ON u.id = a.user_id
@@ -390,6 +408,8 @@ fn run_row(row: &Row<'_>) -> rusqlite::Result<RunDetail> {
             changed_files: row.get(25)?,
             ahead: row.get(26)?,
             worktree_note: row.get(27)?,
+            transcript_bytes: row.get(30)?,
+            transcript_truncated: row.get(31)?,
         },
         message: row.get(28)?,
         output_tail: row.get(29)?,
@@ -790,6 +810,24 @@ pub struct Outcome {
     /// that ends this way and is not a cancel gets its working copy recorded as
     /// `kept` (see the module docs), a cancel is settled later.
     pub worktree: Option<WorktreeEnd>,
+    /// What the transcript file held when the runner finished it; `None` when
+    /// there is none (or, for a cancel, it is recorded later).
+    pub transcript: Option<TranscriptEnd>,
+}
+
+/// The state of a finished transcript file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TranscriptEnd {
+    /// The file's size in bytes, after the runner's last write and sync.
+    pub bytes: i64,
+    /// The size cap was reached.
+    pub truncated: bool,
+}
+
+/// The transcript file of a run under the data folder `root`:
+/// `<root>/transcripts/<run id>.log`.
+pub fn transcript_path(root: &std::path::Path, run_id: i64) -> std::path::PathBuf {
+    root.join("transcripts").join(format!("{run_id}.log"))
 }
 
 impl Outcome {
@@ -801,6 +839,7 @@ impl Outcome {
             output_tail: String::new(),
             truncated: false,
             worktree: None,
+            transcript: None,
         }
     }
 
@@ -840,8 +879,9 @@ pub fn finish_run(
     let error = outcome.error.as_deref().map(|e| clip(e, MAX_ERROR_CHARS));
     tx.execute(
         "UPDATE run SET status = ?1, exit_code = ?2, error = ?3, output_tail = ?4,
-                        output_truncated = ?5, finished = ?6
-         WHERE id = ?7",
+                        output_truncated = ?5, finished = ?6, transcript_bytes = ?7,
+                        transcript_truncated = ?8
+         WHERE id = ?9",
         params![
             outcome.status,
             outcome.exit_code,
@@ -849,6 +889,10 @@ pub fn finish_run(
             outcome.output_tail,
             outcome.truncated,
             now,
+            outcome.transcript.map_or(0, |t| t.bytes.max(0)),
+            outcome
+                .transcript
+                .is_some_and(|t| t.truncated && t.bytes > 0),
             run_id
         ],
     )?;
@@ -878,6 +922,9 @@ pub fn finish_run(
     if let (Some(end), Some(map)) = (&worktree, payload.as_object_mut()) {
         map.insert("worktree_state".into(), json!(end.state));
         map.insert("has_changes".into(), json!(end.has_changes));
+    }
+    if let (Some(transcript), Some(map)) = (outcome.transcript, payload.as_object_mut()) {
+        map.insert("transcript_bytes".into(), json!(transcript.bytes.max(0)));
     }
     emit_as(
         tx,
@@ -1013,6 +1060,27 @@ pub fn record_output(
         params![output_tail, truncated, exit_code, run_id],
     )?;
     Ok(())
+}
+
+/// Records what the transcript file held for a run that is already finished
+/// (a cancel finishes the run before the process is stopped, and a run that
+/// exited at the same moment is finished by the cancel). Changes nothing for
+/// an active run or one whose transcript is recorded already, so a repeat is
+/// harmless. Returns whether it recorded.
+pub fn record_transcript(
+    tx: &Transaction<'_>,
+    run_id: i64,
+    end: TranscriptEnd,
+) -> Result<bool, StoreError> {
+    if end.bytes <= 0 {
+        return Ok(false);
+    }
+    let changed = tx.execute(
+        "UPDATE run SET transcript_bytes = ?1, transcript_truncated = ?2
+         WHERE id = ?3 AND status NOT IN ('starting', 'running') AND transcript_bytes = 0",
+        params![end.bytes, end.truncated, run_id],
+    )?;
+    Ok(changed > 0)
 }
 
 /// Selects what [`list_runs`] returns.

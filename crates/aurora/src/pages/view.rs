@@ -2196,8 +2196,13 @@ fn run_time(label: &str, at: Option<i64>) -> Markup {
 }
 
 fn runs_list(key: &str, runs: &[Run]) -> Markup {
+    // The newest active run is the one whose output the issue page follows.
+    let live = runs
+        .iter()
+        .find(|run| run.status.is_active())
+        .map(|run| run.id);
     html! {
-        section #runs.runs aria-labelledby="runs-heading" {
+        section #runs.runs aria-labelledby="runs-heading" data-live-run=[live] {
             h2 #runs-heading { "Runs" }
             @if runs.is_empty() {
                 p.empty { "No runs yet." }
@@ -2217,6 +2222,12 @@ fn runs_list(key: &str, runs: &[Run]) -> Markup {
                             (run_time("finished", run.finished))
                             @if let Some(code) = run.exit_code {
                                 " " span.meta { "exit " (code) }
+                            }
+                            @if run.status.is_active() {
+                                " "
+                                button type="button" data-action="cancel-run" data-run-id=(run.id) {
+                                    "Cancel"
+                                }
                             }
                             @if run.worktree_state != WorktreeState::None {
                                 " " (worktree_chip(run))
@@ -2324,21 +2335,46 @@ pub fn run_fragment(data: &RunPageData) -> Markup {
             }
             h2 { "First message" }
             pre.run-text { (data.detail.message) }
-            h2 { "Output" }
-            @if run.output_truncated {
-                p.hint { "Only the last part of the output is kept." }
-            }
-            @if data.detail.output_tail.is_empty() {
-                p.empty {
-                    @if run.status.is_active() {
-                        "Nothing yet. The output is recorded when the run ends."
-                    } @else {
-                        "The process printed nothing."
-                    }
+        }
+    }
+}
+
+/// The output of a run. The server renders the tail kept on the run row (the
+/// whole page works without script); the script then replaces it by the
+/// stored transcript and, while the run is active, polls for more
+/// (`GET /api/v1/runs/{id}/transcript`). It lives outside the fragment that
+/// is swapped as the run changes, so a refresh never resets it. `id` is the
+/// panel's element id; `run` and `tail` are absent for the issue page's panel,
+/// which the script points at the issue's active run.
+fn output_panel(id: &str, run: Option<&Run>, tail: &str) -> Markup {
+    let active = run.is_some_and(|r| r.status.is_active());
+    let run_id = run.map(|r| r.id);
+    html! {
+        section.run-output id=(id) aria-labelledby={ (id) "-heading" }
+            data-run-id=[run_id] data-active=(active) hidden[run.is_none()] {
+            div.output-head {
+                h2 id={ (id) "-heading" } { "Output" }
+                span.meta data-role="state" role="status" {}
+                label.output-follow data-role="follow-label" hidden {
+                    input type="checkbox" data-role="follow" checked;
+                    " Follow"
                 }
-            } @else {
-                pre.run-text { (data.detail.output_tail) }
+                a.output-download data-role="download" href=[run_id.map(|n| format!("/api/v1/runs/{n}/transcript.txt?download=1"))] {
+                    "Download"
+                }
             }
+            @if run.is_some_and(|r| r.output_truncated) {
+                p.hint { "Only the last part of the output is shown until the full transcript loads." }
+            }
+            p.empty data-role="empty" hidden[!tail.is_empty()] {
+                @if active {
+                    "Nothing yet."
+                } @else {
+                    "The process printed nothing."
+                }
+            }
+            pre.run-text.transcript data-role="view" tabindex="0" hidden[tail.is_empty()] { (tail) }
+            button type="button" data-action="more-output" data-role="more" hidden { "Load more" }
         }
     }
 }
@@ -2368,6 +2404,7 @@ pub fn run_page(data: &RunPageData) -> Markup {
                 }
                 p.field-msg #page-msg role="alert" {}
                 (run_fragment(data))
+                (output_panel("run-output", Some(run), &data.detail.output_tail))
             }
         },
     )
@@ -2457,6 +2494,7 @@ pub fn issue_page(data: &IssueData) -> Markup {
                         (links_section(&data.detail.links, issue.blocked, key, &lookup))
                         (documents_section(&data.detail.documents, key))
                         (runs_list(key, &data.runs))
+                        (output_panel("issue-output", None, ""))
                         (comments_list(&data.comments, &data.user))
                         (activity_list(&data.activity, &lookup))
                     }

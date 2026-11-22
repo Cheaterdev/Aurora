@@ -137,6 +137,12 @@ fn api_tables() -> (Table, Table) {
         .route("/runs", &["GET"], get(runs::list_runs))
         .route("/runs/{id}", &["GET"], get(runs::get_run))
         .route("/runs/{id}/cancel", &["POST"], post(runs::cancel_run))
+        .route("/runs/{id}/transcript", &["GET"], get(runs::get_transcript))
+        .route(
+            "/runs/{id}/transcript.txt",
+            &["GET"],
+            get(runs::get_transcript_text),
+        )
         .route("/prompt/variables", &["GET"], get(prompts::variables))
         .route(
             "/projects",
