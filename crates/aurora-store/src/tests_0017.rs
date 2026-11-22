@@ -46,7 +46,7 @@ async fn populated_version_sixteen_database_gets_the_queue_columns_and_a_backup(
     drop(raw);
 
     let store = Store::open(&path).unwrap();
-    assert_eq!(store.schema_version(), 17);
+    assert_eq!(store.schema_version(), 18);
     let backup = store.open_report().backup.clone().expect("backup taken");
     let old = Connection::open(&backup).unwrap();
     let has_queued_at: i64 = old

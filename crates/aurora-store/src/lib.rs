@@ -964,6 +964,8 @@ mod tests_0016;
 #[cfg(test)]
 mod tests_0017;
 #[cfg(test)]
+mod tests_0018;
+#[cfg(test)]
 mod tests_actor;
 #[cfg(test)]
 mod tests_agents;

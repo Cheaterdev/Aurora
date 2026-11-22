@@ -269,6 +269,8 @@ pub struct AgentsData {
     pub owner: bool,
     pub agents: Vec<Agent>,
     pub projects: Vec<Project>,
+    /// The "Housekeeping" panel's content; owner only (`None` for anyone else).
+    pub housekeeping: Option<crate::housekeeping::Report>,
 }
 
 pub struct AgentData {
@@ -301,6 +303,7 @@ pub fn load_agents(conn: &Connection, reader: &Principal) -> Result<AgentsData, 
         owner: reader.is_owner(),
         agents: agents::list_agents(conn, reader)?,
         projects: projects::list_projects(conn)?,
+        housekeeping: None,
     })
 }
 

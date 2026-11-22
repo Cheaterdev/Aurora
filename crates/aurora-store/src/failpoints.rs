@@ -18,6 +18,7 @@
 //! | `run_after_transcript_write`   | runner, a batch of output appended to the transcript, process still running | same; the transcript file is readable up to its last complete line |
 //! | `run_after_queue`              | runner, a run committed as `queued` (limits reached), nothing else done   | the run is still `queued`, no key, no process; it is promoted once, never twice |
 //! | `run_after_promote`            | scheduler, a queued run committed as `starting` (key, plan), not spawned  | the run is `interrupted` (it was active), key revoked; nothing starts twice |
+//! | `reconcile_after_kill`         | start-up, a leftover process was killed, the database not yet updated    | the next start finds it gone ("process already gone"); the run ends `interrupted` once, one comment, one card move |
 //!
 //! `before_commit` and `after_commit` are in [`crate::Store::write`], so they
 //! cover every write of the server except the start-up and hourly purge of old
@@ -55,10 +56,11 @@ pub enum Point {
     RunAfterTranscriptWrite,
     RunAfterQueue,
     RunAfterPromote,
+    ReconcileAfterKill,
 }
 
 impl Point {
-    pub const ALL: [Point; 13] = [
+    pub const ALL: [Point; 14] = [
         Point::BeforeCommit,
         Point::AfterCommit,
         Point::AfterCommitBeforeResponse,
@@ -72,6 +74,7 @@ impl Point {
         Point::RunAfterTranscriptWrite,
         Point::RunAfterQueue,
         Point::RunAfterPromote,
+        Point::ReconcileAfterKill,
     ];
 
     pub fn name(self) -> &'static str {
@@ -89,6 +92,7 @@ impl Point {
             Point::RunAfterTranscriptWrite => "run_after_transcript_write",
             Point::RunAfterQueue => "run_after_queue",
             Point::RunAfterPromote => "run_after_promote",
+            Point::ReconcileAfterKill => "reconcile_after_kill",
         }
     }
 

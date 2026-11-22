@@ -21,6 +21,7 @@
 //! The test fails, after printing a summary, if any violation was seen.
 
 use std::collections::BTreeMap;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -392,6 +393,34 @@ fn worker(shared: &Shared, id: u64, run: u64) {
 /// The overall run limit the soak server runs with.
 const MAX_RUNS: i64 = 2;
 const SERVER_ENV: &[(&str, &str)] = &[("AURORA_MAX_RUNS", "2")];
+
+/// Pids of agents the soak's servers started that are still the same live
+/// process (same recorded creation time). Never matches by name, so it cannot
+/// be fooled by (or blame) anybody else's `fake_agent`.
+fn stray_agents(db: &Path) -> Vec<i64> {
+    let conn = aurora_store::rusqlite::Connection::open_with_flags(
+        db,
+        aurora_store::rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .expect("open read-only");
+    let mut stmt = conn
+        .prepare("SELECT pid, pid_started_at FROM run WHERE pid IS NOT NULL AND pid_started_at IS NOT NULL")
+        .expect("prepare");
+    let rows: Vec<(i64, i64)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .expect("query")
+        .filter_map(Result::ok)
+        .collect();
+    rows.into_iter()
+        .filter(|(pid, started)| {
+            u32::try_from(*pid)
+                .ok()
+                .and_then(aurora::runner::process_identity)
+                == Some(*started)
+        })
+        .map(|(pid, _)| pid)
+        .collect()
+}
 
 fn fake_agent() -> std::path::PathBuf {
     let name = format!("fake_agent{}", std::env::consts::EXE_SUFFIX);
@@ -968,10 +997,18 @@ fn kill_loop_soak() {
         soak.server.kill();
         soak.totals.kills += 1;
         soak.check("the final kill", true);
-        // Agents of the killed servers end by themselves after two seconds;
-        // let them go before the data folder is removed.
+        // Agents of the killed servers die with them (job objects) or end by
+        // themselves after two seconds; let them go before the data folder is
+        // removed, then prove none of the agents the soak started is left: every
+        // recorded (pid, creation time) must be gone.
         std::thread::sleep(Duration::from_secs(3));
         assert_checks_green_or_note(&soak);
+        let strays = stray_agents(&db);
+        if !strays.is_empty() {
+            locked(&shared.violations).push(format!(
+                "fake agents still running after the final shutdown: {strays:?}"
+            ));
+        }
     }
 
     let violations = locked(&shared.violations).clone();

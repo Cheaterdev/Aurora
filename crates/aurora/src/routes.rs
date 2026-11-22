@@ -135,6 +135,11 @@ fn api_tables() -> (Table, Table) {
         )
         .route("/agents/{id}/runs", &["POST"], post(runs::start_run))
         .route("/queue", &["GET"], get(runs::get_queue))
+        .route(
+            "/admin/housekeeping",
+            &["GET"],
+            get(crate::housekeeping::get_report),
+        )
         .route("/runs", &["GET"], get(runs::list_runs))
         .route("/runs/{id}", &["GET"], get(runs::get_run))
         .route("/runs/{id}/cancel", &["POST"], post(runs::cancel_run))

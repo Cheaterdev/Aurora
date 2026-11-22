@@ -46,6 +46,7 @@ command exits with 2 and says so; check a copy then.
 | `prompt_templates.valid` | every stored prompt template parses and uses only known variables, and its issue type belongs to its project, so a run can never start from a template that fails validation |
 | `runs.no_orphans` | an active run (`starting`/`running`) has a live key of its agent's user, no finish time, and a pid once `running`; a finished run has a finish time and no live key. (Foreign keys and a unique index cover missing rows and two active runs on one issue.) Offline (`aurora check`) an active run is allowed, because nobody can say whether its process lives; the server's own check right after start-up also demands that every active run belongs to the current boot |
 | `runs.queue` | a `queued` run has a queue time, no start or finish time, no process, no key, no working copy and no transcript; every run has a `run.created` event; a queued run has no `run.promoted`, `run.started` or `run.finished` in the log. How many runs are going is deliberately **not** checked against any limit: limits can be lowered while runs are going, and those finish on their own. (A second active run for an issue is impossible by the unique index, which counts `queued`.) |
+| `runs.reconciled` | a run that start-up interrupted ("server restarted") and whose process start time was recorded has a `reaped` note; only an interrupted run has one; a recorded process start comes with a pid. Rows from before migration 0018 are never flagged |
 | `runs.worktrees` | a run's working copy is consistent with its row: a planned, kept or removed worktree has a folder path, a branch and the repository it belongs to; `removed` never goes with changes (`has_changes`, changed files or commits ahead); a run with no working copy (or one not yet settled) reports no changes; a run that is still active is not `kept` or `removed` yet; and a finished run is no longer `created` (a canceled run may be for the moment before its process is reaped). Only the database can fail this check. A folder that is missing for a `kept` copy, or still there for a `removed` one, is reported as a note and never fails, because the disk can legitimately differ (a person removed it by hand) |
 | `runs.transcripts` | a run's recorded transcript size and truncation flag make sense (nothing recorded while the run is active; truncated only with a size), and a recorded size equals the size of `<folder of the database>/transcripts/<run id>.log`: the runner records it once, after its last write and sync, so a different size means the file was edited, cut or replaced. A size of 0 means "not recorded" (a crash, or a run that never had a process) and is never compared, because a crashed run's file may hold more than anyone recorded. A missing file is only a note (a copy of the database checked elsewhere, a backup without the data folder, a person who moved it) |
 
@@ -95,12 +96,13 @@ named place in the write path. They are listed in one place,
 | `mid_migration` | inside a migration's transaction, SQL run, version not recorded | old schema intact; the next start backs up and migrates once |
 | `mid_ack` | consumer ack transaction, cursor updated, not committed | the cursor where it was; the events are delivered again |
 | `run_after_create` | runner, run row committed as `starting`, process not spawned | the run is `interrupted` ("server restarted"), its key revoked, no second run for the event |
-| `run_after_spawn` | runner, process spawned, run not yet marked `running` | same; the stray process is for TRK-45 to reap |
+| `run_after_spawn` | runner, process spawned, run not yet marked `running` | same; on Windows the job died with the server, so no process is left (note `pid unknown`) |
 | `run_before_finish` | runner, process exited, the finish not yet committed | same |
 | `run_after_worktree` | runner, the run's git worktree and branch made, process not spawned | the run is `interrupted`, its working copy is `kept` (never claimed removed, never deleted), the folder and the branch are still there, no second run; the leftover is for a person to remove (see "Working copies") |
 | `run_after_transcript_write` | runner, a batch of output appended to the run's transcript, the process still running | the run is `interrupted` ("server restarted"), no second run, `aurora check` passes; the transcript file exists and is readable up to its last complete line (a half-written last line is ignored, never an error); its size is not recorded (`transcript_bytes` 0) and no end marker was written |
 | `run_after_queue` | runner, a run committed as `queued` (a limit was reached), nothing else done | after the restart the run is still `queued` (no key, no process, no worktree), it is promoted and runs exactly once, the redelivered trigger makes no second run, `aurora check` passes |
 | `run_after_promote` | scheduler, a queued run committed as `starting` (key minted, working copy planned, message written), process not spawned | the run is `interrupted` ("server restarted") like any run that was active, its key is revoked, nothing starts twice, `aurora check` passes |
+| `reconcile_after_kill` | start-up, a leftover process was killed, the database not yet updated | the next start finds the process gone (`process already gone`); the run ends `interrupted` once, with one comment and one card move; `aurora check` passes |
 
 Arm one with `AURORA_TEST_FAILPOINT=<name>` (first hit) or `<name>:<n>` (the n-th
 hit of that point in this process). `before_commit` and `after_commit` cover
@@ -173,10 +175,61 @@ rules are in `docs/api.md` (Runs); this is what runs where.
   the child leads its own process group and the group gets the signal.
   Nothing besides the aurora binary and the agent's command is needed, except
   `git` when a project has a repository (see "Working copies").
-- **Not yet.** A process is not tied to the server: if the server is killed the
-  agent keeps running until it ends by itself, and its key is already revoked at
-  the next start. Job objects / process groups that die with the server, and
-  reaping strays, are TRK-45.
+- **Containment (TRK-45).**
+  *Windows:* each run's agent starts suspended, is put in a job object of its own
+  (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, no breakaway flag) and only then
+  resumed, so it cannot start a grandchild before it is contained. When the
+  server process ends in any way (crash, `taskkill /F`), the OS closes the job
+  and kills the agent and all its descendants. Cancel, timeout and shutdown
+  call `TerminateJobObject` (instant, whole tree); when the agent exits by
+  itself, whatever it left running in the job is killed too. A child that asks
+  for `CREATE_BREAKAWAY_FROM_JOB` is refused by the OS. Jobs nest on Windows 8
+  and later, so a server started inside another job (terminal, IDE, service
+  host) still works. If a job cannot be made or the process cannot be assigned,
+  a warning is logged and that run falls back to `taskkill /T /F` (it then does
+  **not** die with the server). The code is the only `unsafe` in the server:
+  `crates/aurora/src/runner/platform/windows.rs`, using `windows-sys`.
+  *Elsewhere (best effort, written but **not run** on the machine that made
+  it):* the agent leads its own process group; cancel/timeout/shutdown send
+  `SIGTERM`, wait 300 ms and send `SIGKILL` to the group with the `kill`
+  program. It does **not** die with the server (no `PR_SET_PDEATHSIG`, no
+  cgroup), and a descendant that calls `setsid` or double-forks leaves the
+  group. Start-up reconciliation (below) is the safety net there, and only on
+  Linux (identity comes from `/proc`; without `/proc` a leftover is left alone).
+- **At start-up, in order.** For every run left `starting`/`running` by an
+  earlier boot: (1) its recorded pid is looked at; it is killed with its tree
+  **only if** a process with that pid exists and its creation time equals
+  `run.pid_started_at` (never by name; Windows: `taskkill /T /F` on the
+  verified pid, because a job cannot be recovered after a restart); a pid whose
+  creation time differs is left alone. (2) One transaction marks the run
+  `interrupted` ("server restarted"), revokes its key, stores the `reaped` note
+  (`killed leftover process <pid>`, `process already gone`, `pid reused, left
+  alone`, `pid unknown`), adds an `[Aurora]` comment on the issue (as the run's
+  agent: no paths, no secrets, the branch of a kept working copy) and, if the
+  issue's card is in a `started` column, moves it to the end of the first
+  `unstarted` column (a card a person moved is left alone; without such a column
+  the comment says so). Only start-up does this; cancel, timeout, failure and a
+  clean shutdown add no comment and move no card. A second start-up finds
+  nothing active and changes nothing. (3) The data folder is scanned (see
+  "Housekeeping"). (4) The dispatcher and scheduler start, which may promote
+  runs that were *queued* before (a person or rule queued them). **Nothing is
+  restarted:** an interrupted run is never run again. The crash test is
+  `reconcile_after_kill` (a process killed, the database not yet updated).
+- **Honest limits.** A leftover whose agent already died but whose
+  grandchildren live on cannot be found after a restart (Windows jobs make this
+  case rare; elsewhere it exists). The check-then-kill of a pid is not atomic.
+  If the server itself runs in a job that forbids nested jobs, every run uses the
+  taskkill fallback.
+
+## Housekeeping (reported, never deleted)
+
+`GET /api/v1/admin/housekeeping` (owner only) and the "Housekeeping" panel of
+the Agents page list: entries of `<data folder>/worktrees/` that no run accounts
+for (unknown), runs whose `created`/`kept` working copy folder is missing, the
+kept copies, and the `reaped` note of every reconciled run. The server also logs
+one line per unknown or missing copy at start-up. Aurora **never** deletes one;
+see "Working copies" for the manual commands. An unknown folder may be a copy of
+a run from a database that was restored from a backup: look inside first.
 
 ## Limits and the queue
 
@@ -309,9 +362,8 @@ Windows that is Git for Windows and nothing else is needed, WSL included.
 - **Crashes.** If the server dies after a worktree was made, the next start marks
   the run `interrupted` and its working copy `kept`, without touching the disk
   (`run_after_worktree` is the crash test). A copy left by a crash can therefore
-  be a stray, and nothing deletes it: it is for a person. (Reporting kept and
-  unknown copies when the server starts is TRK-45's job; it must report them and
-  still never delete one automatically.)
+  be a stray, and nothing deletes it: it is for a person. Start-up reports kept
+  and unknown copies (see "Housekeeping") and never deletes one.
 - **Looking at and removing a kept copy.** The run page and the issue's Runs
   section show the branch, folder, base and the number of changed files. To
   remove one by hand once its work is no longer needed:
@@ -390,8 +442,9 @@ restart it:
   more than 2 runs `starting`/`running` and no run promoted or finished twice,
   and the invariant checks cover the rest (`runs.queue`, `runs.no_orphans`,
   event replay). Run `cargo build --examples -p aurora` first: the agent is an
-  example binary. A killed server leaves its fake agent running until its two
-  seconds are over; stopping agent processes with the server is not done yet.
+  example binary. A killed server's fake agents die with it on Windows (job
+  objects); at the end the soak lists the fake agents it started and fails if any
+  is still alive after the final shutdown (Windows).
 
 It prints a summary (kills, restarts, writes acknowledged, resends, checks,
 runs by status, duration) and fails on any violation. Memory stays bounded: only the unverified

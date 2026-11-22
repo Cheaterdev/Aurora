@@ -18,6 +18,12 @@ tower-http = { version = "0.7.1", default-features = false, features = ["catch-p
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
+[target.'cfg(windows)'.dependencies]
+# Job objects, process times and thread resume for the runner's containment
+# (src/runner/platform/windows.rs, the only place with `unsafe`). Already a
+# dependency of aurora-store, so nothing new is built.
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Diagnostics_ToolHelp", "Win32_System_JobObjects", "Win32_System_Threading"] }
+
 [dev-dependencies]
 # Feature unification: `cargo test` builds the server binary with the failpoints
 # compiled in; `cargo build` does not.

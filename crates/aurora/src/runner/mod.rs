@@ -42,14 +42,28 @@
 //!   that the runner is alive to see (a crash leaves no marker). The file's
 //!   size is recorded on the run when it ends.
 //!
-//! Children are killed as a tree on a best-effort basis only; they are not tied
-//! to the server's life (TRK-45 adds containment), so a hard-killed server can
-//! leave an agent process behind.
+//! * **Containment** (TRK-45, see `platform`): on Windows every agent runs in a
+//!   job object of its own that the OS closes, killing the whole tree, when the
+//!   server process ends however it ends; elsewhere the agent leads a process
+//!   group that is killed whole on cancel, timeout and shutdown (and does not die
+//!   with the server). Cancel, timeout and shutdown end the tree through the
+//!   same handle ([`platform::Contained`]); `taskkill /T /F` is the fallback
+//!   when no job could be made.
+//! * **Start-up** ([`Runner::start`]): for every run left active by a previous
+//!   boot, in this order, (1) its recorded process is looked at and, only when
+//!   its creation time still matches `pid_started_at`, killed with its tree
+//!   ([`reap`]); (2) one transaction marks the run `interrupted`, records the
+//!   `reaped` note, comments on the issue and moves a card out of the started
+//!   column (`runs::reconcile_startup_with`); (3) the data folder is scanned and
+//!   unknown or missing working copies are **reported, never deleted**
+//!   ([`crate::housekeeping`]); (4) the dispatcher and scheduler start. Nothing
+//!   is ever restarted: an interrupted run stays interrupted.
 
 mod capture;
 #[cfg_attr(windows, path = "platform/windows.rs")]
 #[cfg_attr(not(windows), path = "platform/other.rs")]
 mod platform;
+pub mod reap;
 mod spawn;
 
 use std::collections::HashMap;
@@ -95,6 +109,29 @@ pub struct Resolved {
     pub path: PathBuf,
     /// A `.cmd` / `.bat` file, run through `cmd.exe`.
     pub shim: bool,
+}
+
+/// What the system says is at a pid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Inspect {
+    /// No such process (or it has exited).
+    Gone,
+    /// A running process and when it was created: Windows, the 100 ns FILETIME;
+    /// Linux, clock ticks since boot. Only ever compared with a value taken the
+    /// same way.
+    Alive(i64),
+    /// The system would not say (no permission, or no way to ask).
+    Unreadable,
+}
+
+/// The identity of a running process: its creation time as recorded in
+/// `run.pid_started_at`. `None` when the process is gone or the system does
+/// not say. Public so tests can describe a process the way the runner does.
+pub fn process_identity(pid: u32) -> Option<i64> {
+    match platform::inspect(pid) {
+        Inspect::Alive(started) => Some(started),
+        Inspect::Gone | Inspect::Unreadable => None,
+    }
 }
 
 /// Knobs for tests; the defaults are what the server uses.
@@ -294,16 +331,40 @@ impl Runner {
     pub async fn start(store: Store, config: RunnerConfig) -> Result<Runner, StoreError> {
         let boot_id = runs::new_boot_id()?;
         let boot = boot_id.clone();
+        // 1. The processes first: a run is only marked once its process is
+        //    dealt with, so a crash in between is repeated safely (the second
+        //    look finds "process already gone").
+        let leftovers = store.read(move |c| runs::leftover_runs(c, &boot)).await?;
+        let mut notes = HashMap::new();
+        let mut killed = false;
+        for left in &leftovers {
+            let found = reap::reap(left.pid, left.pid_started_at).await;
+            tracing::warn!(
+                run = left.run_id, pid = ?left.pid, result = %found.note(),
+                "a run was active when the server last stopped"
+            );
+            killed |= matches!(found, reap::Reaped::Killed(_));
+            notes.insert(left.run_id, found.note());
+        }
+        if killed {
+            failpoints::hit(Point::ReconcileAfterKill);
+        }
+        // 2. One transaction: interrupted, note, comment, card.
+        let boot = boot_id.clone();
         let interrupted = store
-            .write_background(move |tx| runs::reconcile_startup(tx, now_millis(), &boot))
+            .write_background(move |tx| {
+                runs::reconcile_startup_with(tx, now_millis(), &boot, &notes)
+            })
             .await?;
         if !interrupted.is_empty() {
             tracing::warn!(
                 runs = ?interrupted,
-                "runs were still active when the server last stopped; marked them interrupted \
-                 (a process they started may still be running: TRK-45 will find those)"
+                "marked the runs that were still active when the server last stopped interrupted; \
+                 nothing is restarted"
             );
         }
+        // 3. Report what is on disk and not accounted for; delete nothing.
+        crate::housekeeping::log_at_startup(&store, &config.data_dir).await;
         let boot = boot_id.clone();
         let report = store
             .read(move |c| Ok(aurora_store::invariants::check_with_boot(c, &boot)))
@@ -1062,12 +1123,19 @@ impl Runner {
             Err(_) => return fail("preparing the process failed unexpectedly".into()),
         };
         let spawn::Prepared { mut command, stdin } = prepared;
-        let mut child = match command.spawn() {
-            Ok(child) => child,
+        let (mut child, contained) = match platform::spawn(&mut command) {
+            Ok(started) => started,
             Err(err) => return fail(format!("could not start the agent's command: {err}")),
         };
         let pid = child.id().unwrap_or(0);
         control.pid.store(pid, Ordering::SeqCst);
+        tracing::debug!(
+            run = run_id,
+            pid,
+            held_by = contained.kind(),
+            "agent process started"
+        );
+        let started_at = process_identity(pid);
         failpoints::hit(Point::RunAfterSpawn);
 
         let tail: SharedTail = Arc::new(Mutex::new(Tail::new(OUTPUT_TAIL_BYTES)));
@@ -1119,7 +1187,7 @@ impl Runner {
             .inner
             .store
             .write_background(move |tx| {
-                runs::mark_running(tx, now_millis(), run_id, i64::from(pid))
+                runs::mark_running_process(tx, now_millis(), run_id, i64::from(pid), started_at)
             })
             .await;
         let mut stop = control.stop.subscribe();
@@ -1132,7 +1200,7 @@ impl Runner {
         let end = match started {
             Err(StoreError::Rejected(_)) => {
                 // Canceled while starting: whoever canceled already finished it.
-                platform::kill_tree(pid).await;
+                contained.kill(pid).await;
                 let _ = child.kill().await;
                 if let Some(ticker) = &ticker {
                     ticker.abort();
@@ -1155,10 +1223,13 @@ impl Runner {
         };
         let mut code = None;
         match &end {
-            End::Exited(Ok(status)) => code = status.code(),
-            End::Exited(Err(_)) => {}
+            End::Exited(Ok(status)) => {
+                code = status.code();
+                contained.release();
+            }
+            End::Exited(Err(_)) => contained.release(),
             End::TimedOut | End::Stopped(_) | End::Lost(_) => {
-                platform::kill_tree(pid).await;
+                contained.kill(pid).await;
                 let _ = child.kill().await;
                 if let Ok(status) = child.wait().await {
                     code = status.code();

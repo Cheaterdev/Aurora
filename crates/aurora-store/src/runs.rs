@@ -46,6 +46,17 @@
 //!   [`reconcile_startup`] marks every active run of another boot `interrupted`
 //!   before the runner consumes anything.
 //!
+//! # Start-up reconciliation (TRK-45)
+//!
+//! The runner first looks at the process of every leftover active run
+//! ([`leftover_runs`]: pid and `pid_started_at`, kills it only when its creation
+//! time still matches) and then calls [`reconcile_startup_with`] with what it
+//! found. That one transaction marks each run `interrupted`, records `reaped`,
+//! comments on the issue as the run's agent and moves a card that is still in a
+//! `started` column back to the first `unstarted` one. Runs that end any other
+//! way (cancel, timeout, failure, a clean shutdown) get none of this: a person
+//! sees those happen. Nothing is ever restarted.
+//!
 //! # Secrets
 //!
 //! The first message and the captured output can hold secrets (a person's
@@ -105,6 +116,8 @@
 //! [`record_transcript`]. **No event is written per chunk.** A crash leaves
 //! the columns at 0 and the file as it was; nothing reconciles the file.
 
+use std::collections::HashMap;
+
 use rusqlite::types::{FromSql, FromSqlError, FromSqlResult, ToSql, ToSqlOutput, ValueRef};
 use rusqlite::{Connection, OptionalExtension, Row, Transaction, params, params_from_iter};
 use serde::Serialize;
@@ -113,7 +126,9 @@ use serde_json::json;
 use crate::StoreError;
 use crate::agents;
 use crate::auth::{self, Principal, Role, Scope};
-use crate::projects::{conflict, emit_as, invalid, not_found, refusal};
+use crate::comments::{self, NewComment};
+use crate::issues::{self, MoveTarget};
+use crate::projects::{StateType, conflict, emit_as, invalid, not_found, refusal};
 
 /// The last this many bytes of output are kept.
 pub const OUTPUT_TAIL_BYTES: usize = 64 * 1024;
@@ -394,6 +409,11 @@ pub struct Run {
     /// 1-based place among all queued runs, oldest first; `None` unless the
     /// run is `queued`. Computed when read.
     pub queue_position: Option<i64>,
+    /// What start-up reconciliation found of this run's process when it
+    /// marked the run `interrupted` (TRK-45): `killed leftover process <pid>`,
+    /// `process already gone`, `pid reused, left alone` or `pid unknown`.
+    /// `None` for every other run. Hidden from agents (it names a pid).
+    pub reaped: Option<String>,
 }
 
 /// A run with the sensitive text. Owner and members only.
@@ -416,7 +436,7 @@ const RUN_SELECT: &str = "SELECT r.id, r.agent_id, u.name, p.key, i.number, r.re
         CASE WHEN r.status = 'queued' THEN
             (SELECT COUNT(*) FROM run q WHERE q.status = 'queued'
                 AND (q.queued_at < r.queued_at OR (q.queued_at = r.queued_at AND q.id <= r.id)))
-        END
+        END, r.reaped
      FROM run r
      JOIN agent a ON a.id = r.agent_id
      JOIN user u ON u.id = a.user_id
@@ -461,6 +481,7 @@ fn run_row(row: &Row<'_>) -> rusqlite::Result<RunDetail> {
             transcript_truncated: row.get(31)?,
             queued_at: row.get(32)?,
             queue_position: row.get(33)?,
+            reaped: row.get(34)?,
         },
         message: row.get(28)?,
         output_tail: row.get(29)?,
@@ -1267,10 +1288,24 @@ pub fn mark_running(
     run_id: i64,
     pid: i64,
 ) -> Result<(), StoreError> {
+    mark_running_process(tx, now, run_id, pid, None)
+}
+
+/// [`mark_running`] that also records when the process was created (see
+/// `pid_started_at` in migration 0018), so a later start-up can tell this
+/// process from a new one that got the same pid. `None` when the system would
+/// not say.
+pub fn mark_running_process(
+    tx: &Transaction<'_>,
+    now: i64,
+    run_id: i64,
+    pid: i64,
+    pid_started_at: Option<i64>,
+) -> Result<(), StoreError> {
     let changed = tx.execute(
-        "UPDATE run SET status = 'running', pid = ?1, started = ?2
-         WHERE id = ?3 AND status = 'starting'",
-        params![pid, now, run_id],
+        "UPDATE run SET status = 'running', pid = ?1, started = ?2, pid_started_at = ?3
+         WHERE id = ?4 AND status = 'starting'",
+        params![pid, now, pid_started_at, run_id],
     )?;
     if changed == 0 {
         get_run(tx, run_id)?;
@@ -1670,22 +1705,90 @@ fn ids_of(tx: &Transaction<'_>, sql: &str, boot_id: &str) -> Result<Vec<i64>, St
     Ok(rows.collect::<Result<_, _>>()?)
 }
 
-/// At start-up, before anything consumes events: every active run that
-/// belongs to another boot was orphaned by a crash. Each becomes
-/// `interrupted` ("server restarted") and its key is revoked, in one
-/// transaction. Returns the ids. Does not touch processes: a process that
-/// outlived a hard kill is for the supervisor (TRK-45) to find.
+/// An active run of an earlier boot and what is known of its process: what
+/// start-up reconciliation has to look at before it marks the run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Leftover {
+    pub run_id: i64,
+    pub pid: Option<i64>,
+    /// The process's creation time as recorded when it started; see migration
+    /// 0018.
+    pub pid_started_at: Option<i64>,
+}
+
+/// Every `starting` or `running` run that does not belong to `boot_id`, oldest
+/// first.
+pub fn leftover_runs(conn: &Connection, boot_id: &str) -> Result<Vec<Leftover>, StoreError> {
+    let mut stmt = conn.prepare(
+        "SELECT id, pid, pid_started_at FROM run
+         WHERE status IN ('starting', 'running') AND boot_id <> ?1 ORDER BY id",
+    )?;
+    let rows = stmt.query_map([boot_id], |row| {
+        Ok(Leftover {
+            run_id: row.get(0)?,
+            pid: row.get(1)?,
+            pid_started_at: row.get(2)?,
+        })
+    })?;
+    Ok(rows.collect::<Result<_, _>>()?)
+}
+
+/// The note recorded when the caller found out nothing about a process.
+pub const NOT_CHECKED: &str = "process not checked";
+
+/// [`reconcile_startup_with`] for a caller that did not look at any process.
 pub fn reconcile_startup(
     tx: &Transaction<'_>,
     now: i64,
     boot_id: &str,
+) -> Result<Vec<i64>, StoreError> {
+    reconcile_startup_with(tx, now, boot_id, &HashMap::new())
+}
+
+/// At start-up, before anything consumes events: every active run that
+/// belongs to another boot was orphaned by a crash. Each becomes
+/// `interrupted` ("server restarted") and its key is revoked, in one
+/// transaction, which also (TRK-45)
+///
+/// * records in `reaped` what the caller found of its process (`notes`, by run
+///   id; [`NOT_CHECKED`] without one),
+/// * adds a comment on the issue, written as the run's agent and starting with
+///   `[Aurora]` (it says what happened and names the working copy's branch,
+///   never a path or a secret), and
+/// * when the issue's card is in a column of the `started` kind, moves it to
+///   the end of the project's first `unstarted` column (a card a person
+///   already moved is left where it is; with no such column the comment says
+///   the card stayed).
+///
+/// A run is only reconciled while it is active, so a second start-up finds
+/// nothing to do and adds no second comment or move. Returns the ids. The
+/// processes themselves are the runner's business (`runner::reap`): this
+/// function never touches one.
+pub fn reconcile_startup_with(
+    tx: &Transaction<'_>,
+    now: i64,
+    boot_id: &str,
+    notes: &HashMap<i64, String>,
 ) -> Result<Vec<i64>, StoreError> {
     let ids = ids_of(
         tx,
         "SELECT id FROM run WHERE status IN ('starting', 'running') AND boot_id <> ?1 ORDER BY id",
         boot_id,
     )?;
-    let done = interrupt(tx, now, ids, "server restarted")?;
+    let mut done = Vec::new();
+    for id in ids {
+        let outcome = Outcome::new(RunStatus::Interrupted).error("server restarted");
+        if !finish_run(tx, now, None, id, outcome)? {
+            continue;
+        }
+        let note = notes.get(&id).map_or(NOT_CHECKED, String::as_str);
+        tx.execute(
+            "UPDATE run SET reaped = ?1 WHERE id = ?2",
+            params![clip(note, MAX_REAPED_CHARS), id],
+        )?;
+        explain_interruption(tx, now, id, note)?;
+        done.push(id);
+    }
     // A working copy still `created` under another boot was never looked at
     // (a crash, or a cancel whose process was still being stopped). Without
     // touching the disk, the safe reading is "may have changes".
@@ -1696,6 +1799,97 @@ pub fn reconcile_startup(
         [boot_id],
     )?;
     Ok(done)
+}
+
+const MAX_REAPED_CHARS: usize = 200;
+
+/// The comment and the card move of [`reconcile_startup_with`] for one run
+/// that was just interrupted, written as its agent's user.
+fn explain_interruption(
+    tx: &Transaction<'_>,
+    now: i64,
+    run_id: i64,
+    note: &str,
+) -> Result<(), StoreError> {
+    type Found = (
+        i64,
+        String,
+        i64,
+        i64,
+        Option<String>,
+        WorktreeState,
+        StateType,
+    );
+    let (project_id, project, number, user_id, branch, worktree, column): Found = tx.query_row(
+        "SELECT p.id, p.key, i.number, a.user_id, r.branch, r.worktree_state, c.state_type
+         FROM run r
+         JOIN issue i ON i.id = r.issue_id
+         JOIN project p ON p.id = r.project_id
+         JOIN agent a ON a.id = r.agent_id
+         JOIN \"column\" c ON c.id = i.column_id
+         WHERE r.id = ?1",
+        [run_id],
+        |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
+            ))
+        },
+    )?;
+    let actor = Principal {
+        user_id,
+        role: Role::Agent,
+        scope: Scope::Write,
+    };
+    let mut body = format!(
+        "[Aurora] Run {run_id} was interrupted because the server restarted. Process: {note}."
+    );
+    if let (WorktreeState::Kept, Some(branch)) = (worktree, branch) {
+        body.push_str(&format!(" Working copy: kept on branch {branch}."));
+    }
+    if column == StateType::Started {
+        let target: Option<(i64, String)> = tx
+            .query_row(
+                "SELECT id, name FROM \"column\"
+                 WHERE project_id = ?1 AND state_type = 'unstarted' ORDER BY position, id LIMIT 1",
+                [project_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        match target {
+            Some((column_id, name)) => {
+                issues::move_issue(
+                    tx,
+                    now,
+                    &actor,
+                    &project,
+                    number,
+                    MoveTarget {
+                        column_id,
+                        ..MoveTarget::default()
+                    },
+                )?;
+                body.push_str(&format!(" The card was moved back to {name}."));
+            }
+            None => body.push_str(
+                " The card stays where it is: the project has no column of the unstarted kind.",
+            ),
+        }
+    }
+    comments::add_comment(
+        tx,
+        now,
+        &actor,
+        &project,
+        number,
+        NewComment { body, parent: None },
+    )?;
+    Ok(())
 }
 
 /// At shutdown, after the run tasks stopped: whatever of this boot is still

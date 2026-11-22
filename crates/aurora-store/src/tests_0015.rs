@@ -69,7 +69,7 @@ async fn populated_version_fourteen_database_gets_the_working_copy_columns() {
     drop(raw);
 
     let store = Store::open(&path).unwrap();
-    assert_eq!(store.schema_version(), 17);
+    assert_eq!(store.schema_version(), 18);
     let backup = store.open_report().backup.clone().expect("backup taken");
     assert!(backup.starts_with(default_backup_dir(&path)));
     let (repo, base, rules, run) = store

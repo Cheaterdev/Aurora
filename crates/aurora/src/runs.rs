@@ -68,12 +68,14 @@ fn parse_issue(text: &str) -> Result<(String, i64), ApiError> {
 }
 
 /// An agent's key never learns where on this machine things are: no working
-/// copy folder and no note (a note may quote git).
+/// copy folder and no note (a note may quote git), and nothing about what
+/// start-up did to a process (`reaped` names a pid).
 fn agent_view(run: &Run) -> Value {
     let mut value = serde_json::to_value(run).unwrap_or(Value::Null);
     if let Some(map) = value.as_object_mut() {
         map.remove("worktree_path");
         map.remove("worktree_note");
+        map.remove("reaped");
     }
     value
 }

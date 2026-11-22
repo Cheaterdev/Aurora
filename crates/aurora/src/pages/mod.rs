@@ -368,8 +368,15 @@ async fn agents_page(
     State(store): State<Store>,
     Extension(principal): Extension<Principal>,
 ) -> PageResult {
+    let dir = crate::transcript::data_dir(&store);
     let data = store
-        .read(move |c| data::load_agents(c, &principal))
+        .read(move |c| {
+            let mut data = data::load_agents(c, &principal)?;
+            if principal.is_owner() {
+                data.housekeeping = Some(crate::housekeeping::scan(c, &dir)?);
+            }
+            Ok(data)
+        })
         .await?;
     Ok(no_store(ok(view::agents_page(&data))))
 }

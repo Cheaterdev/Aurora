@@ -851,7 +851,13 @@ trigger_event_id, pid, template_source, template_id, edited, exit_code, error,
 output_truncated, started, finished, created, created_by, worktree_state,
 worktree_path, branch, base_ref, base_commit, has_changes, changed_files, ahead,
 worktree_note, transcript_bytes, transcript_truncated, queued_at,
-queue_position}`. `queued_at` is when the run was queued (kept after it
+queue_position, reaped}`. `reaped` (TRK-45) is what start-up found of the process
+of a run it marked `interrupted` (`killed leftover process <pid>`, `process
+already gone`, `pid reused, left alone`, `pid unknown`); null for every other
+run, and hidden from an agent's key. When start-up interrupts a run it also
+comments on the issue (as the run's agent, prefixed `[Aurora]`, no paths) and
+moves a card that is still in a `started` column to the first `unstarted` one.
+`queued_at` is when the run was queued (kept after it
 started; null for a run that started at once) and `queue_position` its 1-based
 place among all queued runs, oldest first (null unless the run is `queued`;
 computed when read, so it moves up as runs ahead of it start or are canceled).
@@ -982,6 +988,23 @@ their agent's queue was full (it restarts at 0). Query `agent` (id) narrows
 agent's key sees only the entries of its allowed projects, and `running` counts
 only runs of those projects; `limit` and `queue_full_drops` are server-wide.
 `401` without a key, `503` when this server has no runner.
+
+### `GET /api/v1/admin/housekeeping`
+
+Owner only (`403` for members and agents, `401` without a key). What start-up
+reconciliation leaves for a person (TRK-45), computed when asked and read-only:
+`{"leftover_processes": [{"run", "pid", "note"}], "unknown_working_copies":
+[{"name", "kind"}], "kept_working_copies": [{"run", "branch", "state",
+"folder_exists"}], "checked_at"}`. `leftover_processes` lists the runs with a
+`reaped` note (newest first, at most 500): `killed leftover process <pid>`,
+`process already gone`, `pid reused, left alone`, `pid unknown`, `could not kill
+leftover process <pid>`. `unknown_working_copies` are entries of
+`<data folder>/worktrees/` that no run with a `created` or `kept` working copy
+accounts for; `name` is relative to the data folder (`worktrees/<name>`), `kind`
+`folder` or `file`. `kept_working_copies` are the runs whose working copy is
+`created` or `kept`, with whether `worktrees/<run id>` exists. Nothing is ever
+deleted, killed or restarted by this endpoint or by start-up; the same lists are
+shown in the "Housekeeping" panel of the Agents page (owner only).
 
 ## Search
 

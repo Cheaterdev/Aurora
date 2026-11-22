@@ -1382,9 +1382,74 @@ pub fn agents_page(data: &AgentsData) -> Markup {
                 } @else {
                     p.hint { "Only the owner can create or edit agents." }
                 }
+                @if let Some(report) = &data.housekeeping {
+                    (housekeeping_panel(report))
+                }
             }
         },
     )
+}
+
+/// What start-up reconciliation leaves for the owner to decide (TRK-45). Text
+/// only: Aurora never removes a working copy, and the commands are for a
+/// person to run.
+fn housekeeping_panel(report: &crate::housekeeping::Report) -> Markup {
+    html! {
+        section.housekeeping #housekeeping {
+            h2 { "Housekeeping" }
+            p.hint {
+                "Aurora never deletes a working copy and never restarts a run by itself. "
+                "This is what it found when it last looked (at page load); a person decides."
+            }
+            h3 { "Working copies the database does not know" }
+            @if report.unknown_working_copies.is_empty() {
+                p.empty { "None." }
+            } @else {
+                ul.unknown-copies {
+                    @for copy in &report.unknown_working_copies {
+                        li { code { (copy.name) } " " span.hint { "(" (copy.kind) " in the data folder)" } }
+                    }
+                }
+            }
+            h3 { "Kept working copies" }
+            @if report.kept_working_copies.is_empty() {
+                p.empty { "None." }
+            } @else {
+                ul.kept-copies {
+                    @for copy in &report.kept_working_copies {
+                        li {
+                            "Run " (copy.run) ", "
+                            @if let Some(branch) = &copy.branch { code { (branch) } } @else { "no branch" }
+                            " " span.chip { (copy.state.as_str()) }
+                            @if !copy.folder_exists { " " span.chip { "folder missing" } }
+                        }
+                    }
+                }
+            }
+            h3 { "Processes found at start-up" }
+            @if report.leftover_processes.is_empty() {
+                p.empty { "None." }
+            } @else {
+                ul.reaped {
+                    @for left in &report.leftover_processes {
+                        li {
+                            "Run " (left.run) ": " (left.note)
+                        }
+                    }
+                }
+            }
+            h3 { "Removing a working copy by hand" }
+            p.hint { "Once its work is no longer needed (run these yourself):" }
+            pre {
+                "git -C <repository> worktree remove <worktree folder>      # add --force for a dirty one\n"
+                "git -C <repository> branch -D aurora/<KEY>-<n>-run<id>\n"
+                "git -C <repository> worktree prune                          # if the folder was deleted by hand"
+            }
+            p.hint {
+                "A folder listed as unknown has no run behind it: look inside before removing it."
+            }
+        }
+    }
 }
 
 fn source_label(source: TemplateSource) -> &'static str {

@@ -198,6 +198,12 @@ pub const INVARIANTS: &[Invariant] = &[
         needs_current_schema: true,
         run: runs_queue,
     },
+    Invariant {
+        name: "runs.reconciled",
+        proves: "a run that start-up reconciliation interrupted (\"server restarted\") and whose process identity was recorded says what became of the process; only an interrupted run has such a note; an active run has no leftover-process note",
+        needs_current_schema: true,
+        run: runs_reconciled,
+    },
 ];
 
 /// Runs every invariant on `conn`, which is not changed. The checks see one
@@ -694,6 +700,31 @@ fn runs_queue(conn: &Connection) -> Result<Finding, StoreError> {
     )?;
     let queued = count(conn, "SELECT COUNT(*) FROM run WHERE status = 'queued'")?;
     Finding::of(format!("{queued} queued"), violations)
+}
+
+/// Start-up reconciliation (TRK-45). A row from before migration 0018 has no
+/// `pid_started_at` and no note, and is never flagged; a run reconciled by
+/// this build that had a recorded process identity always has its `reaped` note
+/// (the same transaction wrote both).
+fn runs_reconciled(conn: &Connection) -> Result<Finding, StoreError> {
+    let violations = lines(
+        conn,
+        "SELECT 'run ' || id || ' was interrupted by a restart with a recorded process but says nothing of it'
+         FROM run WHERE status = 'interrupted' AND error = 'server restarted'
+           AND pid_started_at IS NOT NULL AND reaped IS NULL
+         UNION ALL
+         SELECT 'run ' || id || ' is ' || status || ' but has a leftover-process note'
+         FROM run WHERE reaped IS NOT NULL AND status <> 'interrupted'
+         UNION ALL
+         SELECT 'run ' || id || ' has a recorded process start without a pid'
+         FROM run WHERE pid_started_at IS NOT NULL AND pid IS NULL",
+        |r| r.get(0),
+    )?;
+    let noted = count(conn, "SELECT COUNT(*) FROM run WHERE reaped IS NOT NULL")?;
+    Finding::of(
+        format!("{noted} runs with a leftover-process note"),
+        violations,
+    )
 }
 
 /// Database rules about working copies (TRK-16), plus notes about the file

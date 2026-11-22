@@ -2299,3 +2299,33 @@ async fn shutdown_ends_open_streams_without_waiting_for_the_drain() {
     let eof = tokio::time::timeout(Duration::from_secs(2), sse.stream.read_to_end(&mut rest)).await;
     assert!(eof.is_ok(), "the stream did not end");
 }
+
+/// The owner's Housekeeping panel (TRK-45): unknown folders are listed by
+/// name, escaped, with the manual commands as text; nothing is removed.
+#[tokio::test]
+async fn the_agents_page_shows_the_housekeeping_panel_to_the_owner_and_escapes_names() {
+    let server = Server::start().await;
+    let cookie = server.owner_cookie().await;
+    let stray = server._dir.path().join("worktrees").join("a&b'c");
+    std::fs::create_dir_all(&stray).unwrap();
+
+    let anonymous = get(server.addr, "/agents", None).await;
+    assert_ne!(anonymous.status, 200, "needs a session");
+    assert!(!anonymous.body.contains("Housekeeping"));
+
+    let page = get(server.addr, "/agents", Some(&cookie)).await;
+    assert_eq!(page.status, 200);
+    assert!(page.body.contains("Housekeeping"), "{}", page.body);
+    assert!(
+        page.body.contains("worktrees/a&amp;b'c"),
+        "the name is escaped: {}",
+        page.body
+    );
+    assert!(!page.body.contains("a&b'c"));
+    assert!(
+        page.body
+            .contains("git -C &lt;repository&gt; worktree remove")
+    );
+    assert!(stray.is_dir(), "looking deletes nothing");
+    server.shutdown().await;
+}

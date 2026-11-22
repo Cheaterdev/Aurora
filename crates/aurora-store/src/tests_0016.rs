@@ -44,7 +44,7 @@ async fn populated_version_fifteen_database_gets_the_transcript_columns() {
     drop(raw);
 
     let store = Store::open(&path).unwrap();
-    assert_eq!(store.schema_version(), 17);
+    assert_eq!(store.schema_version(), 18);
     let run = store.read(|c| get_run(c, 7)).await.unwrap().run;
     assert_eq!((run.transcript_bytes, run.transcript_truncated), (0, false));
     let bad = store
