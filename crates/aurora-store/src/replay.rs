@@ -588,10 +588,23 @@ fn apply(s: &mut Snapshot, e: &Event) -> Res<()> {
                     int(&p["agent_id"])?,
                     pid,
                     int(&p["issue"]["number"])?,
-                    "starting".to_string(),
+                    if p["queued"].as_bool() == Some(true) {
+                        "queued"
+                    } else {
+                        "starting"
+                    }
+                    .to_string(),
                     p["branch"].as_str().map(str::to_string),
                 ),
             );
+        }
+        "run.promoted" => {
+            let run = entry(&mut s.runs, e.entity_id, "run")?;
+            if run.3 != "queued" {
+                return Err(format!("run {} was promoted from {}", e.entity_id, run.3));
+            }
+            run.3 = "starting".into();
+            run.4 = p["branch"].as_str().map(str::to_string);
         }
         "run.started" => {
             int(&p["pid"])?;

@@ -280,6 +280,10 @@ pub struct AgentData {
     pub keys: Vec<ApiKey>,
     /// Template text is owner-only, so these stay empty for everyone else.
     pub prompt: Option<PromptData>,
+    /// This agent's running count and queued runs.
+    pub queue: runs::QueueView,
+    /// The overall limit of runs at once; `None` on a server without a runner.
+    pub max_runs: Option<i64>,
 }
 
 /// What the "Prompt" section of the agent page shows.
@@ -332,6 +336,8 @@ pub fn load_agent(conn: &Connection, reader: &Principal, id: i64) -> Result<Agen
         projects: all_projects,
         keys,
         prompt,
+        queue: runs::queue_view(conn, None, Some(id))?,
+        max_runs: None,
     })
 }
 

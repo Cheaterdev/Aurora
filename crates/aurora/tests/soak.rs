@@ -5,6 +5,12 @@
 //! acknowledged is still there, and that retries with the same
 //! `Idempotency-Key` never duplicated anything.
 //!
+//! One more thread starts runs of a fake agent with an overall limit of two
+//! (`AURORA_MAX_RUNS=2`), faster than they finish, cancels some of what waits,
+//! and the checks assert the limit, the queue order, and that nothing is
+//! promoted or finished twice. Build the example agent first with
+//! `cargo build --examples -p aurora`.
+//!
 //! Ignored by default. Run it with
 //!
 //! ```text
@@ -126,6 +132,8 @@ struct Shared {
     replays: AtomicU64,
     duplicate_probes: AtomicU64,
     consumer_acked: AtomicI64,
+    runs_started: AtomicU64,
+    runs_refused: AtomicU64,
     columns: Mutex<Vec<i64>>,
     type_id: AtomicI64,
     /// Moves sent and not yet answered, per issue. A move the server committed
@@ -381,6 +389,138 @@ fn worker(shared: &Shared, id: u64, run: u64) {
     }
 }
 
+/// The overall run limit the soak server runs with.
+const MAX_RUNS: i64 = 2;
+const SERVER_ENV: &[(&str, &str)] = &[("AURORA_MAX_RUNS", "2")];
+
+fn fake_agent() -> std::path::PathBuf {
+    let name = format!("fake_agent{}", std::env::consts::EXE_SUFFIX);
+    let path = std::path::Path::new(common::harness::BIN)
+        .parent()
+        .expect("a folder")
+        .join("examples")
+        .join(name);
+    assert!(
+        path.exists(),
+        "build the examples first (cargo build --examples -p aurora): {}",
+        path.display()
+    );
+    path
+}
+
+/// Starts runs faster than two slots can finish them, so a queue builds up,
+/// cancels some of what waits, and watches the queue's own rules while the
+/// server is killed: never more than `MAX_RUNS` runs started at once, and
+/// queue positions that are 1, 2, 3 ... in order.
+fn runs(shared: &Shared, agent: i64, run: u64) {
+    let mut rng = Rng::new(77);
+    let mut seq = 0_u64;
+    while !shared.stopped() {
+        seq += 1;
+        let idem = format!("soak-{run}-r-{seq}");
+        let Some(made) = shared.send(
+            "POST",
+            &format!("/api/v1/projects/{PROJECT}/issues"),
+            Some(&json!({
+                "title": format!("soak-r-{seq}"),
+                "type_id": shared.type_id.load(Ordering::SeqCst),
+            })),
+            Some(&idem),
+        ) else {
+            return;
+        };
+        if made.status != 201 {
+            shared.violation(format!(
+                "create run issue answered {}: {}",
+                made.status, made.body
+            ));
+            return;
+        }
+        let number = made.json()["number"].as_i64().unwrap_or(0);
+        let Some(started) = shared.send(
+            "POST",
+            &format!("/api/v1/agents/{agent}/runs"),
+            Some(&json!({"issue": format!("{PROJECT}-{number}")})),
+            Some(&format!("{idem}-run")),
+        ) else {
+            return;
+        };
+        match started.status {
+            201 => {
+                shared.runs_started.fetch_add(1, Ordering::SeqCst);
+                let status = started.json()["status"].as_str().unwrap_or("").to_string();
+                if status != "queued" && status != "starting" {
+                    shared.violation(format!("a new run is `{status}`: {}", started.body));
+                    return;
+                }
+            }
+            // The agent's queue is full: the limit doing its job.
+            409 => {
+                shared.runs_refused.fetch_add(1, Ordering::SeqCst);
+            }
+            other => {
+                shared.violation(format!("starting a run answered {other}: {}", started.body));
+                return;
+            }
+        }
+        if rng.below(100) < 30
+            && let Some(list) = shared.send("GET", "/api/v1/runs?status=queued", None, None)
+            && list.status == 200
+        {
+            let queued: Vec<i64> = list
+                .json()
+                .as_array()
+                .map(|rows| rows.iter().filter_map(|r| r["id"].as_i64()).collect())
+                .unwrap_or_default();
+            if !queued.is_empty() {
+                let id = queued[rng.below(queued.len() as u64) as usize];
+                let Some(canceled) = shared.send(
+                    "POST",
+                    &format!("/api/v1/runs/{id}/cancel"),
+                    None,
+                    Some(&format!("{idem}-cancel")),
+                ) else {
+                    return;
+                };
+                // 409: it was promoted or finished in the meantime.
+                if canceled.status != 200 && canceled.status != 409 {
+                    shared.violation(format!(
+                        "cancel of run {id} answered {}: {}",
+                        canceled.status, canceled.body
+                    ));
+                    return;
+                }
+            }
+        }
+        let Some(queue) = shared.send("GET", "/api/v1/queue", None, None) else {
+            return;
+        };
+        if queue.status == 200 {
+            let view = queue.json();
+            let running = view["running"].as_i64().unwrap_or(0);
+            if running > MAX_RUNS {
+                shared.violation(format!(
+                    "{running} runs are started at once with a limit of {MAX_RUNS}: {}",
+                    queue.body
+                ));
+                return;
+            }
+            let positions: Vec<i64> = view["queued"]
+                .as_array()
+                .map(|rows| rows.iter().filter_map(|r| r["position"].as_i64()).collect())
+                .unwrap_or_default();
+            let expected: Vec<i64> = (1..=positions.len() as i64).collect();
+            if positions != expected {
+                shared.violation(format!(
+                    "queue positions are {positions:?}, not 1, 2, 3 ..."
+                ));
+                return;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(100 + rng.below(300)));
+    }
+}
+
 /// A consumer that polls and acknowledges while the server is being killed.
 fn consumer(shared: &Shared, run: u64) {
     let name = "soak-consumer";
@@ -619,6 +759,26 @@ impl Soak {
                  (and at most {in_flight} unanswered): a change was lost or applied twice"
             ));
         }
+        let started = count(
+            &self.db,
+            "SELECT COUNT(*) FROM run WHERE status IN ('starting', 'running')",
+        );
+        if started > MAX_RUNS {
+            self.shared.violation(format!(
+                "{when}: {started} runs are started at once with a limit of {MAX_RUNS}"
+            ));
+        }
+        let twice = count(
+            &self.db,
+            "SELECT COUNT(*) FROM (SELECT run_id FROM (SELECT entity_id AS run_id, kind FROM event
+              WHERE kind IN ('run.promoted', 'run.finished'))
+              GROUP BY run_id, kind HAVING COUNT(*) > 1)",
+        );
+        if twice != 0 {
+            self.shared.violation(format!(
+                "{when}: {twice} runs were promoted or finished more than once"
+            ));
+        }
         let duplicated = count(
             &self.db,
             "SELECT COUNT(*) FROM (SELECT title FROM issue WHERE title LIKE 'soak-i-%'
@@ -642,7 +802,7 @@ impl Soak {
             number.is_multiple_of(COMMAND_CHECK_EVERY),
         );
 
-        self.server = Server::spawn(&self.db, None);
+        self.server = Server::spawn_with(&self.db, None, SERVER_ENV);
         if let Err(why) = self.server.wait_ready(Duration::from_secs(180)) {
             self.shared
                 .violation(format!("{when}: the restart failed: {why}"));
@@ -689,7 +849,7 @@ fn kill_loop_soak() {
         .map_or(0, |d| d.as_secs());
     println!("soak: {seconds} s on {}", db.display());
 
-    let mut server = Server::spawn(&db, None);
+    let mut server = Server::spawn_with(&db, None, SERVER_ENV);
     server
         .wait_ready(Duration::from_secs(60))
         .expect("the first start");
@@ -706,6 +866,8 @@ fn kill_loop_soak() {
         replays: AtomicU64::new(0),
         duplicate_probes: AtomicU64::new(0),
         consumer_acked: AtomicI64::new(0),
+        runs_started: AtomicU64::new(0),
+        runs_refused: AtomicU64::new(0),
         columns: Mutex::new(Vec::new()),
         type_id: AtomicI64::new(0),
         moving: Mutex::new(BTreeMap::new()),
@@ -738,9 +900,22 @@ fn kill_loop_soak() {
     shared
         .type_id
         .store(task["id"].as_i64().unwrap_or(0), Ordering::SeqCst);
+    let agent = setup(
+        "POST",
+        "/api/v1/agents",
+        json!({"name": "soak-bot", "command": fake_agent().display().to_string(),
+               "args": ["--sleep", "2"], "projects": [PROJECT], "max_concurrent": 2,
+               "on_assign": false, "on_mention": false}),
+    )["id"]
+        .as_i64()
+        .expect("agent id");
     shared.set_addr(Some(server.addr.clone()));
 
     let mut handles = Vec::new();
+    {
+        let shared = shared.clone();
+        handles.push(std::thread::spawn(move || runs(&shared, agent, run)));
+    }
     for id in 0..WORKERS {
         let shared = shared.clone();
         handles.push(std::thread::spawn(move || worker(&shared, id, run)));
@@ -793,6 +968,9 @@ fn kill_loop_soak() {
         soak.server.kill();
         soak.totals.kills += 1;
         soak.check("the final kill", true);
+        // Agents of the killed servers end by themselves after two seconds;
+        // let them go before the data folder is removed.
+        std::thread::sleep(Duration::from_secs(3));
         assert_checks_green_or_note(&soak);
     }
 
@@ -835,6 +1013,36 @@ fn kill_loop_soak() {
         soak.totals.library_checks, soak.totals.command_checks
     );
     println!("entries re-verified:   {}", soak.totals.entries_verified);
+    println!(
+        "runs:                  {} started (HTTP 201), {} refused (queue full), {} in the table",
+        shared.runs_started.load(Ordering::SeqCst),
+        shared.runs_refused.load(Ordering::SeqCst),
+        count(&db, "SELECT COUNT(*) FROM run")
+    );
+    for status in [
+        "queued",
+        "starting",
+        "running",
+        "succeeded",
+        "failed",
+        "interrupted",
+        "canceled",
+    ] {
+        println!(
+            "  runs {status:<12} {}",
+            count(
+                &db,
+                &format!("SELECT COUNT(*) FROM run WHERE status = '{status}'")
+            )
+        );
+    }
+    println!(
+        "  run.promoted events  {}",
+        count(
+            &db,
+            "SELECT COUNT(*) FROM event WHERE kind = 'run.promoted'"
+        )
+    );
     println!("database:              {size} bytes, {events} events");
     println!("violations:            {}", violations.len());
     for violation in &violations {

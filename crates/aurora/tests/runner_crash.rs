@@ -227,6 +227,207 @@ fn a_crash_before_the_finish_is_recorded_interrupts_the_run_on_restart() {
     case("run_before_finish");
 }
 
+/// The queue's failpoints (TRK-18), with `AURORA_MAX_RUNS=1` so the second
+/// issue's run has to wait for the first one.
+///
+/// `run_after_queue`: killed right after the second run was queued. The first
+/// run is interrupted on restart; the queued run holds no process and no key,
+/// so it survives, is promoted once and finishes, exactly once.
+///
+/// `run_after_promote`: killed right after the first run ended and the queued
+/// one was promoted (row `starting`, key minted) and before its process was
+/// started: the promoted run is interrupted on restart with its key revoked.
+fn queue_case(point: &str) {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db = dir.path().join("aurora.db");
+    let key = bootstrap(&db);
+    let env = [("AURORA_MAX_RUNS", "1")];
+
+    let mut armed = Server::spawn_with(&db, Some(&format!("{point}:1")), &env);
+    armed
+        .wait_ready(READY)
+        .unwrap_or_else(|why| panic!("{point}: the armed server did not start: {why}"));
+    let a = armed.addr.clone();
+    ok(
+        &a,
+        &key,
+        "POST",
+        "/api/v1/projects",
+        Some(json!({"key": "AA", "name": "A"})),
+    );
+    ok(
+        &a,
+        &key,
+        "POST",
+        "/api/v1/projects/AA/issue-types",
+        Some(json!({"name": "Task"})),
+    );
+    for title in ["First", "Second"] {
+        ok(
+            &a,
+            &key,
+            "POST",
+            "/api/v1/projects/AA/issues",
+            Some(json!({"title": title})),
+        );
+    }
+    let made = ok(
+        &a,
+        &key,
+        "POST",
+        "/api/v1/agents",
+        Some(
+            json!({"name": "bot", "command": fake_agent().display().to_string(),
+                    "args": ["--sleep", "2"], "projects": ["AA"], "max_concurrent": 3}),
+        ),
+    );
+    let user = made["user_id"].as_i64().expect("agent user");
+    ok(
+        &a,
+        &key,
+        "PATCH",
+        "/api/v1/projects/AA/issues/1",
+        Some(json!({"assignee_id": user})),
+    );
+    wait_for(point, &db, "SELECT COUNT(*) FROM run", 1);
+    ok(
+        &a,
+        &key,
+        "PATCH",
+        "/api/v1/projects/AA/issues/2",
+        Some(json!({"assignee_id": user})),
+    );
+
+    let status = armed
+        .wait_exit(DIES)
+        .unwrap_or_else(|| panic!("{point}: the server did not die:\n{}", armed.log_text()));
+    assert!(!status.success(), "{point}: exited cleanly");
+    drop(armed);
+    assert_eq!(
+        count(&db, "SELECT COUNT(*) FROM run"),
+        2,
+        "{point}: two runs"
+    );
+    assert_checks_green(
+        &db,
+        &format!("{point}: after the crash, before the restart"),
+    );
+    if point == "run_after_queue" {
+        assert_eq!(
+            count(
+                &db,
+                "SELECT COUNT(*) FROM run WHERE id = 2 AND status = 'queued'"
+            ),
+            1,
+            "{point}: the second run is queued when the server dies"
+        );
+        assert_eq!(
+            count(
+                &db,
+                "SELECT COUNT(*) FROM run WHERE id = 2 AND key_id IS NOT NULL"
+            ),
+            0,
+            "{point}: a queued run has no key"
+        );
+    } else {
+        assert_eq!(
+            count(
+                &db,
+                "SELECT COUNT(*) FROM run WHERE id = 2 AND status = 'starting'"
+            ),
+            1,
+            "{point}: the second run was promoted when the server dies"
+        );
+        assert_eq!(
+            count(
+                &db,
+                "SELECT COUNT(*) FROM run WHERE id = 2 AND key_id IS NOT NULL"
+            ),
+            1,
+            "{point}: a promoted run has its key"
+        );
+    }
+
+    let mut server = Server::spawn_with(&db, None, &env);
+    server
+        .wait_ready(READY)
+        .unwrap_or_else(|why| panic!("{point}: the restart failed: {why}"));
+    if point == "run_after_queue" {
+        wait_for(
+            point,
+            &db,
+            "SELECT COUNT(*) FROM run WHERE id = 1 AND status = 'interrupted'",
+            1,
+        );
+        wait_for(
+            point,
+            &db,
+            "SELECT COUNT(*) FROM run WHERE id = 2 AND status = 'succeeded'",
+            1,
+        );
+        assert_eq!(
+            count(
+                &db,
+                "SELECT COUNT(*) FROM event WHERE kind = 'run.promoted'"
+            ),
+            1,
+            "{point}: promoted once"
+        );
+    } else {
+        wait_for(
+            point,
+            &db,
+            "SELECT COUNT(*) FROM run WHERE id = 2 AND status = 'interrupted' AND error = 'server restarted'",
+            1,
+        );
+    }
+    // The assignment events are delivered again and must not make new runs.
+    std::thread::sleep(Duration::from_millis(1500));
+    assert_eq!(
+        count(&db, "SELECT COUNT(*) FROM run"),
+        2,
+        "{point}: no third run"
+    );
+    assert_eq!(
+        count(
+            &db,
+            "SELECT COUNT(*) FROM run WHERE status IN ('queued', 'starting', 'running')"
+        ),
+        0,
+        "{point}: nothing is left active or waiting"
+    );
+    assert_eq!(
+        count(
+            &db,
+            "SELECT COUNT(*) FROM event WHERE kind = 'run.finished'"
+        ),
+        2,
+        "{point}: one finish event per run"
+    );
+    assert_eq!(
+        count(
+            &db,
+            "SELECT COUNT(*) FROM api_key k JOIN run r ON k.name = 'run-' || r.id
+             WHERE k.revoked IS NULL"
+        ),
+        0,
+        "{point}: no run key is left usable"
+    );
+    assert_checks_green(&db, &format!("{point}: after the restart"));
+    server.kill();
+    assert_checks_green(&db, &format!("{point}: after killing the restarted server"));
+}
+
+#[test]
+fn a_crash_after_a_run_is_queued_keeps_it_waiting_and_it_runs_once_after_restart() {
+    queue_case("run_after_queue");
+}
+
+#[test]
+fn a_crash_after_a_promotion_interrupts_the_promoted_run_on_restart() {
+    queue_case("run_after_promote");
+}
+
 /// A repository with one commit, in a temporary folder of its own.
 fn make_repo() -> tempfile::TempDir {
     let dir = tempfile::tempdir().expect("temp dir");

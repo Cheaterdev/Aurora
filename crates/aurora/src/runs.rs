@@ -165,6 +165,8 @@ pub(crate) async fn start_run(
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .take();
     if let Some(created) = created {
+        // A queued run is not launched; the scheduler is asked to look at it.
+        runner.wake();
         runner.launch(created);
     }
     Ok(response)
@@ -183,7 +185,9 @@ pub(crate) async fn list_runs(
     let status = match query.status.as_deref() {
         None | Some("") => None,
         Some(text) => Some(RunStatus::parse(text).ok_or_else(|| {
-            invalid("status must be starting, running, succeeded, failed, interrupted or canceled")
+            invalid(
+                "status must be queued, starting, running, succeeded, failed, interrupted or canceled",
+            )
         })?),
     };
     let filter = RunFilter {
@@ -258,12 +262,53 @@ pub(crate) async fn cancel_run(
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     if ran {
+        // A queued run has no process: this returns at once and only the
+        // wake matters (a running run's slot is free now, too).
+        runner.wake();
         runner.stop_process(id, Some(user)).await;
         if let Ok(settled) = store.read(move |c| runs::get_run(c, id)).await {
             return Ok((StatusCode::OK, Json(settled)).into_response());
         }
     }
     Ok(response)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct QueueQuery {
+    /// Only this agent's queue.
+    agent: Option<i64>,
+}
+
+/// The run queue: how many runs are going against the overall limit and the
+/// queued runs, oldest first with their position and what holds each back. A
+/// restricted key sees only the runs of its allowed projects (and `running`
+/// counts only those). `queue_full_drops` counts triggers dropped because
+/// their agent's queue was full since the server started.
+pub(crate) async fn get_queue(
+    State(store): State<Store>,
+    Extension(access): Extension<Access>,
+    Extension(runner): Extension<Option<Runner>>,
+    ApiQuery(query): ApiQuery<QueueQuery>,
+) -> ApiResult<Response> {
+    let runner = runner.ok_or_else(runner_missing)?;
+    let allowed = access.allowed().map(<[String]>::to_vec);
+    let agent = query.agent;
+    let view = store
+        .read(move |c| {
+            if let Some(id) = agent {
+                agents::agent_config(c, id)?;
+            }
+            runs::queue_view(c, allowed.as_deref(), agent)
+        })
+        .await?;
+    Ok(Json(json!({
+        "running": view.running,
+        "limit": runner.max_runs(),
+        "queued": view.queued,
+        "queue_full_drops": runner.queue_full_drops(),
+    }))
+    .into_response())
 }
 
 #[derive(Deserialize)]

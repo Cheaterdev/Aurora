@@ -1278,6 +1278,20 @@ mark {
   color: var(--danger);
 }
 
+/* A queued run waits for a slot: dashed, so it never reads as a live run. */
+.chip-run[data-status="queued"] {
+  border: 1px dashed currentColor;
+  font-weight: 600;
+}
+
+.queue-note {
+  margin: 8px 0;
+}
+
+.queue-panel .queue-summary {
+  margin: 0 0 8px;
+}
+
 .chip-worktree[data-state="kept"][data-changes="true"] {
   color: var(--success);
 }

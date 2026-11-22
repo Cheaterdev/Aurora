@@ -79,6 +79,8 @@ fn new_run(agent: i64, number: i64, event: Option<i64>) -> NewRun {
         failed: None,
         worktree_root: None,
         base_branch: None,
+        comment_id: None,
+        limits: None,
     }
 }
 

@@ -13,6 +13,7 @@ use serde_json::{Map, Value, json};
 use crate::auth::{Access, no_store};
 use crate::idem;
 use crate::routes::{ApiError, ApiJson, ApiResult};
+use crate::runner::Runner;
 
 /// Name of the key `create_key: true` issues.
 const AGENT_KEY_NAME: &str = "agent key";
@@ -93,13 +94,23 @@ pub(crate) async fn create_agent(
 pub(crate) async fn update_agent(
     State(store): State<Store>,
     Extension(principal): Extension<Principal>,
+    Extension(runner): Extension<Option<Runner>>,
     Path(id): Path<i64>,
     ApiJson(patch): ApiJson<AgentPatch>,
 ) -> ApiResult<Response> {
-    idem::json(&store, StatusCode::OK, move |tx| {
+    let response = idem::json(&store, StatusCode::OK, move |tx| {
         agents::update_agent(tx, now_millis(), &principal, id, patch)
     })
-    .await
+    .await?;
+    // A changed limit, switch or project list may free or end queued runs.
+    wake(&runner);
+    Ok(response)
+}
+
+fn wake(runner: &Option<Runner>) {
+    if let Some(runner) = runner {
+        runner.wake();
+    }
 }
 
 pub(crate) async fn delete_agent(
@@ -116,29 +127,34 @@ pub(crate) async fn delete_agent(
 pub(crate) async fn enable_agent(
     State(store): State<Store>,
     Extension(principal): Extension<Principal>,
+    Extension(runner): Extension<Option<Runner>>,
     Path(id): Path<i64>,
 ) -> ApiResult<Response> {
-    set_enabled(store, principal, id, true).await
+    set_enabled(store, principal, runner, id, true).await
 }
 
 pub(crate) async fn disable_agent(
     State(store): State<Store>,
     Extension(principal): Extension<Principal>,
+    Extension(runner): Extension<Option<Runner>>,
     Path(id): Path<i64>,
 ) -> ApiResult<Response> {
-    set_enabled(store, principal, id, false).await
+    set_enabled(store, principal, runner, id, false).await
 }
 
 async fn set_enabled(
     store: Store,
     principal: Principal,
+    runner: Option<Runner>,
     id: i64,
     enabled: bool,
 ) -> ApiResult<Response> {
-    idem::json(&store, StatusCode::OK, move |tx| {
+    let response = idem::json(&store, StatusCode::OK, move |tx| {
         agents::set_enabled(tx, now_millis(), &principal, id, enabled)
     })
-    .await
+    .await?;
+    wake(&runner);
+    Ok(response)
 }
 
 fn invalid(reason: String) -> ApiError {

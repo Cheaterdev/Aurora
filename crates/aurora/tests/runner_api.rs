@@ -64,6 +64,8 @@ fn options() -> RunnerOptions {
     RunnerOptions {
         poll_every: Duration::from_millis(100),
         timeout_override: None,
+        schedule_every: Duration::from_millis(100),
+        ..RunnerOptions::default()
     }
 }
 
@@ -435,7 +437,11 @@ async fn an_issue_with_an_active_run_drops_the_next_trigger() {
         )
         .await;
     settle().await;
-    assert_eq!(server.runs().await.len(), 1, "no queue yet (TRK-18)");
+    assert_eq!(
+        server.runs().await.len(),
+        1,
+        "an issue never has two active runs"
+    );
     let id = run["id"].as_i64().unwrap();
     let cancelled = server
         .api(

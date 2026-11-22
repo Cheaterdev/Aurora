@@ -70,11 +70,17 @@ async fn run(config: Config) -> Result<()> {
     // Reconciles runs a crash left active, then starts the dispatcher; its
     // shutdown (kill children, mark runs interrupted) is a hook of `serve_with`.
     // TRK-45 hardens this (stray processes, moving cards).
-    let mut runner_config = aurora::runner::RunnerConfig::for_server(
-        &store,
-        listener.local_addr()?,
-        aurora::runner::RunnerOptions::default(),
-    );
+    let defaults = aurora::runner::RunnerOptions::default();
+    let runner_options = aurora::runner::RunnerOptions {
+        max_runs: config.max_runs.unwrap_or(defaults.max_runs),
+        max_queued_per_agent: config
+            .max_queued_per_agent
+            .unwrap_or(defaults.max_queued_per_agent),
+        max_queue_wait: config.max_queue_wait,
+        ..defaults
+    };
+    let mut runner_config =
+        aurora::runner::RunnerConfig::for_server(&store, listener.local_addr()?, runner_options);
     if let Some(cap) = config.transcript_max_bytes {
         runner_config.transcript_max_bytes = cap;
     }

@@ -127,6 +127,12 @@ impl Server {
     /// Starts the binary on `db` (port 0) and returns without waiting.
     /// `failpoint` arms `AURORA_TEST_FAILPOINT`.
     pub fn spawn(db: &Path, failpoint: Option<&str>) -> Server {
+        Server::spawn_with(db, failpoint, &[])
+    }
+
+    /// Like [`Server::spawn`], with more environment variables (for example
+    /// `AURORA_MAX_RUNS`).
+    pub fn spawn_with(db: &Path, failpoint: Option<&str>, env: &[(&str, &str)]) -> Server {
         let dir = db.parent().expect("a parent folder");
         let mut n = 0;
         let log = loop {
@@ -148,6 +154,9 @@ impl Server {
             .stdin(Stdio::null())
             .stdout(file.try_clone().expect("clone"))
             .stderr(file);
+        for (name, value) in env {
+            command.env(name, value);
+        }
         if let Some(spec) = failpoint {
             command.env("AURORA_TEST_FAILPOINT", spec);
         }

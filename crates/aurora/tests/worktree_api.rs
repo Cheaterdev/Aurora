@@ -125,6 +125,8 @@ fn options() -> RunnerOptions {
     RunnerOptions {
         poll_every: Duration::from_millis(100),
         timeout_override: None,
+        schedule_every: Duration::from_millis(100),
+        ..RunnerOptions::default()
     }
 }
 

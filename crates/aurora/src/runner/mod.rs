@@ -6,8 +6,20 @@
 //!   asks `agents::triggers_for_event` what each wants, creates the run rows
 //!   and acknowledges the batch afterwards. A crash before the acknowledgement
 //!   redelivers events; `UNIQUE(trigger_event_id, agent_id)` makes that harmless.
-//!   An issue that already has an active run drops the trigger (logged, no
-//!   comment; TRK-18 adds queueing).
+//!   An issue that already has an active run (queued, starting or running)
+//!   drops the trigger (logged, no comment).
+//! * **Limits and the queue** (TRK-18): a run is created `queued` instead of
+//!   started when the global limit (`AURORA_MAX_RUNS`, default 4) or the
+//!   agent's `max_concurrent` has no room, decided inside the creating
+//!   transaction (the single writer), so two triggers cannot both pass a limit.
+//!   The **scheduler** is a second task: woken whenever a run ends or is
+//!   queued or canceled, or an agent changes, and by a safety tick
+//!   ([`RunnerOptions::schedule_every`], 5 s), it promotes queued runs oldest
+//!   first, one transaction per pass (`queued -> starting`, key, working copy
+//!   plan and first message together). An agent at its limit does not hold
+//!   others back. A queued run survives a restart (it is intent, not a
+//!   process) and is promoted as limits allow; an active run does not
+//!   (start-up marks it `interrupted`).
 //! * A **run task** per run spawns the process (see [`spawn`]), records the
 //!   pid, captures the last 64 KiB of output, enforces the agent's timeout and
 //!   records the result. Whatever happens it ends with one `finish_run`
@@ -41,9 +53,10 @@ mod platform;
 mod spawn;
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -53,12 +66,12 @@ use aurora_store::failpoints::{self, Point};
 use aurora_store::projects::Rejection;
 use aurora_store::prompt::{self, PromptRequest, TriggerCtx, TriggerKind};
 use aurora_store::runs::{
-    self, Created, NewRun, OUTPUT_TAIL_BYTES, Outcome, RunDetail, RunReason, RunStatus,
-    TranscriptEnd, WorktreeEnd, WorktreeState, WorktreeTarget,
+    self, Created, Limits, NewRun, OUTPUT_TAIL_BYTES, Outcome, RunDetail, RunReason, RunStatus,
+    Scheduled, TranscriptEnd, WorktreeEnd, WorktreeState, WorktreeTarget,
 };
 use aurora_store::rusqlite::Transaction;
 use aurora_store::{Store, StoreError, now_millis};
-use tokio::sync::watch;
+use tokio::sync::{Notify, watch};
 use tokio::task::JoinHandle;
 
 use crate::gitwork::Git;
@@ -74,6 +87,8 @@ const READER_GRACE: Duration = Duration::from_secs(2);
 /// the run before it answers with what it has.
 const CANCEL_WAIT: Duration = Duration::from_secs(5);
 const SHUTDOWN_WAIT: Duration = Duration::from_secs(7);
+/// How long a scheduler that panicked waits before it starts again.
+const RESTART_DELAY: Duration = Duration::from_secs(1);
 
 /// A command file found by [`platform::resolve_command`].
 pub struct Resolved {
@@ -89,6 +104,18 @@ pub struct RunnerOptions {
     pub poll_every: Duration,
     /// Replaces every agent's timeout (the registry's minimum is 60 s).
     pub timeout_override: Option<Duration>,
+    /// At most this many runs `starting` or `running` at once, all agents
+    /// together (1 to 64; `AURORA_MAX_RUNS`).
+    pub max_runs: i64,
+    /// At most this many queued runs per agent; a trigger beyond it is
+    /// dropped and counted (`AURORA_MAX_QUEUED_PER_AGENT`).
+    pub max_queued_per_agent: i64,
+    /// Cancel a queued run that has waited this long; `None` never
+    /// (`AURORA_MAX_QUEUE_WAIT_SECS`, 0 means never).
+    pub max_queue_wait: Option<Duration>,
+    /// The scheduler's safety tick: how late a promotion can be when nothing
+    /// woke it (a limit changed by hand).
+    pub schedule_every: Duration,
 }
 
 impl Default for RunnerOptions {
@@ -96,6 +123,10 @@ impl Default for RunnerOptions {
         RunnerOptions {
             poll_every: Duration::from_millis(500),
             timeout_override: None,
+            max_runs: Limits::DEFAULT_MAX_RUNS,
+            max_queued_per_agent: Limits::DEFAULT_MAX_QUEUED_PER_AGENT,
+            max_queue_wait: None,
+            schedule_every: Duration::from_secs(5),
         }
     }
 }
@@ -162,6 +193,12 @@ struct Inner {
     halt: watch::Sender<bool>,
     active: Mutex<HashMap<i64, Arc<Control>>>,
     dispatcher: Mutex<Option<JoinHandle<()>>>,
+    scheduler: Mutex<Option<JoinHandle<()>>>,
+    /// Wakes the scheduler: a run ended, was queued or canceled.
+    wake: Notify,
+    max_runs: AtomicI64,
+    /// Triggers dropped because their agent's queue was full, since start.
+    queue_full_drops: AtomicU64,
 }
 
 /// Cheap to clone; all clones are the one runner.
@@ -220,6 +257,27 @@ async fn finish_transcript(
         .ok()
 }
 
+/// Runs the task `make` builds; when it panics, says so and runs a fresh one
+/// after `delay`, so a bug in one pass never ends the loop for good. Returns
+/// when the task returns.
+async fn keep_running<F, Fut>(name: &'static str, delay: Duration, make: F)
+where
+    F: Fn() -> Fut,
+    Fut: Future<Output = ()> + Send + 'static,
+{
+    loop {
+        match tokio::spawn(make()).await {
+            Ok(()) => return,
+            Err(join) if join.is_panic() => {
+                let message = crate::supervise::panic_message(join.into_panic().as_ref());
+                tracing::error!(task = name, panic = %message, "task panicked; restarting it");
+                tokio::time::sleep(delay).await;
+            }
+            Err(_) => return,
+        }
+    }
+}
+
 fn describe(duration: Duration) -> String {
     let secs = duration.as_secs_f64();
     if secs.fract() == 0.0 {
@@ -262,6 +320,7 @@ impl Runner {
             .await?;
 
         let (halt, _) = watch::channel(false);
+        let max_runs = AtomicI64::new(config.options.max_runs.clamp(1, 64));
         let runner = Runner {
             inner: Arc::new(Inner {
                 store,
@@ -272,6 +331,10 @@ impl Runner {
                 halt,
                 active: Mutex::new(HashMap::new()),
                 dispatcher: Mutex::new(None),
+                scheduler: Mutex::new(None),
+                wake: Notify::new(),
+                max_runs,
+                queue_full_drops: AtomicU64::new(0),
             }),
         };
         let looping = runner.clone();
@@ -280,11 +343,61 @@ impl Runner {
             Ok(())
         });
         *lock(&runner.inner.dispatcher) = Some(handle);
+        // Queued runs a previous server left are promoted by the first pass.
+        let scheduling = runner.clone();
+        let handle = tokio::spawn(async move {
+            keep_running("runner-scheduler", RESTART_DELAY, move || {
+                let again = scheduling.clone();
+                async move { again.schedule_loop().await }
+            })
+            .await;
+        });
+        *lock(&runner.inner.scheduler) = Some(handle);
         Ok(runner)
     }
 
     pub fn boot_id(&self) -> &str {
         &self.inner.boot_id
+    }
+
+    // ---- limits and the queue ----
+
+    /// The limits in force now.
+    pub fn limits(&self) -> Limits {
+        let options = &self.inner.config.options;
+        Limits {
+            max_runs: self.max_runs(),
+            max_queued_per_agent: options.max_queued_per_agent.max(0),
+            max_queue_wait_ms: options.max_queue_wait.map_or(0, |wait| {
+                i64::try_from(wait.as_millis()).unwrap_or(i64::MAX).max(1)
+            }),
+        }
+    }
+
+    /// The overall limit of runs going at once.
+    pub fn max_runs(&self) -> i64 {
+        self.inner.max_runs.load(Ordering::SeqCst)
+    }
+
+    /// Changes the overall limit (1 to 64) and wakes the scheduler: a higher
+    /// limit promotes queued runs at once, a lower one lets running runs
+    /// finish and holds the queue until they have.
+    pub fn set_max_runs(&self, max_runs: i64) {
+        self.inner
+            .max_runs
+            .store(max_runs.clamp(1, 64), Ordering::SeqCst);
+        self.wake();
+    }
+
+    /// Asks the scheduler to look at the queue now.
+    pub fn wake(&self) {
+        self.inner.wake.notify_one();
+    }
+
+    /// Triggers dropped since this server started because their agent's queue
+    /// was full.
+    pub fn queue_full_drops(&self) -> u64 {
+        self.inner.queue_full_drops.load(Ordering::SeqCst)
     }
 
     fn stopping(&self) -> bool {
@@ -322,12 +435,31 @@ impl Runner {
                 failed: None,
                 worktree_root: self.inner.config.data_dir.to_str().map(str::to_string),
                 base_branch: request.base_branch.clone(),
+                comment_id: request.comment_id,
+                limits: Some(self.limits()),
             },
         )?;
-        if created.duplicate || edited {
+        // A queued run has no message to render yet: that happens when it
+        // starts, so it sees the issue as it is then.
+        if created.duplicate || edited || created.run.status != RunStatus::Starting {
             return Ok(created);
         }
+        self.render_first_message(tx, now, &mut created, request.comment_id, request.actor)?;
+        Ok(created)
+    }
+
+    /// Renders the first message of a run that is `starting` and stores it in
+    /// `tx`; a template that fails validation ends the run `failed` instead.
+    fn render_first_message(
+        &self,
+        tx: &Transaction<'_>,
+        now: i64,
+        created: &mut Created,
+        comment_id: Option<i64>,
+        actor: Option<i64>,
+    ) -> Result<(), StoreError> {
         let id = created.run.id;
+        let project = created.run.project.clone();
         // The path and the branch are known from the run's id before git has
         // made anything, so the message can name them.
         let tree = created.run.worktree_path.clone();
@@ -336,13 +468,13 @@ impl Runner {
             tx,
             now,
             &PromptRequest {
-                agent_id: request.agent_id,
-                project: &request.project,
-                number: request.number,
+                agent_id: created.run.agent_id,
+                project: &project,
+                number: created.run.issue_number,
                 trigger: TriggerCtx {
-                    kind: kind_of(request.reason),
-                    comment_id: request.comment_id,
-                    actor_id: request.actor,
+                    kind: kind_of(created.run.reason),
+                    comment_id,
+                    actor_id: actor,
                 },
                 workdir: tree.as_deref(),
                 branch: branch.as_deref(),
@@ -363,13 +495,85 @@ impl Runner {
                 let mut outcome = Outcome::new(RunStatus::Failed)
                     .error(format!("prompt template invalid: {why}"));
                 outcome.worktree = Some(WorktreeEnd::none("the run never started"));
-                runs::finish_run(tx, now, request.actor, id, outcome)?;
+                runs::finish_run(tx, now, actor, id, outcome)?;
                 created.key = None;
                 created.run = runs::get_run(tx, id)?.run;
             }
             Err(other) => return Err(other),
         }
-        Ok(created)
+        Ok(())
+    }
+
+    /// One scheduler pass inside `tx` (see `runs::schedule`), with the first
+    /// message of each promoted run rendered in the same transaction.
+    fn schedule_in_tx(&self, tx: &Transaction<'_>, now: i64) -> Result<Scheduled, StoreError> {
+        let root = self.inner.config.data_dir.to_str();
+        let mut done = runs::schedule(
+            tx,
+            now,
+            &self.inner.boot_id,
+            root,
+            &self.limits(),
+            !self.stopping(),
+        )?;
+        for promotion in &mut done.promoted {
+            if promotion.created.run.edited {
+                continue;
+            }
+            self.render_first_message(
+                tx,
+                now,
+                &mut promotion.created,
+                promotion.comment_id,
+                promotion.actor,
+            )?;
+        }
+        Ok(done)
+    }
+
+    // ---- the scheduler ----
+
+    async fn schedule_loop(&self) {
+        let mut halt = self.inner.halt.subscribe();
+        loop {
+            if self.stopping() {
+                return;
+            }
+            match self.schedule_once().await {
+                Ok(()) => {}
+                Err(StoreError::Closed) => return,
+                Err(err) => tracing::warn!(error = %err, "the scheduler could not run; retrying"),
+            }
+            tokio::select! {
+                () = self.inner.wake.notified() => {}
+                () = tokio::time::sleep(self.inner.config.options.schedule_every) => {}
+                _ = halt.wait_for(|stopped| *stopped) => return,
+            }
+        }
+    }
+
+    async fn schedule_once(&self) -> Result<(), StoreError> {
+        let waiting = self.inner.store.read(runs::queued_count).await?;
+        if waiting == 0 {
+            return Ok(());
+        }
+        let me = self.clone();
+        let done = self
+            .inner
+            .store
+            .write_background(move |tx| me.schedule_in_tx(tx, now_millis()))
+            .await?;
+        for (id, why) in &done.canceled {
+            tracing::info!(run = id, %why, "queued run canceled");
+        }
+        if !done.promoted.is_empty() {
+            failpoints::hit(Point::RunAfterPromote);
+        }
+        for promotion in done.promoted {
+            tracing::info!(run = promotion.created.run.id, "queued run promoted");
+            self.launch(promotion.created);
+        }
+        Ok(())
     }
 
     /// Starts the process of a run [`Runner::create_in_tx`] committed. Does
@@ -488,12 +692,24 @@ impl Runner {
             Ok(created) if created.duplicate => {
                 tracing::debug!(event = trigger.event_id, "event already has its run");
             }
+            Ok(created) if created.run.status == RunStatus::Queued => {
+                tracing::info!(
+                    run = created.run.id, issue = %trigger.issue, reason = ?trigger.reason,
+                    "run queued: a limit is reached"
+                );
+                failpoints::hit(Point::RunAfterQueue);
+                self.wake();
+            }
             Ok(created) => {
                 tracing::info!(
                     run = created.run.id, issue = %trigger.issue, reason = ?trigger.reason,
                     "run created"
                 );
                 self.launch(created);
+            }
+            Err(StoreError::Rejected(Rejection::Conflict(why))) if runs::is_queue_full(&why) => {
+                self.inner.queue_full_drops.fetch_add(1, Ordering::SeqCst);
+                tracing::warn!(event = trigger.event_id, %why, "trigger dropped: the queue is full");
             }
             Err(StoreError::Rejected(Rejection::Conflict(why))) => {
                 tracing::info!(event = trigger.event_id, %why, "trigger dropped");
@@ -530,6 +746,8 @@ impl Runner {
         }
         lock(&self.inner.active).remove(&run_id);
         control.done.send_replace(true);
+        // The run's slot is free: let the queue move.
+        self.wake();
     }
 
     async fn execute(&self, run_id: i64, key: String, control: Arc<Control>) {
@@ -1041,6 +1259,10 @@ impl Runner {
         if let Some(handle) = handle {
             let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
         }
+        let handle = lock(&self.inner.scheduler).take();
+        if let Some(handle) = handle {
+            let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+        }
         let boot = self.inner.boot_id.clone();
         match self
             .inner
@@ -1080,6 +1302,26 @@ mod tests {
         assert_eq!(split_issue("TRK-0"), None);
         assert_eq!(split_issue("TRK"), None);
         assert_eq!(split_issue("TRK-x"), None);
+    }
+
+    #[tokio::test]
+    async fn a_task_that_panics_is_started_again_and_one_that_returns_is_not() {
+        let starts = Arc::new(AtomicU32::new(0));
+        let counter = starts.clone();
+        keep_running("test", Duration::from_millis(1), move || {
+            let counter = counter.clone();
+            async move {
+                if counter.fetch_add(1, Ordering::SeqCst) < 2 {
+                    panic!("deliberate");
+                }
+            }
+        })
+        .await;
+        assert_eq!(
+            starts.load(Ordering::SeqCst),
+            3,
+            "two panics, then a clean end"
+        );
     }
 
     #[test]

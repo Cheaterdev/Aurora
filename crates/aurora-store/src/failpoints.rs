@@ -16,6 +16,8 @@
 //! | `run_after_spawn`              | runner, process spawned, run not yet marked `running`                     | same; the stray process is for TRK-45 to reap                   |
 //! | `run_before_finish`            | runner, process exited, the finish not yet committed                      | same                                                            |
 //! | `run_after_transcript_write`   | runner, a batch of output appended to the transcript, process still running | same; the transcript file is readable up to its last complete line |
+//! | `run_after_queue`              | runner, a run committed as `queued` (limits reached), nothing else done   | the run is still `queued`, no key, no process; it is promoted once, never twice |
+//! | `run_after_promote`            | scheduler, a queued run committed as `starting` (key, plan), not spawned  | the run is `interrupted` (it was active), key revoked; nothing starts twice |
 //!
 //! `before_commit` and `after_commit` are in [`crate::Store::write`], so they
 //! cover every write of the server except the start-up and hourly purge of old
@@ -51,10 +53,12 @@ pub enum Point {
     RunAfterSpawn,
     RunBeforeFinish,
     RunAfterTranscriptWrite,
+    RunAfterQueue,
+    RunAfterPromote,
 }
 
 impl Point {
-    pub const ALL: [Point; 11] = [
+    pub const ALL: [Point; 13] = [
         Point::BeforeCommit,
         Point::AfterCommit,
         Point::AfterCommitBeforeResponse,
@@ -66,6 +70,8 @@ impl Point {
         Point::RunAfterSpawn,
         Point::RunBeforeFinish,
         Point::RunAfterTranscriptWrite,
+        Point::RunAfterQueue,
+        Point::RunAfterPromote,
     ];
 
     pub fn name(self) -> &'static str {
@@ -81,6 +87,8 @@ impl Point {
             Point::RunAfterSpawn => "run_after_spawn",
             Point::RunBeforeFinish => "run_before_finish",
             Point::RunAfterTranscriptWrite => "run_after_transcript_write",
+            Point::RunAfterQueue => "run_after_queue",
+            Point::RunAfterPromote => "run_after_promote",
         }
     }
 

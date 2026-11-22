@@ -2,15 +2,39 @@
 //!
 //! The store only keeps the record; the process itself is the runner's
 //! business (`crates/aurora/src/runner`). A run goes
-//! `starting -> running -> succeeded | failed | interrupted | canceled`; a run
-//! that never got a process (the template is invalid, the command is missing)
-//! goes `starting -> failed`, and one whose first message cannot even be
-//! rendered is created already `failed`.
+//! `[queued ->] starting -> running -> succeeded | failed | interrupted |
+//! canceled`; a run that never got a process (the template is invalid, the
+//! command is missing) goes `starting -> failed`, and one whose first message
+//! cannot even be rendered is created already `failed`. `interrupted` is what a
+//! crash or a stop of the server leaves behind for a run that was active
+//! (`starting` or `running`); a `queued` run is never interrupted, it waits.
+//!
+//! # The queue (TRK-18)
+//!
+//! [`create_run`] given [`Limits`] decides inside its own transaction whether
+//! the run may start now: the number of `starting` and `running` runs must be
+//! below the global limit and below the agent's `max_concurrent`, and no older
+//! queued run may be eligible to go first. Otherwise the run is created
+//! `queued`: it records who or what asked (reason, trigger event, actor,
+//! comment, manual message and base branch) and holds **no process, key,
+//! working copy or transcript**. [`schedule`] promotes queued runs oldest
+//! first (an agent at its limit is skipped, not waited for) and re-checks each
+//! one before it starts: a disabled agent, a removed project access or an
+//! archived issue ends the queued run `canceled` with the reason. The first
+//! message of a promoted run is rendered by the runner in the promoting
+//! transaction, so it sees the issue as it is then.
+//!
+//! A queued run is the pending intent for its issue and counts as active for
+//! the one-active-run rule: a second trigger for the issue is dropped, exactly
+//! as for a running one. The cap on queued runs per agent is
+//! [`Limits::max_queued_per_agent`]; a trigger beyond it is refused with
+//! [`QUEUE_FULL`].
 //!
 //! # Rules the database and this module enforce
 //!
 //! * **One active run per issue**: a partial unique index over
-//!   `status IN ('starting', 'running')`. Creating a second is `Conflict`.
+//!   `status IN ('queued', 'starting', 'running')`. Creating a second is
+//!   `Conflict`.
 //! * **One run per (trigger event, agent)**: the runner is told about an event
 //!   at least once, so a redelivered event finds its run
 //!   ([`Created::duplicate`]) instead of making another.
@@ -36,7 +60,10 @@
 //! asked (a manual start, a cancel) and absent for the system:
 //!
 //! * `run.created` `{agent_id, issue: {number, identifier}, reason,
-//!   trigger_event_id, template_source, branch, worktree_state}`
+//!   trigger_event_id, template_source, branch, worktree_state, queued}`
+//!   (`queued: true` for a run that waits; its `branch` is null until promoted)
+//! * `run.promoted` `{branch, worktree_state}`: `queued` to `starting`, in the
+//!   transaction that also mints the key and plans the working copy
 //! * `run.started` `{pid}`
 //! * `run.finished` `{status, exit_code, error?, worktree_state?, has_changes?,
 //!   transcript_bytes?}` (`transcript_bytes` is the size of the transcript file
@@ -99,6 +126,7 @@ pub const MAX_LIMIT: i64 = 200;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RunStatus {
+    Queued,
     Starting,
     Running,
     Succeeded,
@@ -110,6 +138,7 @@ pub enum RunStatus {
 impl RunStatus {
     pub fn as_str(self) -> &'static str {
         match self {
+            RunStatus::Queued => "queued",
             RunStatus::Starting => "starting",
             RunStatus::Running => "running",
             RunStatus::Succeeded => "succeeded",
@@ -121,6 +150,7 @@ impl RunStatus {
 
     pub fn parse(text: &str) -> Option<RunStatus> {
         Some(match text {
+            "queued" => RunStatus::Queued,
             "starting" => RunStatus::Starting,
             "running" => RunStatus::Running,
             "succeeded" => RunStatus::Succeeded,
@@ -131,7 +161,16 @@ impl RunStatus {
         })
     }
 
+    /// Not finished: queued, starting or running.
     pub fn is_active(self) -> bool {
+        matches!(
+            self,
+            RunStatus::Queued | RunStatus::Starting | RunStatus::Running
+        )
+    }
+
+    /// Holds a slot of the limits: starting or running (a queued run does not).
+    pub fn holds_slot(self) -> bool {
         matches!(self, RunStatus::Starting | RunStatus::Running)
     }
 }
@@ -349,6 +388,12 @@ pub struct Run {
     pub transcript_bytes: i64,
     /// The transcript hit its size cap and the rest of the output is not in it.
     pub transcript_truncated: bool,
+    /// When the run was queued; kept after it was promoted. `None` for a run
+    /// that started at once.
+    pub queued_at: Option<i64>,
+    /// 1-based place among all queued runs, oldest first; `None` unless the
+    /// run is `queued`. Computed when read.
+    pub queue_position: Option<i64>,
 }
 
 /// A run with the sensitive text. Owner and members only.
@@ -367,7 +412,11 @@ const RUN_SELECT: &str = "SELECT r.id, r.agent_id, u.name, p.key, i.number, r.re
         r.error, r.output_truncated, r.started, r.finished, r.created, r.created_by,
         r.worktree_path, r.branch, r.base_ref, r.base_commit, r.worktree_state, r.has_changes,
         r.changed_files, r.ahead, r.worktree_note,
-        r.message, r.output_tail, r.transcript_bytes, r.transcript_truncated
+        r.message, r.output_tail, r.transcript_bytes, r.transcript_truncated, r.queued_at,
+        CASE WHEN r.status = 'queued' THEN
+            (SELECT COUNT(*) FROM run q WHERE q.status = 'queued'
+                AND (q.queued_at < r.queued_at OR (q.queued_at = r.queued_at AND q.id <= r.id)))
+        END
      FROM run r
      JOIN agent a ON a.id = r.agent_id
      JOIN user u ON u.id = a.user_id
@@ -410,6 +459,8 @@ fn run_row(row: &Row<'_>) -> rusqlite::Result<RunDetail> {
             worktree_note: row.get(27)?,
             transcript_bytes: row.get(30)?,
             transcript_truncated: row.get(31)?,
+            queued_at: row.get(32)?,
+            queue_position: row.get(33)?,
         },
         message: row.get(28)?,
         output_tail: row.get(29)?,
@@ -455,6 +506,46 @@ pub struct NewRun {
     pub worktree_root: Option<String>,
     /// Start from this branch instead of the project's `base_branch`.
     pub base_branch: Option<String>,
+    /// The comment the first message may refer to; kept on a queued run until
+    /// it is promoted.
+    pub comment_id: Option<i64>,
+    /// `None`: no limits, the run always starts at once (store-level tests).
+    pub limits: Option<Limits>,
+}
+
+/// What decides between starting a run at once and queueing it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Limits {
+    /// At most this many runs `starting` or `running` at the same time.
+    pub max_runs: i64,
+    /// At most this many `queued` runs per agent.
+    pub max_queued_per_agent: i64,
+    /// Queued runs older than this many milliseconds are canceled; 0 for never.
+    pub max_queue_wait_ms: i64,
+}
+
+impl Limits {
+    pub const DEFAULT_MAX_RUNS: i64 = 4;
+    pub const DEFAULT_MAX_QUEUED_PER_AGENT: i64 = 20;
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Limits {
+            max_runs: Limits::DEFAULT_MAX_RUNS,
+            max_queued_per_agent: Limits::DEFAULT_MAX_QUEUED_PER_AGENT,
+            max_queue_wait_ms: 0,
+        }
+    }
+}
+
+/// The start of the `Conflict` text of a trigger that found its agent's queue
+/// full; see [`is_queue_full`].
+pub const QUEUE_FULL: &str = "queue full";
+
+/// Whether a `Conflict` text says the agent's queue was full.
+pub fn is_queue_full(why: &str) -> bool {
+    why.starts_with(QUEUE_FULL)
 }
 
 /// The longest branch name [`branch_name`] makes.
@@ -587,7 +678,7 @@ pub fn create_run(
     }
     let active: Option<i64> = tx
         .query_row(
-            "SELECT id FROM run WHERE issue_id = ?1 AND status IN ('starting', 'running')",
+            "SELECT id FROM run WHERE issue_id = ?1 AND status IN ('queued', 'starting', 'running')",
             [issue_id],
             |row| row.get(0),
         )
@@ -598,19 +689,44 @@ pub fn create_run(
         )));
     }
 
+    let mut queued = false;
+    if new.failed.is_none()
+        && let Some(limits) = &new.limits
+        && !has_capacity(tx, agent.id, agent.max_concurrent, limits)?
+    {
+        let waiting: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM run WHERE agent_id = ?1 AND status = 'queued'",
+            [agent.id],
+            |row| row.get(0),
+        )?;
+        if waiting >= limits.max_queued_per_agent {
+            return Err(conflict(format!(
+                "{QUEUE_FULL}: agent {} already has {waiting} queued run(s), at most {} are kept",
+                agent.name, limits.max_queued_per_agent
+            )));
+        }
+        queued = true;
+    }
     let (status, finished, error) = match &new.failed {
         Some(error) => (
             RunStatus::Failed,
             Some(now),
             Some(clip(error, MAX_ERROR_CHARS)),
         ),
+        None if queued => (RunStatus::Queued, None, None),
         None => (RunStatus::Starting, None, None),
+    };
+    let (queued_at, comment, requested_branch) = if queued {
+        (Some(now), new.comment_id, new.base_branch.clone())
+    } else {
+        (None, None, None)
     };
     tx.execute(
         "INSERT INTO run (agent_id, issue_id, project_id, trigger_event_id, reason, status,
                           boot_id, message, template_source, template_id, edited, error,
-                          finished, created, created_by)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                          finished, created, created_by, queued_at, trigger_comment_id,
+                          requested_base_branch)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
         params![
             agent.id,
             issue_id,
@@ -626,7 +742,10 @@ pub fn create_run(
             error,
             finished,
             now,
-            actor
+            actor,
+            queued_at,
+            comment,
+            requested_branch
         ],
     )
     .map_err(|err| {
@@ -637,61 +756,22 @@ pub fn create_run(
     let id = tx.last_insert_rowid();
 
     let mut secret = None;
-    if new.failed.is_none() {
-        let principal = Principal {
-            user_id: agent.user_id,
-            role: Role::Agent,
-            scope: Scope::Write,
-        };
-        let key = auth::create_key(
-            tx,
-            now,
-            &principal,
-            agent.user_id,
-            &format!("run-{id}"),
-            Scope::Write,
-        )?;
-        tx.execute(
-            "UPDATE run SET key_id = ?1 WHERE id = ?2",
-            params![key.info.id, id],
-        )?;
-        secret = Some(key.key);
-    }
-
-    let fixed_folder = agent
-        .private
-        .as_ref()
-        .is_none_or(|private| private.work_dir.is_some());
     let mut branch = None;
     let mut worktree_state = WorktreeState::None;
-    if new.failed.is_none()
-        && !fixed_folder
-        && let Some(root) = &new.worktree_root
-    {
-        let repo: Option<(Option<String>, Option<String>)> = tx
-            .query_row(
-                "SELECT repo_path, base_branch FROM project WHERE id = ?1",
-                [project_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()?;
-        if let Some((Some(repo), configured)) = repo {
-            let name = branch_name(&new.project, new.number, id);
-            tx.execute(
-                "UPDATE run SET worktree_path = ?1, worktree_repo = ?2, branch = ?3,
-                                base_ref = ?4, worktree_state = 'created'
-                 WHERE id = ?5",
-                params![
-                    worktree_dir(root, id),
-                    repo,
-                    name,
-                    new.base_branch.clone().or(configured),
-                    id
-                ],
-            )?;
-            branch = Some(name);
-            worktree_state = WorktreeState::Created;
-        }
+    if new.failed.is_none() && !queued {
+        let armed = arm_run(
+            tx,
+            now,
+            &agent,
+            id,
+            project_id,
+            (&new.project, new.number),
+            new.worktree_root.as_deref(),
+            new.base_branch.as_deref(),
+        )?;
+        secret = Some(armed.secret);
+        branch = armed.branch;
+        worktree_state = armed.worktree_state;
     }
     emit_as(
         tx,
@@ -709,6 +789,7 @@ pub fn create_run(
             "template_source": new.template_source,
             "branch": branch,
             "worktree_state": worktree_state,
+            "queued": queued,
         }),
     )?;
     if let Some(error) = &error {
@@ -728,6 +809,420 @@ pub fn create_run(
         key: secret,
         duplicate: false,
     })
+}
+
+/// Whether a run of `agent_id` may start now: both limits have room and no
+/// older queued run that could start is waiting (it goes first; the scheduler
+/// promotes it on its next pass).
+fn has_capacity(
+    conn: &Connection,
+    agent_id: i64,
+    max_concurrent: i64,
+    limits: &Limits,
+) -> Result<bool, StoreError> {
+    let running: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM run WHERE status IN ('starting', 'running')",
+        [],
+        |row| row.get(0),
+    )?;
+    if running >= limits.max_runs {
+        return Ok(false);
+    }
+    let mine: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM run WHERE agent_id = ?1 AND status IN ('starting', 'running')",
+        [agent_id],
+        |row| row.get(0),
+    )?;
+    if mine >= max_concurrent {
+        return Ok(false);
+    }
+    let older_waits: bool = conn.query_row(
+        "SELECT EXISTS (
+             SELECT 1 FROM run q JOIN agent a ON a.id = q.agent_id
+             WHERE q.status = 'queued'
+               AND (SELECT COUNT(*) FROM run x
+                    WHERE x.agent_id = q.agent_id AND x.status IN ('starting', 'running'))
+                   < a.max_concurrent)",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(!older_waits)
+}
+
+/// What starting a run needs beyond its row: the per-run key and, for a
+/// project with a repository, the planned working copy.
+struct Armed {
+    secret: String,
+    branch: Option<String>,
+    worktree_state: WorktreeState,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn arm_run(
+    tx: &Transaction<'_>,
+    now: i64,
+    agent: &agents::Agent,
+    run_id: i64,
+    project_id: i64,
+    issue: (&str, i64),
+    worktree_root: Option<&str>,
+    base_branch: Option<&str>,
+) -> Result<Armed, StoreError> {
+    let principal = Principal {
+        user_id: agent.user_id,
+        role: Role::Agent,
+        scope: Scope::Write,
+    };
+    let key = auth::create_key(
+        tx,
+        now,
+        &principal,
+        agent.user_id,
+        &format!("run-{run_id}"),
+        Scope::Write,
+    )?;
+    tx.execute(
+        "UPDATE run SET key_id = ?1 WHERE id = ?2",
+        params![key.info.id, run_id],
+    )?;
+
+    let fixed_folder = agent
+        .private
+        .as_ref()
+        .is_none_or(|private| private.work_dir.is_some());
+    let mut branch = None;
+    let mut worktree_state = WorktreeState::None;
+    if !fixed_folder && let Some(root) = worktree_root {
+        let repo: Option<(Option<String>, Option<String>)> = tx
+            .query_row(
+                "SELECT repo_path, base_branch FROM project WHERE id = ?1",
+                [project_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        if let Some((Some(repo), configured)) = repo {
+            let name = branch_name(issue.0, issue.1, run_id);
+            tx.execute(
+                "UPDATE run SET worktree_path = ?1, worktree_repo = ?2, branch = ?3,
+                                base_ref = ?4, worktree_state = 'created'
+                 WHERE id = ?5",
+                params![
+                    worktree_dir(root, run_id),
+                    repo,
+                    name,
+                    base_branch.map(str::to_string).or(configured),
+                    run_id
+                ],
+            )?;
+            branch = Some(name);
+            worktree_state = WorktreeState::Created;
+        }
+    }
+    Ok(Armed {
+        secret: key.key,
+        branch,
+        worktree_state,
+    })
+}
+
+/// A queued run that [`schedule`] started: its row is `starting`, its key is
+/// minted and its working copy planned. The first message is still the
+/// caller's to render (unless `run.edited`: a person's text is kept).
+#[derive(Debug)]
+pub struct Promotion {
+    pub created: Created,
+    /// The comment the template may refer to.
+    pub comment_id: Option<i64>,
+    /// Who asked for the run when it was queued (the event's actor or the
+    /// person who started it).
+    pub actor: Option<i64>,
+}
+
+/// What one [`schedule`] pass did.
+#[derive(Debug, Default)]
+pub struct Scheduled {
+    pub promoted: Vec<Promotion>,
+    /// Queued runs that ended `canceled` instead of starting, with the reason.
+    pub canceled: Vec<(i64, String)>,
+}
+
+/// Why a queued run may no longer start, if so.
+fn queued_problem(tx: &Transaction<'_>, id: i64) -> Result<Option<String>, StoreError> {
+    let (agent_id, project, issue_id): (i64, String, i64) = tx.query_row(
+        "SELECT r.agent_id, p.key, r.issue_id FROM run r JOIN project p ON p.id = r.project_id
+         WHERE r.id = ?1",
+        [id],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    let agent = agents::agent_config(tx, agent_id)?;
+    if !agent.enabled {
+        return Ok(Some("agent disabled".to_string()));
+    }
+    if auth::get_user(tx, agent.user_id)?.disabled {
+        return Ok(Some("agent user disabled".to_string()));
+    }
+    if !agent.projects.contains(&project) {
+        return Ok(Some(format!(
+            "agent no longer has access to project {project}"
+        )));
+    }
+    let archived: bool = tx.query_row(
+        "SELECT archived <> 0 FROM issue WHERE id = ?1",
+        [issue_id],
+        |row| row.get(0),
+    )?;
+    if archived {
+        return Ok(Some("issue archived".to_string()));
+    }
+    Ok(None)
+}
+
+/// One pass of the scheduler, in the caller's transaction:
+///
+/// 1. queued runs older than `limits.max_queue_wait_ms` (when set) are
+///    canceled ("queue wait exceeded");
+/// 2. every queued run is checked again: a disabled agent or user, a project
+///    the agent may no longer access and an archived issue cancel it with that
+///    reason, so a queue never starts what is no longer allowed;
+/// 3. queued runs are promoted oldest first while the global limit has room,
+///    skipping a run whose agent is at its own limit (it does not hold the
+///    others back).
+///
+/// Nothing is promoted when `start` is false (the server is stopping).
+pub fn schedule(
+    tx: &Transaction<'_>,
+    now: i64,
+    boot_id: &str,
+    worktree_root: Option<&str>,
+    limits: &Limits,
+    start: bool,
+) -> Result<Scheduled, StoreError> {
+    let mut out = Scheduled::default();
+    let waiting: Vec<(i64, i64)> = {
+        let mut stmt = tx.prepare(
+            "SELECT id, queued_at FROM run WHERE status = 'queued' ORDER BY queued_at, id",
+        )?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        rows.collect::<Result<_, _>>()?
+    };
+    for (id, queued_at) in waiting {
+        let why = if limits.max_queue_wait_ms > 0 && now - queued_at >= limits.max_queue_wait_ms {
+            Some("queue wait exceeded".to_string())
+        } else {
+            queued_problem(tx, id)?
+        };
+        if let Some(why) = why {
+            let outcome = Outcome::new(RunStatus::Canceled).error(why.clone());
+            if finish_run(tx, now, None, id, outcome)? {
+                out.canceled.push((id, why));
+            }
+        }
+    }
+    // `while start` would never change `start`; the loop ends by `break`.
+    loop {
+        if !start {
+            break;
+        }
+        let running: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM run WHERE status IN ('starting', 'running')",
+            [],
+            |row| row.get(0),
+        )?;
+        if running >= limits.max_runs {
+            break;
+        }
+        let next: Option<i64> = tx
+            .query_row(
+                "SELECT q.id FROM run q JOIN agent a ON a.id = q.agent_id
+                 WHERE q.status = 'queued'
+                   AND (SELECT COUNT(*) FROM run x
+                        WHERE x.agent_id = q.agent_id AND x.status IN ('starting', 'running'))
+                       < a.max_concurrent
+                 ORDER BY q.queued_at, q.id LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(id) = next else {
+            break;
+        };
+        out.promoted
+            .push(promote(tx, now, id, boot_id, worktree_root)?);
+    }
+    Ok(out)
+}
+
+fn promote(
+    tx: &Transaction<'_>,
+    now: i64,
+    id: i64,
+    boot_id: &str,
+    worktree_root: Option<&str>,
+) -> Result<Promotion, StoreError> {
+    #[allow(clippy::type_complexity)]
+    let (agent_id, project_id, project, number, comment_id, actor, base_branch): (
+        i64,
+        i64,
+        String,
+        i64,
+        Option<i64>,
+        Option<i64>,
+        Option<String>,
+    ) = tx.query_row(
+        "SELECT r.agent_id, r.project_id, p.key, i.number, r.trigger_comment_id, r.created_by,
+                r.requested_base_branch
+         FROM run r JOIN project p ON p.id = r.project_id JOIN issue i ON i.id = r.issue_id
+         WHERE r.id = ?1",
+        [id],
+        |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
+            ))
+        },
+    )?;
+    let changed = tx.execute(
+        "UPDATE run SET status = 'starting', boot_id = ?1 WHERE id = ?2 AND status = 'queued'",
+        params![boot_id, id],
+    )?;
+    if changed == 0 {
+        return Err(conflict("the run is not queued"));
+    }
+    let agent = agents::agent_config(tx, agent_id)?;
+    let armed = arm_run(
+        tx,
+        now,
+        &agent,
+        id,
+        project_id,
+        (&project, number),
+        worktree_root,
+        base_branch.as_deref(),
+    )?;
+    emit_as(
+        tx,
+        now,
+        None,
+        Some(project_id),
+        "run",
+        id,
+        "run.promoted",
+        &json!({ "branch": armed.branch, "worktree_state": armed.worktree_state }),
+    )?;
+    Ok(Promotion {
+        created: Created {
+            run: get_run(tx, id)?.run,
+            key: Some(armed.secret),
+            duplicate: false,
+        },
+        comment_id,
+        actor,
+    })
+}
+
+/// How many runs are queued.
+pub fn queued_count(conn: &Connection) -> Result<i64, StoreError> {
+    Ok(conn.query_row(
+        "SELECT COUNT(*) FROM run WHERE status = 'queued'",
+        [],
+        |row| row.get(0),
+    )?)
+}
+
+/// One queued run in the queue view.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct QueueEntry {
+    pub run_id: i64,
+    pub agent_id: i64,
+    pub agent: String,
+    pub project: String,
+    /// `KEY-n`.
+    pub issue: String,
+    pub queued_at: i64,
+    /// 1-based among all queued runs, oldest first, whoever may see them.
+    pub position: i64,
+    /// `agent`: its agent is at its own limit; `global`: the overall limit (or
+    /// an older run that goes first) holds it back.
+    pub waiting_on: &'static str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct QueueView {
+    /// Runs `starting` or `running` (of the readable projects).
+    pub running: i64,
+    pub queued: Vec<QueueEntry>,
+}
+
+/// The queue, oldest first. `allowed` limits it to runs of those projects
+/// (`None`: every project, an empty list: none); `agent_id` to one agent.
+pub fn queue_view(
+    conn: &Connection,
+    allowed: Option<&[String]>,
+    agent_id: Option<i64>,
+) -> Result<QueueView, StoreError> {
+    let visible = |project: &str, agent: i64| {
+        allowed.is_none_or(|keys| keys.iter().any(|key| key == project))
+            && agent_id.is_none_or(|wanted| wanted == agent)
+    };
+    let mut stmt = conn.prepare(
+        "SELECT r.id, r.agent_id, u.name, p.key, i.number, r.queued_at,
+                (SELECT COUNT(*) FROM run x
+                 WHERE x.agent_id = r.agent_id AND x.status IN ('starting', 'running'))
+                    >= a.max_concurrent
+         FROM run r
+         JOIN agent a ON a.id = r.agent_id
+         JOIN user u ON u.id = a.user_id
+         JOIN issue i ON i.id = r.issue_id
+         JOIN project p ON p.id = r.project_id
+         WHERE r.status = 'queued' ORDER BY r.queued_at, r.id",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, i64>(4)?,
+            row.get::<_, i64>(5)?,
+            row.get::<_, bool>(6)?,
+        ))
+    })?;
+    let mut queued = Vec::new();
+    for (index, row) in rows.enumerate() {
+        let (run_id, agent, name, project, number, queued_at, agent_full) = row?;
+        if visible(&project, agent) {
+            queued.push(QueueEntry {
+                run_id,
+                agent_id: agent,
+                agent: name,
+                issue: format!("{project}-{number}"),
+                project,
+                queued_at,
+                position: i64::try_from(index).unwrap_or(i64::MAX - 1) + 1,
+                waiting_on: if agent_full { "agent" } else { "global" },
+            });
+        }
+    }
+    let mut stmt = conn.prepare(
+        "SELECT p.key, r.agent_id FROM run r JOIN project p ON p.id = r.project_id
+         WHERE r.status IN ('starting', 'running')",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+    })?;
+    let mut running = 0;
+    for row in rows {
+        let (project, agent) = row?;
+        if visible(&project, agent) {
+            running += 1;
+        }
+    }
+    Ok(QueueView { running, queued })
 }
 
 fn check_message(message: &str) -> Result<(), StoreError> {

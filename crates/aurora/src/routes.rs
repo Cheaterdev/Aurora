@@ -134,6 +134,7 @@ fn api_tables() -> (Table, Table) {
             post(prompts::preview),
         )
         .route("/agents/{id}/runs", &["POST"], post(runs::start_run))
+        .route("/queue", &["GET"], get(runs::get_queue))
         .route("/runs", &["GET"], get(runs::list_runs))
         .route("/runs/{id}", &["GET"], get(runs::get_run))
         .route("/runs/{id}/cancel", &["POST"], post(runs::cancel_run))

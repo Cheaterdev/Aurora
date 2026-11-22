@@ -69,7 +69,7 @@ async fn populated_version_fourteen_database_gets_the_working_copy_columns() {
     drop(raw);
 
     let store = Store::open(&path).unwrap();
-    assert_eq!(store.schema_version(), 16);
+    assert_eq!(store.schema_version(), 17);
     let backup = store.open_report().backup.clone().expect("backup taken");
     assert!(backup.starts_with(default_backup_dir(&path)));
     let (repo, base, rules, run) = store
@@ -236,6 +236,8 @@ fn new_run(agent: i64, number: i64, root: Option<&str>) -> NewRun {
         failed: None,
         worktree_root: root.map(str::to_string),
         base_branch: None,
+        comment_id: None,
+        limits: None,
     }
 }
 

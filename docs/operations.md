@@ -45,6 +45,7 @@ command exits with 2 and says so; check a copy then.
 | `search.index` | the full-text index holds exactly the issues, comments and documents that should be in it |
 | `prompt_templates.valid` | every stored prompt template parses and uses only known variables, and its issue type belongs to its project, so a run can never start from a template that fails validation |
 | `runs.no_orphans` | an active run (`starting`/`running`) has a live key of its agent's user, no finish time, and a pid once `running`; a finished run has a finish time and no live key. (Foreign keys and a unique index cover missing rows and two active runs on one issue.) Offline (`aurora check`) an active run is allowed, because nobody can say whether its process lives; the server's own check right after start-up also demands that every active run belongs to the current boot |
+| `runs.queue` | a `queued` run has a queue time, no start or finish time, no process, no key, no working copy and no transcript; every run has a `run.created` event; a queued run has no `run.promoted`, `run.started` or `run.finished` in the log. How many runs are going is deliberately **not** checked against any limit: limits can be lowered while runs are going, and those finish on their own. (A second active run for an issue is impossible by the unique index, which counts `queued`.) |
 | `runs.worktrees` | a run's working copy is consistent with its row: a planned, kept or removed worktree has a folder path, a branch and the repository it belongs to; `removed` never goes with changes (`has_changes`, changed files or commits ahead); a run with no working copy (or one not yet settled) reports no changes; a run that is still active is not `kept` or `removed` yet; and a finished run is no longer `created` (a canceled run may be for the moment before its process is reaped). Only the database can fail this check. A folder that is missing for a `kept` copy, or still there for a `removed` one, is reported as a note and never fails, because the disk can legitimately differ (a person removed it by hand) |
 | `runs.transcripts` | a run's recorded transcript size and truncation flag make sense (nothing recorded while the run is active; truncated only with a size), and a recorded size equals the size of `<folder of the database>/transcripts/<run id>.log`: the runner records it once, after its last write and sync, so a different size means the file was edited, cut or replaced. A size of 0 means "not recorded" (a crash, or a run that never had a process) and is never compared, because a crashed run's file may hold more than anyone recorded. A missing file is only a note (a copy of the database checked elsewhere, a backup without the data folder, a person who moved it) |
 
@@ -98,6 +99,8 @@ named place in the write path. They are listed in one place,
 | `run_before_finish` | runner, process exited, the finish not yet committed | same |
 | `run_after_worktree` | runner, the run's git worktree and branch made, process not spawned | the run is `interrupted`, its working copy is `kept` (never claimed removed, never deleted), the folder and the branch are still there, no second run; the leftover is for a person to remove (see "Working copies") |
 | `run_after_transcript_write` | runner, a batch of output appended to the run's transcript, the process still running | the run is `interrupted` ("server restarted"), no second run, `aurora check` passes; the transcript file exists and is readable up to its last complete line (a half-written last line is ignored, never an error); its size is not recorded (`transcript_bytes` 0) and no end marker was written |
+| `run_after_queue` | runner, a run committed as `queued` (a limit was reached), nothing else done | after the restart the run is still `queued` (no key, no process, no worktree), it is promoted and runs exactly once, the redelivered trigger makes no second run, `aurora check` passes |
+| `run_after_promote` | scheduler, a queued run committed as `starting` (key minted, working copy planned, message written), process not spawned | the run is `interrupted` ("server restarted") like any run that was active, its key is revoked, nothing starts twice, `aurora check` passes |
 
 Arm one with `AURORA_TEST_FAILPOINT=<name>` (first hit) or `<name>:<n>` (the n-th
 hit of that point in this process). `before_commit` and `after_commit` cover
@@ -127,17 +130,24 @@ rules are in `docs/api.md` (Runs); this is what runs where.
   second and acknowledged after each batch. Delivery is at least once:
   `UNIQUE(trigger_event_id, agent_id)` makes a repeat harmless, and the partial
   unique index `run_one_active_per_issue` allows one `starting`/`running` run per
-  issue. A trigger for an issue that already has an active run is dropped (logged
-  at info); queueing is TRK-18.
-- **A run's life.** `starting` (row, message, key and `run.created` event in one
-  transaction) then `running` (`run.started`, with the pid) then one of
+  issue. A trigger for an issue that already has an active run (`queued`,
+  `starting` or `running`) is dropped (logged at info): a queued run is the
+  pending intent for its issue.
+- **A run's life.** Optionally `queued` (see "Limits and the queue"), then
+  `starting` (row, message, key and `run.created` event in one transaction) then
+  `running` (`run.started`, with the pid) then one of
   `succeeded`, `failed` (exit code other than 0, timeout, command not found, bad
   working folder), `canceled` (a person) or `interrupted` (the server stopped or
   was killed). The end, the revocation of the run's key and `run.finished` are one
   transaction. A start-up pass marks every run left active by a previous boot
   `interrupted` ("server restarted") and revokes its key; a clean shutdown stops
   the children, waits up to 7 seconds and marks what is left `interrupted`
-  ("server stopped").
+  ("server stopped"). **`interrupted` is the outcome of a crash**: it says "the
+  server went away while this run was active", which is not the same as `failed`
+  (the process ran and went wrong), and is what "runs left active by a crash are
+  marked failed on start" means here. A timeout is a `failed` run with the error
+  `timed out after N s`; the process tree is killed and the transcript ends with
+  `run timed out`.
 - **The process.** The agent's command, as registered, is launched as a plain
   child process: no shell, so quoting in `args` is not interpreted. The first
   message goes to standard input, or into every `{prompt}` argument. `{issue}`,
@@ -167,6 +177,52 @@ rules are in `docs/api.md` (Runs); this is what runs where.
   agent keeps running until it ends by itself, and its key is already revoked at
   the next start. Job objects / process groups that die with the server, and
   reaping strays, are TRK-45.
+
+## Limits and the queue
+
+How many runs go at once is bounded, and what does not fit waits in a visible
+queue (TRK-18). The rules and the JSON are in `docs/api.md` (Runs, `GET /queue`);
+this is how to set and read it.
+
+| setting | flag | default | range |
+|---------|------|---------|-------|
+| `AURORA_MAX_RUNS` | `--max-runs <n>` | 4 | 1 to 64: runs `starting` or `running`, all agents together |
+| `AURORA_MAX_QUEUED_PER_AGENT` | `--max-queued-per-agent <n>` | 20 | 0 to 1000: queued runs one agent may have; a trigger beyond it is dropped and counted |
+| `AURORA_MAX_QUEUE_WAIT_SECS` | `--max-queue-wait-secs <n>` | 0 (never) | 0 to 604800: a queued run that waited this long is canceled with "queue wait exceeded" |
+
+The per-agent limit is the agent's `max_concurrent` (1 to 16, default 1) and the
+timeout is the agent's `timeout_seconds` (60 to 86400, default 3600, always set,
+so there is no separate global default: a change of the stored default is a
+change of what new agents get). The timeout starts when the process does; a
+queued run never times out while it waits.
+
+- **Where the decision is made.** In the single writer, in the transaction that
+  creates the run: it counts the runs that are `starting`/`running`, so two
+  triggers cannot both take the last slot. A new run goes to the queue also when
+  an older queued run could start (first come, first served). A queued run has no
+  process, key, working copy or transcript; it keeps the trigger (reason, event,
+  person, comment, manual message and base branch).
+- **The scheduler.** One task, woken when a run ends, a run is queued or
+  canceled, an agent is changed, and by a 5-second tick. It first cancels queued
+  runs that may no longer start (agent or its user disabled, project access
+  removed, issue archived, queue wait exceeded), then promotes the oldest queued
+  runs while the overall limit has room; a run whose agent is at its limit is
+  skipped, not waited for. Promotion is one transaction: `queued -> starting`,
+  the key, the working copy plan, the first message and `run.promoted`. A panic in
+  the scheduler is logged and the loop starts again after a second.
+- **Restarts.** Queued runs survive a restart and are promoted by the first
+  scheduler pass; active runs are marked `interrupted` first, so their slots are
+  free. `run_after_queue` and `run_after_promote` (see Failpoints) are the crash
+  tests of both sides.
+- **Lowering a limit** never stops a run that is going: the queue just waits until
+  the count is under the new limit.
+- **A cancel** frees the slot when it commits; the canceled process tree may take
+  a few seconds to go, so for that moment more processes than the limit can exist.
+- **Seeing it.** `GET /api/v1/queue`; the issue page's Runs section (a "Queued
+  (position n)" chip and a Cancel button); the run page ("waiting for a free
+  slot"); and the "Queue" panel of the agent page (running against the limits and
+  the agent's queued runs; it shows the state at page load).
+  `queue_full_drops` in the API counts dropped triggers since the server started.
 
 ## Transcripts (live output)
 
@@ -283,7 +339,11 @@ check` passes. `run_after_worktree` is tested against a project with a real
 the restart. `run_after_transcript_write` kills the server while the agent is
 still running and has printed part of its output: after the restart the run is
 interrupted, the transcript file is readable (a torn last line is ignored) and
-the checks pass. The rest of this section is about the write-path matrix.
+the checks pass. `run_after_queue` and `run_after_promote` are tested with the
+global limit set to 1: a queued run survives a crash and is promoted exactly once
+after the restart; a run killed between its promotion and its spawn is
+`interrupted` and nothing starts twice. The rest of this section is about the
+write-path matrix.
 
 `crates/aurora/tests/crash_matrix.rs` runs the real binary built by `cargo test`.
 For every failpoint above and several hit counts (1, 2, 5, 17 where there are
@@ -322,9 +382,19 @@ restart it:
 * compares the number of soak issues in the database with the creates
   acknowledged (no loss, no duplicate), and that no title exists twice,
 * clients resend a request that got no answer with the same `Idempotency-Key`.
+* a run thread starts runs of a fake agent (which sleeps two seconds) on fresh
+  issues, faster than they finish, with the overall limit at 2
+  (`AURORA_MAX_RUNS=2`), cancels some of what waits, and watches
+  `GET /api/v1/queue`: never more than 2 runs started at once and queue
+  positions 1, 2, 3 ... in order. After every restart the check also finds no
+  more than 2 runs `starting`/`running` and no run promoted or finished twice,
+  and the invariant checks cover the rest (`runs.queue`, `runs.no_orphans`,
+  event replay). Run `cargo build --examples -p aurora` first: the agent is an
+  example binary. A killed server leaves its fake agent running until its two
+  seconds are over; stopping agent processes with the server is not done yet.
 
 It prints a summary (kills, restarts, writes acknowledged, resends, checks,
-duration) and fails on any violation. Memory stays bounded: only the unverified
+runs by status, duration) and fails on any violation. Memory stays bounded: only the unverified
 acknowledgements and a reservoir of 2000 older facts are kept.
 
 ```powershell

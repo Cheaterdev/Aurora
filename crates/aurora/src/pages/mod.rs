@@ -377,11 +377,13 @@ async fn agents_page(
 async fn agent_page(
     State(store): State<Store>,
     Extension(principal): Extension<Principal>,
+    Extension(runner): Extension<Option<crate::Runner>>,
     Path(id): Path<i64>,
 ) -> PageResult {
-    let data = store
+    let mut data = store
         .read(move |c| data::load_agent(c, &principal, id))
         .await?;
+    data.max_runs = runner.map(|runner| runner.max_runs());
     Ok(no_store(ok(view::agent_page(&data))))
 }
 

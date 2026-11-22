@@ -492,6 +492,8 @@ async fn build_world(s: &Server) -> World {
                     failed: None,
                     worktree_root: None,
                     base_branch: None,
+                    comment_id: None,
+                    limits: None,
                 },
             )?;
             Ok(made.run.id)

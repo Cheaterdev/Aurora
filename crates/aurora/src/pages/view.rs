@@ -18,7 +18,7 @@ use aurora_store::issues::{Issue, Priority};
 use aurora_store::links::{Blocker, IssueLinks, LinkedIssue};
 use aurora_store::projects::{Column, IssueType, Label, Project};
 use aurora_store::prompt::{TemplateSource, VariableInfo};
-use aurora_store::runs::{Run, WorktreeState};
+use aurora_store::runs::{Run, RunStatus, WorktreeState};
 use aurora_store::search::{Hit, Kind, Segment};
 use maud::{DOCTYPE, Markup, html};
 use serde_json::Value;
@@ -1603,6 +1603,7 @@ pub fn agent_page(data: &AgentData) -> Markup {
                         (prompt_section(&data.projects, prompt))
                     }
                     (run_now_section(agent))
+                    (queue_panel(data))
                     h2 { "Keys" }
                     @if data.keys.is_empty() {
                         p.empty { "This agent has no keys." }
@@ -1649,11 +1650,66 @@ pub fn agent_page(data: &AgentData) -> Markup {
                             @if agent.projects.is_empty() { "none" } @else { (agent.projects.join(", ")) }
                         }
                     }
+                    (queue_panel(data))
                     p.hint { "Only the owner can edit agents." }
                 }
             }
         },
     )
+}
+
+/// Running against the limits, and the runs waiting for a slot, oldest first.
+/// Static: it shows the state when the page was loaded.
+fn queue_panel(data: &AgentData) -> Markup {
+    let agent = &data.agent;
+    html! {
+        section.queue-panel aria-labelledby="queue-heading" {
+            h2 #queue-heading { "Queue" }
+            p.queue-summary {
+                (data.queue.running) " running of " (agent.max_concurrent)
+                " allowed for this agent"
+                @if let Some(limit) = data.max_runs {
+                    ", overall limit " (limit) " runs at once"
+                }
+                "."
+            }
+            @if data.queue.queued.is_empty() {
+                p.empty { "No run is waiting." }
+            } @else {
+                ol.run-list {
+                    @for entry in &data.queue.queued {
+                        li {
+                            span.chip.chip-run data-status="queued" {
+                                "Queued (position " (entry.position) ")"
+                            }
+                            " "
+                            a.run-link href={ "/p/" (entry.project) "/runs/" (entry.run_id) } {
+                                "Run " (entry.run_id)
+                            }
+                            " "
+                            a href={ "/p/" (entry.project) "/" (entry.issue.rsplit('-').next().unwrap_or("")) } {
+                                (entry.issue)
+                            }
+                            " "
+                            span.meta {
+                                @if entry.waiting_on == "agent" {
+                                    "waiting for this agent's limit"
+                                } @else {
+                                    "waiting for a free slot overall"
+                                }
+                            }
+                            " "
+                            (run_time("queued", Some(entry.queued_at)))
+                            " "
+                            button type="button" data-action="cancel-run" data-run-id=(entry.run_id) {
+                                "Cancel"
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Owner only, like the rest of the agent controls; members start runs
@@ -2153,7 +2209,13 @@ pub fn activity_fragment(data: &ActivityData) -> Markup {
 
 fn run_chip(run: &Run) -> Markup {
     html! {
-        span.chip.chip-run data-status=(run.status.as_str()) { (run.status.as_str()) }
+        span.chip.chip-run data-status=(run.status.as_str()) {
+            @if let (RunStatus::Queued, Some(position)) = (run.status, run.queue_position) {
+                "Queued (position " (position) ")"
+            } @else {
+                (run.status.as_str())
+            }
+        }
     }
 }
 
@@ -2218,7 +2280,11 @@ fn runs_list(key: &str, runs: &[Run]) -> Markup {
                             " "
                             span.meta { (run.reason.as_str()) }
                             " "
-                            (run_time("started", run.started.or(Some(run.created))))
+                            @if run.status == RunStatus::Queued {
+                                (run_time("queued", run.queued_at.or(Some(run.created))))
+                            } @else {
+                                (run_time("started", run.started.or(Some(run.created))))
+                            }
                             (run_time("finished", run.finished))
                             @if let Some(code) = run.exit_code {
                                 " " span.meta { "exit " (code) }
@@ -2265,6 +2331,18 @@ pub fn run_fragment(data: &RunPageData) -> Markup {
                     }
                 }
             }
+            @if run.status == RunStatus::Queued {
+                p.hint.queue-note {
+                    "Waiting for a free slot: the agent's limit of concurrent runs or the "
+                    "overall limit of runs is reached. It starts by itself, oldest first."
+                }
+            }
+            @if run.status == RunStatus::Interrupted {
+                p.hint {
+                    "Interrupted: the server stopped or crashed while this run was active, "
+                    "so it did not finish. The process may have changed things before that."
+                }
+            }
             dl.facts {
                 dt { "Agent" }
                 dd { a href={ "/agents/" (run.agent_id) } { (run.agent) } }
@@ -2281,6 +2359,10 @@ pub fn run_fragment(data: &RunPageData) -> Markup {
                 }
                 dt { "Created" }
                 dd { (run_time("", Some(run.created))) }
+                @if let Some(at) = run.queued_at {
+                    dt { "Queued" }
+                    dd { (run_time("", Some(at))) }
+                }
                 @if run.started.is_some() {
                     dt { "Started" }
                     dd { (run_time("", run.started)) }
@@ -2334,7 +2416,11 @@ pub fn run_fragment(data: &RunPageData) -> Markup {
                 }
             }
             h2 { "First message" }
-            pre.run-text { (data.detail.message) }
+            @if run.status == RunStatus::Queued && data.detail.message.is_empty() {
+                p.empty { "It is written when the run starts, from the issue as it is then." }
+            } @else {
+                pre.run-text { (data.detail.message) }
+            }
         }
     }
 }

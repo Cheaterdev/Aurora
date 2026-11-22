@@ -566,13 +566,13 @@
     button.disabled = true;
     button.textContent = 'Canceling…';
     api('POST', '/runs/' + button.dataset.runId + '/cancel').then(function () {
-      if (page === 'run') { refreshRun(); } else if (page === 'issue') { refreshRuns(); }
+      if (page === 'run') { refreshRun(); } else if (page === 'issue') { refreshRuns(); } else if (page === 'agent') { location.reload(); }
     }, function (err) {
       button.disabled = false;
       button.textContent = label;
       // The run may have ended on its own meanwhile: show what is true now.
       if (err.status === 409) {
-        if (page === 'run') { refreshRun(); } else if (page === 'issue') { refreshRuns(); }
+        if (page === 'run') { refreshRun(); } else if (page === 'issue') { refreshRuns(); } else if (page === 'agent') { location.reload(); }
       }
       toast(err.message, 'error');
     });

@@ -192,6 +192,12 @@ pub const INVARIANTS: &[Invariant] = &[
         needs_current_schema: true,
         run: runs_transcripts,
     },
+    Invariant {
+        name: "runs.queue",
+        proves: "a queued run has a queue time, no start or finish time, no process, no key, no working copy and no transcript; every run has a run.created event; a queued run is not both queued and started in the log (more than one active run per issue is made impossible by a unique index)",
+        needs_current_schema: true,
+        run: runs_queue,
+    },
 ];
 
 /// Runs every invariant on `conn`, which is not changed. The checks see one
@@ -626,7 +632,7 @@ fn runs_no_orphans(conn: &Connection) -> Result<Finding, StoreError> {
          WHERE r.status IN ('starting', 'running') AND r.finished IS NOT NULL
          UNION ALL
          SELECT 'run ' || r.id || ' is ' || r.status || ' without a finish time' FROM run r
-         WHERE r.status NOT IN ('starting', 'running') AND r.finished IS NULL
+         WHERE r.status NOT IN ('queued', 'starting', 'running') AND r.finished IS NULL
          UNION ALL
          SELECT 'run ' || r.id || ' is ' || r.status || ' but its key is still live' FROM run r
          JOIN api_key k ON k.id = r.key_id
@@ -642,7 +648,52 @@ fn runs_no_orphans(conn: &Connection) -> Result<Finding, StoreError> {
         conn,
         "SELECT COUNT(*) FROM run WHERE status IN ('starting', 'running')",
     )?;
-    Finding::of(format!("{runs} runs, {active} active"), violations)
+    let queued = count(conn, "SELECT COUNT(*) FROM run WHERE status = 'queued'")?;
+    Finding::of(
+        format!("{runs} runs, {active} active, {queued} queued"),
+        violations,
+    )
+}
+
+/// A queued run is only an intent (TRK-18): it holds nothing that belongs to a
+/// started run. The number of running runs is deliberately not checked against
+/// any limit: limits can be lowered at run time, and runs already going finish.
+fn runs_queue(conn: &Connection) -> Result<Finding, StoreError> {
+    let violations = lines(
+        conn,
+        "SELECT 'run ' || id || ' is queued without a queue time' FROM run
+         WHERE status = 'queued' AND queued_at IS NULL
+         UNION ALL
+         SELECT 'run ' || id || ' is queued but has started or finished' FROM run
+         WHERE status = 'queued' AND (started IS NOT NULL OR finished IS NOT NULL)
+         UNION ALL
+         SELECT 'run ' || id || ' is queued but has a process' FROM run
+         WHERE status = 'queued' AND pid IS NOT NULL
+         UNION ALL
+         SELECT 'run ' || id || ' is queued but has a key' FROM run
+         WHERE status = 'queued' AND key_id IS NOT NULL
+         UNION ALL
+         SELECT 'run ' || id || ' is queued but has a working copy' FROM run
+         WHERE status = 'queued' AND (worktree_state <> 'none' OR worktree_path IS NOT NULL
+                                      OR branch IS NOT NULL)
+         UNION ALL
+         SELECT 'run ' || id || ' is queued but has a transcript' FROM run
+         WHERE status = 'queued' AND (transcript_bytes > 0 OR output_tail <> '')
+         UNION ALL
+         SELECT 'run ' || r.id || ' has no run.created event' FROM run r
+         WHERE NOT EXISTS (SELECT 1 FROM event e
+                           WHERE e.entity_kind = 'run' AND e.entity_id = r.id
+                             AND e.kind = 'run.created')
+         UNION ALL
+         SELECT 'run ' || r.id || ' is queued but the log says it was started' FROM run r
+         WHERE r.status = 'queued'
+           AND EXISTS (SELECT 1 FROM event e
+                       WHERE e.entity_kind = 'run' AND e.entity_id = r.id
+                         AND e.kind IN ('run.promoted', 'run.started', 'run.finished'))",
+        |r| r.get(0),
+    )?;
+    let queued = count(conn, "SELECT COUNT(*) FROM run WHERE status = 'queued'")?;
+    Finding::of(format!("{queued} queued"), violations)
 }
 
 /// Database rules about working copies (TRK-16), plus notes about the file

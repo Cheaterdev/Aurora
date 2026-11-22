@@ -769,8 +769,36 @@ The key is revoked in the transaction that records the end of the run.
 Standard output and error are read as they arrive and kept as the run's
 **transcript** (see below); the last 64 KiB are also kept on the run itself as
 `output_tail`; the exit status is the result. There is at most one active run
-(`starting` or `running`) per issue; a trigger that arrives meanwhile is
-dropped (queueing is a later task).
+(`queued`, `starting` or `running`) per issue; a trigger that arrives meanwhile
+is dropped.
+
+**Limits and the queue.** At most `AURORA_MAX_RUNS` (`--max-runs`, 1 to 64,
+default 4) runs are `starting` or `running` at the same time, all agents
+together, and at most the agent's `max_concurrent` (1 to 16, default 1) per
+agent. A run that would pass either limit is created `queued` instead (the
+decision is made in the same transaction as the creation, so two triggers can
+never both pass a limit). A queued run is only an intent: it records who or what
+asked for it (the reason, the event, the person, the comment, the manual
+`message` and `base_branch`) and has **no process, key, working copy or
+transcript**; its first message is written when it starts, so it sees the issue
+as it is then. The scheduler promotes queued runs oldest first (`queued_at`,
+then id) whenever a run ends or a limit changes, at the latest 5 seconds later;
+an agent that is at its own limit is skipped and does not hold other agents'
+runs back. Before a queued run starts it is checked again: when its agent was
+disabled (or its user), lost access to the project, or the issue was archived,
+the run ends `canceled` with the reason in `error` (`agent disabled`, `agent
+user disabled`, `agent no longer has access to project KEY`, `issue archived`)
+instead of starting. If `AURORA_MAX_QUEUE_WAIT_SECS` is set above 0, a queued
+run that has waited that long ends `canceled` with `queue wait exceeded`; the
+default is no limit, and the time a run waits never counts against its
+timeout, which starts when the process does. An agent may have at most
+`AURORA_MAX_QUEUED_PER_AGENT` queued runs (default 20, 0 to 1000); a trigger
+beyond that is dropped and counted (`queue_full_drops` in `GET /queue`, and a
+warning in the log), and a manual start answers `409` with `queue full`. Queued
+runs survive a restart and are promoted as the limits allow, whereas a run that
+was `starting` or `running` when the server died is marked `interrupted` at the
+next start. A canceled run frees its slot as soon as the cancel commits, while
+its process tree may take a few seconds to go.
 
 **A working copy per run.** When the project has a `repo_path` and the agent has
 no `work_dir` of its own, every run works in its own git worktree, so two
@@ -822,7 +850,12 @@ A run is `{id, agent_id, agent, project, issue, issue_number, reason, status,
 trigger_event_id, pid, template_source, template_id, edited, exit_code, error,
 output_truncated, started, finished, created, created_by, worktree_state,
 worktree_path, branch, base_ref, base_commit, has_changes, changed_files, ahead,
-worktree_note, transcript_bytes, transcript_truncated}`. `transcript_bytes` is
+worktree_note, transcript_bytes, transcript_truncated, queued_at,
+queue_position}`. `queued_at` is when the run was queued (kept after it
+started; null for a run that started at once) and `queue_position` its 1-based
+place among all queued runs, oldest first (null unless the run is `queued`;
+computed when read, so it moves up as runs ahead of it start or are canceled).
+`transcript_bytes` is
 the size of the transcript file when the run ended (0 until then, and after a
 crash); `transcript_truncated` says the cap was reached. `worktree_state` is `none`, `created` (made, not yet settled),
 `removed` or `kept`; `base_ref` is the branch it started from and `base_commit`
@@ -830,16 +863,24 @@ its commit at that moment; `changed_files` counts files `git status` lists and
 `ahead` the commits on the run's branch beyond `base_commit`. A registered
 agent's key sees `branch` and the state but not `worktree_path` or
 `worktree_note`. `reason` is
-`assigned`, `mentioned`, `manual` or `schedule`; `status` is `starting`,
-`running`, `succeeded`, `failed`, `interrupted` or `canceled`. Times are
+`assigned`, `mentioned`, `manual` or `schedule`; `status` is `queued`,
+`starting`, `running`, `succeeded`, `failed`, `interrupted` or `canceled`.
+**`interrupted` is what a crash or a stop of the server leaves behind** for a run
+that was active (`starting` or `running`; error `server restarted` or `server
+stopped`); it is a distinct final status from `failed`, which means the process
+ran (or could not start) and went wrong, and it is the outcome a crash has: no
+active run survives a restart. Times are
 milliseconds since the epoch. The detail of a run adds `message` (the exact
 first message) and `output_tail`; both can hold secrets, so only the owner and
 members get them. A registered agent's key sees the runs of its allowed
 projects without `message` and `output_tail`.
 
-Events: `run.created`, `run.started` and `run.finished` carry no message and
-no output; there is no event per chunk of output. `run.created` also has
-`branch` and `worktree_state`, and `run.finished` has `worktree_state`,
+Events: `run.created`, `run.promoted`, `run.started` and `run.finished` carry no
+message and no output; there is no event per chunk of output. `run.created` also
+has `branch`, `worktree_state` and `queued` (true when the run waits; its
+`branch` is then null), `run.promoted` (`queued` to `starting`, written in the
+transaction that mints the key and plans the working copy) has `branch` and
+`worktree_state`, and `run.finished` has `worktree_state`,
 `has_changes` and, when the runner finished the file itself, `transcript_bytes`
 (absent for a cancel by a person: it is committed before the process is stopped,
 and the size is recorded on the run a moment later); no folder is ever in an
@@ -855,15 +896,18 @@ Owner or member (an agent's key gets `403`). Body `{"issue": "KEY-12",
 `message` replaces the rendered first message and is sent verbatim.
 `base_branch` starts this run's worktree from another branch of the project's
 repository; `422` when it does not exist, or when the run gets no working copy
-(no repository, or the agent has a `work_dir`). `201` with the run detail.
-`404` for an unknown agent, `422` for a malformed or unknown issue, a disabled
-agent or user, or a project the agent may not use, `409` when the issue already has an
-active run, `503` when this server has no runner. It takes a request id: a
+(no repository, or the agent has a `work_dir`). `201` with the run detail; when a
+limit is reached the run in it is `queued` (still `201`: read `status`), and
+`queue_position` says where. `404` for an unknown agent, `422` for a malformed or
+unknown issue, a disabled agent or user, or a project the agent may not use, `409`
+when the issue already has an active (queued included) run or the agent's queue is
+full, `503` when this server has no runner. It takes a request id: a
 repeat returns the recorded response and starts no second process.
 
 ### `GET /api/v1/runs`
 
-Query: `issue` (`KEY-12`), `agent` (id), `status`, `has_changes` (`true` lists
+Query: `issue` (`KEY-12`), `agent` (id), `status` (`queued`, `starting`,
+`running`, `succeeded`, `failed`, `interrupted` or `canceled`), `has_changes` (`true` lists
 runs whose working copy has changes, `false` the others), `limit` (default 50,
 max 200), `offset`. Newest first, as an array of runs (no message or output). Only
 runs of projects the key may use are listed; asking for another project's issue
@@ -879,6 +923,9 @@ The run: the detail for owners and members, the plain run for an agent's key.
 
 Owner or member (an agent's key gets `403`). The run becomes `canceled` and its
 key is revoked in this request's transaction, which also records the request id.
+A `queued` run has no process: it is `canceled` at once (event `run.finished`
+with status `canceled`) and the request answers without waiting, with the run
+(no key to revoke, no transcript).
 The process tree is stopped right after the commit (`taskkill /T /F` on Windows,
 the process group elsewhere), the transcript gets its `run canceled` frame and
 the working copy is settled. The request waits for that, at most 5 seconds, and
@@ -919,6 +966,22 @@ Aurora's own as a line `[aurora: run canceled]`. With `?download=1` the answer
 also has `Content-Disposition: attachment; filename="run-<id>.txt"`. `404` as
 above (a running run without output gives an empty text). The text is built in
 memory, so it is bounded by the transcript's size cap.
+
+### `GET /api/v1/queue`
+
+Read scope. The run queue and the limits: `{"running": n, "limit": n, "queued":
+[{"run_id", "agent_id", "agent", "project", "issue", "queued_at", "position",
+"waiting_on"}], "queue_full_drops": n}`. `running` is the number of runs
+`starting` or `running`, `limit` the overall limit (`AURORA_MAX_RUNS`). `queued`
+is oldest first; `position` is the 1-based place among all queued runs and
+`waiting_on` is `agent` when the run's agent is at its own `max_concurrent`,
+else `global` (the overall limit, or an older run that goes first).
+`queue_full_drops` counts triggers dropped since the server started because
+their agent's queue was full (it restarts at 0). Query `agent` (id) narrows
+`queued` and `running` to one agent (`404` for an unknown agent). A registered
+agent's key sees only the entries of its allowed projects, and `running` counts
+only runs of those projects; `limit` and `queue_full_drops` are server-wide.
+`401` without a key, `503` when this server has no runner.
 
 ## Search
 
