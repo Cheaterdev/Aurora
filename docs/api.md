@@ -691,7 +691,7 @@ Links are absolute only when the server is started with `--public-url <url>`
 (or `AURORA_PUBLIC_URL`), an `http` or `https` address without user info, query
 or fragment; a trailing slash is dropped. Otherwise they stay relative.
 
-**What the runner supplies (TRK-15, TRK-17).** `render_prompt(conn, now,
+**What the runner supplies.** `render_prompt(conn, now,
 &PromptRequest)` takes the agent, the issue (`project` key and `number`), the
 trigger (`TriggerCtx`: kind, optional mentioning comment, optional actor),
 `workdir`, `run_id`, `public_url` and, when a person edited the message by
@@ -851,7 +851,7 @@ trigger_event_id, pid, template_source, template_id, edited, exit_code, error,
 output_truncated, started, finished, created, created_by, worktree_state,
 worktree_path, branch, base_ref, base_commit, has_changes, changed_files, ahead,
 worktree_note, transcript_bytes, transcript_truncated, queued_at,
-queue_position, reaped}`. `reaped` (TRK-45) is what start-up found of the process
+queue_position, reaped}`. `reaped` is what start-up found of the process
 of a run it marked `interrupted` (`killed leftover process <pid>`, `process
 already gone`, `pid reused, left alone`, `pid unknown`); null for every other
 run, and hidden from an agent's key. When start-up interrupts a run it also
@@ -992,7 +992,7 @@ only runs of those projects; `limit` and `queue_full_drops` are server-wide.
 ### `GET /api/v1/admin/housekeeping`
 
 Owner only (`403` for members and agents, `401` without a key). What start-up
-reconciliation leaves for a person (TRK-45), computed when asked and read-only:
+reconciliation leaves for a person, computed when asked and read-only:
 `{"leftover_processes": [{"run", "pid", "note"}], "unknown_working_copies":
 [{"name", "kind"}], "kept_working_copies": [{"run", "branch", "state",
 "folder_exists"}], "checked_at"}`. `leftover_processes` lists the runs with a

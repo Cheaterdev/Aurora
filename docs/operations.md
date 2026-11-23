@@ -77,9 +77,9 @@ folder is not inspected.
 
 Append an `Invariant` to `INVARIANTS` in `crates/aurora-store/src/invariants.rs`
 with a stable name and a test in `tests_invariants.rs` that corrupts a copy of a
-database and proves the check notices. TRK-15 made `runs.no_orphans` real (see
-the table), and TRK-18 and TRK-45 extend it for the supervisor and for processes
-that outlive the server.
+database and proves the check notices. `runs.no_orphans` is a real check (see
+the table), and the run queue and process containment extend it for the
+supervisor and for processes that outlive the server.
 
 ## Failpoints (development and tests only)
 
@@ -175,7 +175,7 @@ rules are in `docs/api.md` (Runs); this is what runs where.
   the child leads its own process group and the group gets the signal.
   Nothing besides the aurora binary and the agent's command is needed, except
   `git` when a project has a repository (see "Working copies").
-- **Containment (TRK-45).**
+- **Containment.**
   *Windows:* each run's agent starts suspended, is put in a job object of its own
   (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, no breakaway flag) and only then
   resumed, so it cannot start a grandchild before it is contained. When the
@@ -234,7 +234,7 @@ a run from a database that was restored from a backup: look inside first.
 ## Limits and the queue
 
 How many runs go at once is bounded, and what does not fit waits in a visible
-queue (TRK-18). The rules and the JSON are in `docs/api.md` (Runs, `GET /queue`);
+queue. The rules and the JSON are in `docs/api.md` (Runs, `GET /queue`);
 this is how to set and read it.
 
 | setting | flag | default | range |
