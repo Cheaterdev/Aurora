@@ -22,7 +22,7 @@
 //! * `s`: the stream: `o` standard output, `e` standard error, `x` a marker
 //!   written by Aurora itself (not output of the process: `run canceled`,
 //!   `run timed out`, `server stopped`, `process exited with code 3`,
-//!   `transcript truncated at 8388608 bytes`).
+//!   `transcript truncated: 120000 bytes removed from the middle`).
 //! * `d`: the text. A frame holds one line of one stream, including its line
 //!   ending; a longer line is cut into frames of at most 8 KiB. Concatenating
 //!   the `d` of the `o` and `e` frames in file order gives back what the
@@ -48,13 +48,23 @@
 //!
 //! Frames are appended in batches: a batch is written when 8 KiB are pending or
 //! 250 ms passed, so a crash loses at most that. There is no per-write
-//! `sync_data` (the file is an append log, not a rename-into-place file);
-//! [`TranscriptWriter::finish`] syncs once when the run ends. The file is
-//! capped (default 8 MiB, `AURORA_TRANSCRIPT_MAX_BYTES`): the frame that would
-//! pass the cap is dropped together with everything after it, one `x` frame
-//! `transcript truncated at N bytes` is appended, and the process keeps
-//! running (its pipes are still drained). Markers are not counted against the
-//! cap. A write error stops the transcript the same way, silently for the run.
+//! `sync_data` for a plain append; [`TranscriptWriter::finish`] syncs once when
+//! the run ends.
+//!
+//! The file is capped (default 8 MiB, `AURORA_TRANSCRIPT_MAX_BYTES`), but
+//! reaching the cap never stops the run from being recorded: the first half of
+//! the cap, the head, is kept forever once written, and the second half is a
+//! sliding tail that keeps the most recent output. When the tail would pass
+//! its share of the cap, the oldest frames in it (the middle of the
+//! transcript) are dropped to make room, replaced by one `x` frame
+//! `transcript truncated: N bytes removed from the middle` right after the
+//! head (`N` is cumulative across trims). A trim reopens the file without
+//! `append`, calls `set_len` to cut the stale tail, writes the marker and the
+//! kept frames, flushes, and reopens it for append again; a crash in that
+//! narrow window can lose the tail down to the head, which is a plain,
+//! readable prefix, never a half-written frame. Markers do not count against
+//! the cap. A write or trim error stops the transcript the same way, silently
+//! for the run.
 //!
 //! # Reading
 //!
@@ -214,6 +224,23 @@ impl Scrubber {
 
 // ---- writing ----
 
+/// The last whole-frame boundary at or before `half` bytes from the start of
+/// the file at `path` (or the end of the first frame, if even it alone is
+/// longer than `half`).
+fn freeze_head_boundary(path: &Path, half: u64) -> std::io::Result<u64> {
+    let mut file = File::open(path)?;
+    let mut buf = Vec::new();
+    file.read_to_end(&mut buf)?;
+    let window = (half as usize).min(buf.len());
+    let boundary = buf[..window]
+        .iter()
+        .rposition(|b| *b == b'\n')
+        .map(|at| at + 1)
+        .or_else(|| buf.iter().position(|b| *b == b'\n').map(|at| at + 1))
+        .unwrap_or(buf.len());
+    Ok(boundary as u64)
+}
+
 /// The part of `bytes` that can be turned into text now: all of it unless it
 /// ends in the first bytes of a character whose rest has not arrived.
 fn complete_prefix(bytes: &[u8]) -> usize {
@@ -257,8 +284,14 @@ struct State {
     final_size: u64,
     started: Instant,
     cap: u64,
-    /// Bytes of frames accepted so far (written or pending), markers aside.
-    accepted: u64,
+    /// Bytes actually written to the file so far.
+    written: u64,
+    /// The file length at which the head was frozen; `None` while it still
+    /// grows. Fixed once `written` reaches half the cap.
+    head_end: Option<u64>,
+    /// Cumulative bytes dropped from the middle across all trims, for the
+    /// marker's text.
+    trimmed_bytes: u64,
     truncated: bool,
     closed: bool,
     pending: Vec<u8>,
@@ -276,9 +309,10 @@ impl State {
         self.pending.extend_from_slice(&frame);
     }
 
-    /// Turns one chunk of text of a stream into frames, within the cap.
+    /// Turns one chunk of text of a stream into frames. The cap is enforced
+    /// later, when a batch is actually written (`maintain_cap`), not here.
     fn emit(&mut self, stream: Stream, bytes: &[u8]) {
-        if bytes.is_empty() || self.truncated || self.file.is_none() {
+        if bytes.is_empty() || self.file.is_none() {
             return;
         }
         let text = self
@@ -286,13 +320,6 @@ impl State {
             .apply(String::from_utf8_lossy(bytes).into_owned());
         for piece in pieces(&text) {
             let frame = encode(self.t(), stream.code(), piece);
-            if self.accepted + frame.len() as u64 > self.cap {
-                self.truncated = true;
-                let note = format!("transcript truncated at {} bytes", self.cap);
-                self.marker(&note);
-                return;
-            }
-            self.accepted += frame.len() as u64;
             self.pending.extend_from_slice(&frame);
         }
     }
@@ -361,18 +388,100 @@ impl State {
             self.pending.clear();
             return;
         };
+        let written = self.pending.len() as u64;
         let result = file.write_all(&self.pending).and_then(|()| file.flush());
         self.pending.clear();
         match result {
             Ok(()) => {
+                self.written += written;
                 if announce {
                     failpoints::hit(Point::RunAfterTranscriptWrite);
                 }
+                self.maintain_cap();
             }
             Err(err) => {
                 tracing::warn!(error = %err, "could not write the transcript; it stops here");
                 self.truncated = true;
                 self.file = None;
+            }
+        }
+    }
+
+    /// Keeps the file within the cap: freezes the head once it fills half the
+    /// cap, then trims the tail's oldest frames once the tail passes its own
+    /// half of the cap. Never stops the run; only `[TranscriptWriter::push]`
+    /// calls add new output, this only ever removes old frames.
+    fn maintain_cap(&mut self) {
+        if self.head_end.is_none() {
+            let half = self.cap / 2;
+            if self.written < half {
+                return;
+            }
+            // A batch can carry far more than `half` in one write (a big
+            // pipe read), so the boundary is found in the file, not assumed
+            // to be close to `self.written`.
+            match freeze_head_boundary(&self.path, half) {
+                Ok(boundary) => self.head_end = Some(boundary),
+                Err(err) => {
+                    tracing::warn!(
+                        error = %err,
+                        "could not find where to freeze the transcript's head; it stops here"
+                    );
+                    self.file = None;
+                    return;
+                }
+            }
+        }
+        let head_end = self.head_end.unwrap_or(0);
+        let tail_budget = self.cap.saturating_sub(head_end);
+        let tail_len = self.written.saturating_sub(head_end);
+        if tail_len <= tail_budget {
+            return;
+        }
+        self.trim_tail(head_end, tail_budget / 2);
+    }
+
+    /// Rewrites the file to `head_end` bytes of head plus a marker and the
+    /// most recent `target` bytes of tail, aligned to a whole frame.
+    fn trim_tail(&mut self, head_end: u64, target: u64) {
+        // The writer's own handle only has the append right on Windows, not
+        // the write right `set_len` needs, so the rewrite uses a fresh handle
+        // opened without `append`.
+        self.file = None;
+        let result = (|| -> std::io::Result<u64> {
+            let mut file = OpenOptions::new().read(true).write(true).open(&self.path)?;
+            let tail_len = self.written.saturating_sub(head_end);
+            let skip = tail_len.saturating_sub(target);
+            file.seek(SeekFrom::Start(head_end + skip))?;
+            let mut buf = Vec::new();
+            file.read_to_end(&mut buf)?;
+            let start = buf.iter().position(|b| *b == b'\n').map_or(0, |at| at + 1);
+            self.trimmed_bytes += skip + start as u64;
+            let note = format!(
+                "transcript truncated: {} bytes removed from the middle",
+                self.trimmed_bytes
+            );
+            let marker = encode(self.t(), "x", &note);
+            file.set_len(head_end)?;
+            file.seek(SeekFrom::Start(head_end))?;
+            file.write_all(&marker)?;
+            file.write_all(&buf[start..])?;
+            file.flush()?;
+            Ok(head_end + marker.len() as u64 + (buf.len() - start) as u64)
+        })();
+        match result {
+            Ok(new_len) => {
+                self.written = new_len;
+                self.truncated = true;
+                match OpenOptions::new().append(true).read(true).open(&self.path) {
+                    Ok(file) => self.file = Some(file),
+                    Err(err) => {
+                        tracing::warn!(error = %err, "could not reopen the transcript after a trim");
+                    }
+                }
+            }
+            Err(err) => {
+                tracing::warn!(error = %err, "could not trim the transcript; it stops here");
             }
         }
     }
@@ -392,7 +501,11 @@ impl TranscriptWriter {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let file = OpenOptions::new().create(true).append(true).open(path)?;
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .read(true)
+            .open(path)?;
         Ok(TranscriptWriter {
             state: Arc::new(Mutex::new(State {
                 path: path.to_path_buf(),
@@ -400,7 +513,9 @@ impl TranscriptWriter {
                 final_size: 0,
                 started: Instant::now(),
                 cap,
-                accepted: 0,
+                written: 0,
+                head_end: None,
+                trimmed_bytes: 0,
                 truncated: false,
                 closed: false,
                 pending: Vec::new(),
@@ -453,7 +568,7 @@ impl TranscriptWriter {
             state.closed = true;
             // The file's own size, after the last write and the sync.
             state.final_size =
-                std::fs::metadata(&state.path).map_or(state.accepted, |meta| meta.len());
+                std::fs::metadata(&state.path).map_or(state.written, |meta| meta.len());
         }
         TranscriptEnd {
             bytes: i64::try_from(state.final_size).unwrap_or(i64::MAX),
@@ -682,31 +797,63 @@ mod tests {
     }
 
     #[test]
-    fn the_cap_stops_the_file_and_leaves_one_marker() {
+    fn the_cap_keeps_the_head_and_the_latest_tail_trimming_the_middle() {
         let dir = tempfile::tempdir().unwrap();
-        let w = writer(&dir, 400, Scrubber::new());
-        for n in 0..50 {
+        let w = writer(&dir, 2000, Scrubber::new());
+        for n in 0..200 {
             w.push(Stream::Out, format!("line number {n}\n").as_bytes());
+            if n % 10 == 0 {
+                w.tick();
+            }
         }
         let end = w.finish(Some("run timed out"));
         assert!(end.truncated);
         let entries = all(&dir);
         let data: Vec<&Entry> = entries.iter().filter(|e| !e.is_marker()).collect();
-        assert!(!data.is_empty() && data.len() < 50);
-        assert_eq!(data[0].d, "line number 0\n", "the start is what is kept");
+        assert_eq!(data[0].d, "line number 0\n", "the head is kept");
+        assert_eq!(
+            data.last().unwrap().d,
+            "line number 199\n",
+            "the latest output is kept too, not only the start"
+        );
+        assert!(
+            !data.iter().any(|e| e.d == "line number 100\n"),
+            "a line from the middle was dropped to make room"
+        );
         let markers: Vec<&str> = entries
             .iter()
             .filter(|e| e.is_marker())
             .map(|e| e.d.as_str())
             .collect();
         assert_eq!(
-            markers,
-            ["transcript truncated at 400 bytes", "run timed out"]
+            markers.len(),
+            2,
+            "one surviving trim note plus the end note: {markers:?}"
         );
-        let data_bytes: usize = std::fs::metadata(file(&dir)).unwrap().len() as usize;
-        assert!(data_bytes <= 400 + 200, "markers are small: {data_bytes}");
+        assert!(markers[0].starts_with("transcript truncated: "));
+        assert!(markers[0].ends_with("bytes removed from the middle"));
+        assert_eq!(markers[1], "run timed out");
+        let data_bytes = std::fs::metadata(file(&dir)).unwrap().len();
+        assert!(
+            data_bytes <= 2000 + 400,
+            "stays close to the cap: {data_bytes}"
+        );
         let page = read_page(&file(&dir), 0, 1 << 20).unwrap().unwrap();
         assert!(page.truncated);
+    }
+
+    #[test]
+    fn a_transcript_under_the_cap_is_never_trimmed() {
+        let dir = tempfile::tempdir().unwrap();
+        let w = writer(&dir, DEFAULT_MAX_BYTES, Scrubber::new());
+        for n in 0..20 {
+            w.push(Stream::Out, format!("line number {n}\n").as_bytes());
+        }
+        let end = w.finish(None);
+        assert!(!end.truncated);
+        let entries = all(&dir);
+        assert!(entries.iter().all(|e| !e.is_marker()));
+        assert_eq!(entries.len(), 20);
     }
 
     #[test]

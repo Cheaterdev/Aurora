@@ -582,7 +582,7 @@ async fn polling_while_the_run_goes_on_returns_a_growing_offset_and_done_only_at
 }
 
 #[tokio::test]
-async fn the_cap_truncates_the_file_and_the_run_still_succeeds() {
+async fn the_cap_trims_the_middle_and_keeps_the_head_and_the_latest_output() {
     let server = Server::start_with(options(), Some(4096)).await;
     server.project("AA").await;
     let (_, user, _) = server.agent(&["--flood", "300000"]).await;
@@ -591,18 +591,28 @@ async fn the_cap_truncates_the_file_and_the_run_still_succeeds() {
     assert_eq!(run["status"], "succeeded", "{run}");
     assert_eq!(run["transcript_truncated"], true);
     let id = run["id"].as_i64().unwrap();
+    // Right after a trim the file sits near head + half the tail budget, not
+    // at the cap itself; it only approaches 4096 again just before the next
+    // trim. Either way it never passes the cap by more than a frame or two.
     let bytes = run["transcript_bytes"].as_u64().unwrap();
     assert!(
-        (4096 - 200..=4096 + 200).contains(&bytes),
-        "the cap plus the one note: {bytes}"
+        (1000..=4096 + 500).contains(&bytes),
+        "within the cap, not the whole flood: {bytes}"
     );
     let entries = server.entries(id).await;
     let notes: Vec<&Value> = entries.iter().filter(|e| e["s"] == "x").collect();
-    assert_eq!(notes.len(), 1, "{notes:?}");
-    assert_eq!(notes[0]["d"], "transcript truncated at 4096 bytes");
+    assert_eq!(notes.len(), 1, "one surviving trim note: {notes:?}");
     assert!(
-        text_of(&entries, "o").join("").contains("STDIN-BEGIN"),
-        "the start is kept"
+        notes[0]["d"]
+            .as_str()
+            .unwrap()
+            .starts_with("transcript truncated: ")
+    );
+    let out = text_of(&entries, "o").join("");
+    assert!(out.contains("STDIN-BEGIN"), "the start is kept: {out}");
+    assert!(
+        out.contains("TAIL-MARKER"),
+        "the latest output is kept too, not only the start: {out}"
     );
     let page = server.transcript(id, "").await.json();
     assert_eq!(page["truncated"], true);
